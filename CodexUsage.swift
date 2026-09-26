@@ -569,6 +569,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tokensStaleAfter: TimeInterval = 1800
     private var quotaLastOK: Date?
     private var tokensLastOK: Date?
+    private let launchAgentLabel = "com.local.codex-usage"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[CodexUsage] launched, creating status item")
@@ -712,6 +713,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info(windowLine("5 小时窗口", usage.fiveHour)))
         menu.addItem(info(windowLine("7 天窗口", usage.sevenDay)))
         if let rc = usage.resetCredits, rc > 0 {
+            menu.addItem(.separator())
             menu.addItem(info("重置卡：×\(rc)"))
         }
         menu.addItem(.separator())
@@ -724,11 +726,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(info("Token 今天 \(Fmt.tokensCn(usage.tokensToday?.total))"
                 + " · 7 天 \(Fmt.tokensCn(usage.tokens7d?.total))"
                 + " · 30 天 \(Fmt.tokensCn(usage.tokens30d?.total))"))
-            if let s = usage.tokensToday {
-                menu.addItem(info("  ├ 今日：input \(Fmt.tokensCn(s.input)) / output \(Fmt.tokensCn(s.output))"))
-            }
-            if let s = usage.tokens7d {
-                menu.addItem(info("  └ 近 7 天：input \(Fmt.tokensCn(s.input)) / output \(Fmt.tokensCn(s.output))"))
+            var tokenDetails: [(label: String, s: TokenScanner.Stats)] = []
+            if let s = usage.tokensToday { tokenDetails.append(("今日", s)) }
+            if let s = usage.tokens7d { tokenDetails.append(("近 7 天", s)) }
+            if let s = usage.tokens30d { tokenDetails.append(("近 30 天", s)) }
+            for (i, d) in tokenDetails.enumerated() {
+                let branch = i < tokenDetails.count - 1 ? "├" : "└"
+                menu.addItem(info("  \(branch) \(d.label)：input \(Fmt.tokensCn(d.s.input))"
+                    + " / output \(Fmt.tokensCn(d.s.output))"))
             }
         }
 
@@ -747,10 +752,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
+        menu.addItem(info("更新于 \(Fmt.time(usage.updatedAt))"))
+        menu.addItem(.separator())
         let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(onRefresh), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
 
+        let loginItem = NSMenuItem(title: "开机自启", action: #selector(onToggleLogin), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = isLoginItemEnabled() ? .on : .off
+        menu.addItem(loginItem)
+
+        menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出", action: #selector(onQuit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -759,6 +772,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func onRefresh() { refresh(tokens: true) }
+
+    // MARK: 开机自启（LaunchAgent，与 GlmUsage/KimiUsage 同款）
+
+    private var launchAgentPath: String {
+        NSHomeDirectory() + "/Library/LaunchAgents/\(launchAgentLabel).plist"
+    }
+
+    private func isLoginItemEnabled() -> Bool {
+        FileManager.default.fileExists(atPath: launchAgentPath)
+    }
+
+    @objc private func onToggleLogin() {
+        if isLoginItemEnabled() {
+            try? FileManager.default.removeItem(atPath: launchAgentPath)
+        } else {
+            let exec = Bundle.main.executablePath ?? ""
+            let plist = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>Label</key><string>\(launchAgentLabel)</string>
+                <key>ProgramArguments</key>
+                <array><string>\(exec)</string></array>
+                <key>RunAtLoad</key><true/>
+                <key>KeepAlive</key><true/>
+            </dict>
+            </plist>
+            """
+            try? plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+        }
+        rebuildMenu()
+    }
 
     @objc private func onQuit() { NSApp.terminate(nil) }
 }
