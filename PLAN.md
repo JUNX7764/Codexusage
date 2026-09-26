@@ -1,0 +1,149 @@
+# CodexUsage v1.0.0 开发规划（任务书）
+
+单文件 Swift 菜单栏应用，监控 OpenAI Codex 订阅（ChatGPT Plus 的 Codex 额度）用量，架构与同机的 GlmUsage 完全同构。目标：替代 Electron 版 CodexMeter 的核心功能，内存 ~80MB（CodexMeter 实际独占 250–350MB）。
+
+**v1.0.0 不做**：硬件表盘（ESP32）、图表窗口、Proma 会话扫描（场景未发生，留待 v1.1）、登录流程（直接复用 Codex CLI 的凭证文件）。
+
+模板：`/Users/Chester/Documents/Zcode/Glmusage/GlmUsage.swift`（741 行，整体骨架照抄此文件：NSApplication 菜单栏、StatusItem 两行文本渲染 StackImage、DispatchSourceTimer 定时刷新、--once 自检、status.json 自诊断、下拉菜单构建）。把数据层（CredStore/Fetcher/P peak）替换为下述 Codex 数据层即可。
+
+---
+
+## 1. 额度数据源（已实测，每 60 秒刷新）
+
+```
+GET https://chatgpt.com/backend-api/wham/usage
+Headers:
+  Authorization: Bearer <access_token>
+  Accept: application/json
+  OpenAI-Beta: codex-1
+  originator: Codex Desktop
+```
+
+### 1.1 实测响应结构（2026-09-26，HTTP 200，走 rate_limit 格式）
+
+```jsonc
+{
+  "user_id": "...", "plan_type": "plus",
+  "rate_limit": {
+    "allowed": true, "limit_reached": false,
+    "primary_window": {            // 5 小时窗口
+      "used_percent": 14,          // 整数 0-100，已用百分比
+      "limit_window_seconds": 18000,
+      "reset_at": 1790440265,      // epoch 秒（<10^10 则 ×1000 得毫秒）
+      "reset_after_seconds": 15929 // 兜底：now + 此值
+    },
+    "secondary_window": {          // 7 天窗口
+      "used_percent": 63, "limit_window_seconds": 604800,
+      "reset_at": 1790594069, "reset_after_seconds": 169733
+    }
+  },
+  "credits": { "balance": 0, "has_credits": false },
+  "rate_limit_reset_credits": { "available_count": 3, "applicable_available_count": 0 }
+}
+```
+
+### 1.2 解析规则（兼容两种格式，与 CodexMeter 的 quota.ts 一致）
+
+1. **新格式**：`usage.limits[]`，元素 `{ window: "5h"|"7d", used: 数值, limit: 数值>0, reset_at }`，percentUsed = used/limit×100。
+2. **旧格式（当前实际返回）**：`rate_limit.primary_window` → 5h；`rate_limit.secondary_window` → 7d。used_percent 直接就是已用百分比。可用 `limit_window_seconds` 校验（≈18000=5h，≈604800=7d）。
+3. 两种都存在时合并收集；同一 code 以新格式优先。
+4. `reset_at` 可能是 epoch 秒 / epoch 毫秒（>10^10）/ ISO8601 字符串 / 缺失。缺失时用 `now + reset_after_seconds`。
+5. 套餐 `plan_type`（string，如 "plus"）；重置卡 `rate_limit_reset_credits.available_count`（int）。
+
+### 1.3 认证：只读 `~/.codex/auth.json`（Codex CLI 自己维护）
+
+```jsonc
+{
+  "auth_mode": "chatgpt",
+  "OPENAI_API_KEY": null,
+  "tokens": { "id_token": "...", "access_token": "...", "refresh_token": "...", "account_id": "..." },
+  "last_refresh": "2026-09-24T13:41:04.087869Z"
+}
+```
+
+- Codex CLI 运行时会自动刷新并写回此文件，所以**每次拉额度前重新读文件**取 `tokens.access_token` 即可，绝大多数情况无需自己刷新。
+- email 可从 `tokens.id_token`（JWT）的 payload `https://api.openai.com/profile` claim 里解 `email`（Base64URL 解码第二段），仅用于菜单展示，解析失败就跳过。
+
+## 2. 401 兜底刷新（低频，防刷新风暴）
+
+仅当额度请求返回 401 时触发，且距上次刷新尝试 >5 分钟才真正发请求：
+
+```
+POST https://auth.openai.com/oauth/token
+Content-Type: application/x-www-form-urlencoded
+body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_token=<tokens.refresh_token>
+```
+
+响应 `{ access_token, refresh_token?, id_token?, expires_in }`。成功后**原子写回** `~/.codex/auth.json`：保留原 JSON 全部字段，仅更新 `tokens.access_token` / `tokens.refresh_token`（响应缺失则保留原值）/ `tokens.id_token`（同前）/ `last_refresh`（now ISO8601）。原子写 = 先写同目录 `.tmp` 再 `rename()`。刷新成功后用新 token 重试一次额度请求。刷新失败 → 记 quotaError。
+
+## 3. Token 统计（本地扫描，每 5 分钟一轮 = 每 5 个额度周期）
+
+扫描 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`，仅近 30 天的日期目录。
+
+- 每行是 JSON 事件。目标事件：`type == "event_msg"` 且 `payload.type == "token_count"`，取**该文件中最后一条**的 `payload.info.total_token_usage`（会话累计值）：
+
+```jsonc
+{ "input_tokens": 37522, "cached_input_tokens": 13056, "cache_write_input_tokens": 0,
+  "output_tokens": 235, "reasoning_output_tokens": 92, "total_tokens": 37757 }
+```
+
+- 会话日期 = 文件名前缀 `rollout-YYYY-MM-DDTHH-MM-SS-` 解析（本地时区）。
+- 聚合：今天 / 近 7 天 / 近 30 天 的 total_tokens 之和，附带 input（= input_tokens）/ output（= output_tokens）细分。
+- **增量扫描**（必须，避免每轮全量重读）：状态存 `~/Library/Application Support/CodexUsage/scan-state.json`，记录每文件 `{path: {size, mtime}}`；未变化的文件沿用上次结果；从索引消失的文件（已删除）剔除其贡献。可参考 KimiUsage 的同类实现：`/Users/Chester/Documents/kimi/workspace/kimi-usage-menubar/KimiUsage.swift`（搜"增量"）。
+- v1.0.0 不扫 `~/.proma`（Proma 目录）。
+
+## 4. UI 规格（与 GlmUsage 视觉一致）
+
+**菜单栏两行**（剩余口径，与 GlmUsage 相同）：
+
+```
+5H 86%
+7D 37%
+```
+
+（100 − used_percent，四舍五入取整。）
+
+**数据新鲜度标注（v1 内置，重要）**：分别记录额度（quota）与 token 统计（tokens）的**最后成功时间**。额度 >10 分钟未成功 → 菜单栏第一行前缀 `⚠ `，菜单显示 `⚠ 额度数据过期（最后成功 MM-dd HH:mm）`；tokens >30 分钟同理。刷新成功即恢复。这是本工具区别于两个前辈的改进点（KimiUsage/GlmUsage 目前失败时静默保留旧数据，易误导）。
+
+**下拉菜单**（自上而下）：
+
+```
+Codex 用量（plus 套餐）        // plan_type 大写展示；第二行可显示 email（解析到时）
+─
+5 小时窗口：剩余 86%（重置 09-27 03:31）
+7 天窗口：剩余 37%（重置 09-28 13:54）
+重置卡：×3                     // available_count > 0 时显示
+─
+Token 今天 12.3 万 · 7 天 87 万 · 30 天 210 万   // 格式化见 Fmt
+  ├ 今日：input 9.8 万 / output 2.5 万
+  └ 近 7 天：input 71 万 / output 16 万
+（⚠ tokens 过期行，过期时）
+（错误行：quota/tokens 最后一条错误，有才显示）
+─
+立即刷新
+退出
+```
+
+**--once 自检模式**：拉一次额度 + 全量扫一次 token，打印摘要后退出（照 GlmUsage 的 --once 风格）。**输出严禁包含任何 token/密钥值。**
+
+**status.json 自诊断**：`~/Library/Application Support/CodexUsage/status.json`，字段：line1/line2/planType/五小时剩余/7天剩余/重置时间/quotaLastSuccess/tokensLastSuccess/quotaError/tokensError/updatedAt。**同样严禁写入 token 值。**
+
+## 5. 工程与部署边界
+
+- 单文件 `CodexUsage.swift`；`build.sh` 与 `Info.plist` 已就绪，**不要改动**（部署目标 13.0 是刻意为之，本机 CLT 默认 macosx28 会被 LaunchServices 拒绝）。
+- 刷新节奏：额度 60s / token 扫描每 5 周期（照 GlmUsage 的 tokenEveryCycles 模式）。
+- 网络瞬断时保留上次成功数据但**必须**带 ⚠ 过期标注（与 GlmUsage 的静默保留不同，这是刻意改进）。
+- **本任务不做部署**：不动 LaunchAgents、不 kill CodexMeter、不拷贝到 ~/Applications（由主会话与用户确认后进行）。
+
+## 6. 验收标准
+
+1. `./build.sh` 编译零错误（允许无害 warning，尽量消掉）。
+2. `./CodexUsage.app/Contents/MacOS/CodexUsage --once` 输出：plan_type=plus、5H 剩余 ≈86%、7D 剩余 ≈37%（数字随时间小幅漂移属正常，与接口一致性以能拉到为准）、token 三窗口数字非空（近 30 天有会话）。
+3. 代码/提交/输出/status.json 中无任何密钥值（grep 验证：不得出现 access_token/refresh_token 的值片段）。
+4. `git log` 有清晰中文提交。
+
+## 7. 红线
+
+- access_token / refresh_token / id_token 的**值**不得出现在：代码注释、提交信息、--once 输出、日志、status.json、报告文本里。
+- `~/.codex/` 下只允许**读**；唯一例外是 §2 的 401 刷新成功后原子写回 auth.json 本身。
+- 不安装任何依赖（纯 Foundation + AppKit）。
