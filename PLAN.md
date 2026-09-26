@@ -128,6 +128,54 @@ Token 今天 12.3 万 · 7 天 87 万 · 30 天 210 万   // 格式化见 Fmt
 
 **status.json 自诊断**：`~/Library/Application Support/CodexUsage/status.json`，字段：line1/line2/planType/五小时剩余/7天剩余/重置时间/quotaLastSuccess/tokensLastSuccess/quotaError/tokensError/updatedAt。**同样严禁写入 token 值。**
 
+## 4.5 充值卡（额度重置卡）展示 —— v1.1 增补，对齐 GlmUsage
+
+GlmUsage（"充值卡监测"分支，已部署）已有同款功能，展示格式必须逐行对齐。完整参考实现：`/tmp/glm_resetcard.swift`（若不存在：`cd /Users/Chester/Documents/Zcode/Glmusage && git show '充值卡监测:GlmUsage.swift' > /tmp/glm_resetcard.swift` 自行提取，**只读，不要切分支**）。
+
+### 数据源（已实测 2026-09-26，HTTP 200）
+
+```
+GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits
+Headers: 与 §1 的 wham/usage 完全相同（Bearer access_token + OpenAI-Beta + originator）
+```
+
+响应：
+
+```jsonc
+{ "credits": [
+  { "id": "RateLimitResetCredit_…", "reset_type": "codex_rate_limits",
+    "is_supported_by_plan": true, "status": "available",
+    "granted_at": "2026-09-04T05:13:13.828469Z",   // ISO8601 UTC
+    "expires_at": "2026-10-04T05:13:13.828469Z",
+    "title": "Full reset (Weekly + 5 hr)", ... },
+  … 共 3 张 ] }
+```
+
+解析规则（与 CodexMeter parseResetCreditsPayload 一致）：
+- 容器字段兼容 `credits / reset_credits / resetCredits / data`。
+- 有效卡：`status` 为空或不在 `["redeemed","used","consumed","expired","unavailable"]`，且 `expires_at > now`。按 `expires_at` 升序展示。
+- 卡名：`title` 含 "Full reset" → 展示为 `全额重置卡`；否则用 title 原文。
+
+### 展示格式（对齐 GlmUsage rebuildMenu，替换现有"重置卡：×N"单行）
+
+```
+充值卡（额度重置）：×3                          // 汇总行；位置在 7 天窗口行之后、Token 区之前
+  ⚠️ 全额重置卡 · 2026-10-04 13:13 过期        // ≤72 小时临期 → "⚠️ " 前缀；非临期 → 两空格缩进
+  全额重置卡 · 2026-10-04 13:13 过期
+```
+
+- 空列表 → `充值卡（额度重置）：暂无可用`
+- 明细端点失败但 wham/usage 的 available_count > 0 → `充值卡（额度重置）：×N（明细获取失败）`
+- 两者都失败 → `充值卡获取失败：<截断60字>`（GlmUsage 同款句式；提示语用 Codex 语境，不要提 ZCode）
+- 时间格式照搬 GlmUsage 的 `Fmt.expires`：今天 → `今天 HH:mm`；明天 → `明天 HH:mm`；否则 `yyyy-MM-dd HH:mm`（本地时区）。
+
+### 行为细节
+
+- 刷新周期：与 token 统计同周期（每 5 分钟，tokenEveryCycles）；瞬时失败保留上次数据（同 §5 静默保留规则），充值卡失败**不触发**额度 ⚠ 过期标注（增强信息，与 GlmUsage 一致）。
+- status.json 增加 `resetCards` 字段：`["2026-10-04T05:13:13Z", …]`（各卡过期 ISO，无敏感信息）。
+- `--once` 打印每张有效卡的过期时间（本地时区）。
+- 套餐到期行：GlmUsage 有（subscription/list 接口），OpenAI 侧无对应公开接口，**v1.1 不做**，菜单已有的 plus 套餐展示保持。
+
 ## 5. 工程与部署边界
 
 - 单文件 `CodexUsage.swift`；`build.sh` 与 `Info.plist` 已就绪，**不要改动**（部署目标 13.0 是刻意为之，本机 CLT 默认 macosx28 会被 LaunchServices 拒绝）。
