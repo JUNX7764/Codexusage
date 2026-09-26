@@ -1,3 +1,7 @@
+# 构建产物
 CodexUsage.app/
 CodexUsage-bin
 .DS_Store
+# 图标生成中间产物（保留 icns 成品）
+AppIcon.iconset/
+icon_1024x1024.png
