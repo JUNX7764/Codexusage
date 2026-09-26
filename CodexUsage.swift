@@ -576,11 +576,12 @@ enum Fmt {
         }
         return f.string(from: d)
     }
-    /// token 数量中文缩写：9,999 以内原样 / 12.3 万 / 2.1 亿（末尾多余的 .0 去掉）
-    static func tokensCn(_ v: Double?) -> String {
+    /// token 数量缩写（B/M/K）：9,999 以内原样 / 123.4K / 1.23M / 1.23B（末尾多余的 .0 去掉）
+    static func tokensAbbr(_ v: Double?) -> String {
         guard let v = v else { return "--" }
-        if v >= 100_000_000 { return trim(v / 100_000_000, 2) + " 亿" }
-        if v >= 10_000 { return trim(v / 10_000, 1) + " 万" }
+        if v >= 1_000_000_000 { return trim(v / 1_000_000_000, 2) + "B" }
+        if v >= 1_000_000 { return trim(v / 1_000_000, 2) + "M" }
+        if v >= 10_000 { return trim(v / 10_000, 1) + "K" }
         return String(format: "%.0f", v)
     }
     private static func trim(_ x: Double, _ digits: Int) -> String {
@@ -830,17 +831,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if usage.tokensToday == nil && usage.tokens7d == nil && usage.tokens30d == nil {
             menu.addItem(info("Token 用量：暂无数据"))
         } else {
-            menu.addItem(info("Token 今天 \(Fmt.tokensCn(usage.tokensToday?.total))"
-                + " · 7 天 \(Fmt.tokensCn(usage.tokens7d?.total))"
-                + " · 30 天 \(Fmt.tokensCn(usage.tokens30d?.total))"))
+            menu.addItem(info("Token 今天 \(Fmt.tokensAbbr(usage.tokensToday?.total))"
+                + " · 7 天 \(Fmt.tokensAbbr(usage.tokens7d?.total))"
+                + " · 30 天 \(Fmt.tokensAbbr(usage.tokens30d?.total))"))
             var tokenDetails: [(label: String, s: TokenScanner.Stats)] = []
             if let s = usage.tokensToday { tokenDetails.append(("今日", s)) }
             if let s = usage.tokens7d { tokenDetails.append(("近 7 天", s)) }
             if let s = usage.tokens30d { tokenDetails.append(("近 30 天", s)) }
             for (i, d) in tokenDetails.enumerated() {
                 let branch = i < tokenDetails.count - 1 ? "├" : "└"
-                menu.addItem(info("  \(branch) \(d.label)：input \(Fmt.tokensCn(d.s.input))"
-                    + " / output \(Fmt.tokensCn(d.s.output))"))
+                menu.addItem(info("  \(branch) \(d.label)：input \(Fmt.tokensAbbr(d.s.input))"
+                    + " / output \(Fmt.tokensAbbr(d.s.output))"))
             }
         }
 
@@ -968,8 +969,8 @@ func onceMode() {
 
     if let s = scan {
         func t(_ x: TokenScanner.Stats) -> String {
-            "total=\(Fmt.tokensCn(x.total)) input=\(Fmt.tokensCn(x.input))"
-                + " output=\(Fmt.tokensCn(x.output)) files=\(x.files)"
+            "total=\(Fmt.tokensAbbr(x.total)) input=\(Fmt.tokensAbbr(x.input))"
+                + " output=\(Fmt.tokensAbbr(x.output)) files=\(x.files)"
         }
         print("tokens today: \(t(s.today))")
         print("tokens 7d:   \(t(s.seven))")
