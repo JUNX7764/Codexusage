@@ -6,6 +6,7 @@ import Foundation
 // 架构与同机 GlmUsage 完全同构（单文件 / 纯 Foundation + AppKit / 无外部依赖）。
 // 数据源：
 //   额度  GET https://chatgpt.com/backend-api/wham/usage（每 60s，Bearer 凭证来自 ~/.codex/auth.json）
+//   充值卡 GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits（每 5 分钟，认证头同款）
 //   token 统计：本地增量扫描 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl（每 5 分钟）
 // 凭证红线：access_token / refresh_token / id_token 只存在于内存，绝不写入日志、
 //   status.json、scan-state.json 或提交；~/.codex/ 只读，唯一例外是 401 刷新成功后
@@ -112,11 +113,19 @@ struct QuotaData {
     var error: String?
 }
 
+/// 充值卡（官方名：额度重置卡）明细端点返回的一张有效卡
+struct ResetCard {
+    var expires: Date    // 过期时间（expires_at）
+    var name: String     // 展示名：title 含 "Full reset" → "全额重置卡"，否则用原文
+}
+
 struct UsageData {
     var fiveHour: QuotaWindow?
     var sevenDay: QuotaWindow?
     var planType: String?
-    var resetCredits: Int?
+    var resetCredits: Int?          // wham/usage 的 available_count（明细失败时的兜底汇总）
+    var resetCards: [ResetCard]?    // 明细端点的有效卡列表（nil = 未获取或本次失败）
+    var resetCardsError: String?
     var email: String?
     var tokensToday: TokenScanner.Stats?
     var tokens7d: TokenScanner.Stats?
@@ -133,9 +142,12 @@ struct UsageData {
 // reset_at 兼容 epoch 秒 / epoch 毫秒（>10^10）/ ISO8601 字符串 / 缺失（用 reset_after_seconds 兜底）。
 // 401 时才尝试刷新（距上次刷新尝试 >5 分钟，防刷新风暴）：POST auth.openai.com/oauth/token，
 // 成功后原子写回 auth.json 并用新凭证重试一次额度请求。
+// 充值卡明细另走 GET wham/rate-limit-reset-credits（认证头完全同款；401 不做兜底刷新，
+// 避免新增写 auth.json 的路径，失败由调用方降级展示）。
 
 enum Fetcher {
     static let usageURL = "https://chatgpt.com/backend-api/wham/usage"
+    static let resetCreditsURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
     static let refreshURL = "https://auth.openai.com/oauth/token"
     // Codex CLI 公开 client_id（与官方 CLI 相同，非密钥）
     static let clientID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -151,7 +163,7 @@ enum Fetcher {
             completion(e)
             return
         }
-        requestUsage(token: auth.tokens.accessToken) { obj, status, netErr in
+        requestUsage(usageURL, token: auth.tokens.accessToken) { obj, status, netErr in
             if status == 401 {
                 attemptRefresh(auth: auth) { refreshErr in
                     guard refreshErr == nil, let fresh = CodexAuth.load() else {
@@ -161,7 +173,7 @@ enum Fetcher {
                         completion(e)
                         return
                     }
-                    requestUsage(token: fresh.tokens.accessToken) { obj2, status2, err2 in
+                    requestUsage(usageURL, token: fresh.tokens.accessToken) { obj2, status2, err2 in
                         completion(finish(obj2, status: status2, err: err2, email: fresh.tokens.email))
                     }
                 }
@@ -181,9 +193,10 @@ enum Fetcher {
         return e
     }
 
-    private static func requestUsage(token: String,
+    /// 认证 GET（额度与充值卡明细共用，header 与 wham/usage 完全同款）
+    private static func requestUsage(_ urlStr: String, token: String,
                                      completion: @escaping ([String: Any]?, Int?, String?) -> Void) {
-        guard let url = URL(string: usageURL) else {
+        guard let url = URL(string: urlStr) else {
             completion(nil, nil, "bad url"); return
         }
         var req = URLRequest(url: url, timeoutInterval: 15)
@@ -295,6 +308,42 @@ enum Fetcher {
         let after = ((w["reset_after_seconds"] as? NSNumber)
             ?? (w["reset_after"] as? NSNumber))?.doubleValue ?? 0
         return after > 0 ? now.addingTimeInterval(after) : nil
+    }
+
+    /// 充值卡（额度重置卡）明细：GET wham/rate-limit-reset-credits（认证头与 wham/usage 同款）。
+    /// 401 不做兜底刷新（避免新增写 auth.json 的路径），失败由调用方降级展示。
+    static func fetchResetCards(completion: @escaping ([ResetCard]?, String?) -> Void) {
+        guard let auth = CodexAuth.load() else {
+            completion(nil, "未找到 Codex 凭证（~/.codex/auth.json）"); return
+        }
+        requestUsage(resetCreditsURL, token: auth.tokens.accessToken) { obj, status, err in
+            if let err = err { completion(nil, err); return }
+            guard status == 200, let obj = obj else {
+                completion(nil, "HTTP \(status ?? 0)"); return
+            }
+            completion(parseResetCards(obj, now: Date()), nil)
+        }
+    }
+
+    /// 明细解析（与 CodexMeter parseResetCreditsPayload 口径一致）：容器字段兼容
+    /// credits / reset_credits / resetCredits / data；有效卡 = status 为空或不在已失效
+    /// 集合，且 expires_at > now；按过期时间升序；title 含 "Full reset" → "全额重置卡"。
+    private static func parseResetCards(_ obj: [String: Any], now: Date) -> [ResetCard] {
+        let invalid: Set<String> = ["redeemed", "used", "consumed", "expired", "unavailable"]
+        let container = obj["credits"] ?? obj["reset_credits"] ?? obj["resetCredits"] ?? obj["data"]
+        guard let list = container as? [[String: Any]] else { return [] }
+        var cards: [ResetCard] = []
+        for c in list {
+            let status = ((c["status"] as? String) ?? "").lowercased()
+            guard !invalid.contains(status) else { continue }
+            guard let exp = Fmt.parseDateValue(c["expires_at"] ?? c["expiresAt"]),
+                  exp > now else { continue }
+            let title = (c["title"] as? String) ?? ""
+            let name = title.contains("Full reset") ? "全额重置卡"
+                : (title.isEmpty ? "额度重置卡" : title)
+            cards.append(ResetCard(expires: exp, name: name))
+        }
+        return cards.sorted { $0.expires < $1.expires }
     }
 }
 
@@ -513,6 +562,20 @@ enum Fmt {
         f.dateFormat = "MM-dd HH:mm"
         return f.string(from: d)
     }
+    /// 充值卡到期提示（本地时区）：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期
+    static func expires(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        let cal = Calendar.current
+        if cal.isDateInToday(d) {
+            f.dateFormat = "'今天' HH:mm"
+        } else if cal.isDateInTomorrow(d) {
+            f.dateFormat = "'明天' HH:mm"
+        } else {
+            f.dateFormat = "yyyy-MM-dd HH:mm"
+        }
+        return f.string(from: d)
+    }
     /// token 数量中文缩写：9,999 以内原样 / 12.3 万 / 2.1 亿（末尾多余的 .0 去掉）
     static func tokensCn(_ v: Double?) -> String {
         guard let v = v else { return "--" }
@@ -585,7 +648,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // 拉取数据：额度走网络（回调内含 401 兜底刷新），token 扫描走后台线程
+    // 拉取数据：额度走网络（回调内含 401 兜底刷新），token 扫描与充值卡明细走每 5 分钟周期
     private func refresh(tokens: Bool) {
         Fetcher.fetchQuota { [weak self] r in
             DispatchQueue.main.async { self?.applyQuota(r) }
@@ -594,6 +657,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 let r = TokenScanner.scan()
                 DispatchQueue.main.async { self?.applyTokens(r) }
+            }
+            // 充值卡（额度重置卡）：与 token 统计同周期；失败不触发额度 ⚠ 过期标注
+            Fetcher.fetchResetCards { [weak self] cards, err in
+                DispatchQueue.main.async { self?.applyResetCards(cards, err) }
             }
         }
     }
@@ -625,6 +692,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.tokens7d = r.seven
             usage.tokens30d = r.thirty
             usage.tokensError = nil
+        }
+        usage.updatedAt = Date()
+        renderBar()
+        rebuildMenu()
+    }
+
+    // 充值卡：成功则更新并清错误；瞬时失败保留上次数据、仅记录错误
+    // （有旧数据时菜单仍展示旧卡；不触碰 quotaLastOK，不影响额度 ⚠ 过期标注）
+    private func applyResetCards(_ cards: [ResetCard]?, _ err: String?) {
+        if let cards = cards {
+            usage.resetCards = cards
+            usage.resetCardsError = nil
+        } else if let err = err {
+            usage.resetCardsError = err
         }
         usage.updatedAt = Date()
         renderBar()
@@ -674,6 +755,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "fiveHourReset": usage.fiveHour?.reset.map { Fmt.dayTime($0) } ?? "",
             "sevenDayReset": usage.sevenDay?.reset.map { Fmt.dayTime($0) } ?? "",
             "resetCredits": usage.resetCredits ?? -1,
+            "resetCards": (usage.resetCards ?? []).map { iso($0.expires) },
+            "resetCardsError": usage.resetCardsError ?? "",
             "quotaLastSuccess": iso(quotaLastOK),
             "tokensLastSuccess": iso(tokensLastOK),
             "quotaStale": quotaStale,
@@ -712,9 +795,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(info(windowLine("5 小时窗口", usage.fiveHour)))
         menu.addItem(info(windowLine("7 天窗口", usage.sevenDay)))
-        if let rc = usage.resetCredits, rc > 0 {
+
+        // 充值卡（额度重置卡）：独立成区两侧加横条（沿用原"重置卡：×N"的分区）；
+        // 有效卡按过期时间升序，≤72 小时临期加 ⚠️ 前缀（展示格式与 GlmUsage 逐行对齐）
+        func cardLine(_ name: String, _ d: Date) -> String {
+            let warn = d.timeIntervalSinceNow <= 72 * 3600
+            return (warn ? "⚠️ " : "  ") + "\(name) · \(Fmt.expires(d)) 过期"
+        }
+        var cardLines: [String] = []
+        if let cards = usage.resetCards {
+            if cards.isEmpty {
+                cardLines = ["充值卡（额度重置）：暂无可用"]
+            } else {
+                cardLines = ["充值卡（额度重置）：×\(cards.count)"]
+                cardLines += cards.map { cardLine($0.name, $0.expires) }
+            }
+        } else if let e = usage.resetCardsError {
+            // 明细失败：wham/usage 的 available_count > 0 时兜底显示数量，否则整区报错
+            if let n = usage.resetCredits, n > 0 {
+                cardLines = ["充值卡（额度重置）：×\(n)（明细获取失败）"]
+            } else {
+                let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
+                cardLines = ["充值卡获取失败：\(short)（Codex 登录态可能过期，运行 codex login 后重试）"]
+            }
+        }
+        if !cardLines.isEmpty {
             menu.addItem(.separator())
-            menu.addItem(info("重置卡：×\(rc)"))
+            for l in cardLines { menu.addItem(info(l)) }
         }
         menu.addItem(.separator())
 
@@ -815,6 +922,8 @@ func onceMode() {
     let group = DispatchGroup()
     var quota: QuotaData?
     var scan: TokenScanner.Result?
+    var cards: [ResetCard]?
+    var cardsErr: String?
     group.enter()
     Fetcher.fetchQuota { r in
         quota = r
@@ -823,6 +932,12 @@ func onceMode() {
     group.enter()
     DispatchQueue.global(qos: .userInitiated).async {
         scan = TokenScanner.scan()
+        group.leave()
+    }
+    group.enter()
+    Fetcher.fetchResetCards { c, e in
+        cards = c
+        cardsErr = e
         group.leave()
     }
     _ = group.wait(timeout: .now() + 60)
@@ -843,6 +958,13 @@ func onceMode() {
     } else {
         print("quota: no result (timeout)")
     }
+
+    // 充值卡（额度重置卡）：每张有效卡的过期时间（本地时区）
+    if let cs = cards {
+        print("reset cards: \(cs.count) valid")
+        for c in cs { print("  \(c.name) · \(Fmt.expires(c.expires)) 过期") }
+    }
+    if let e = cardsErr { print("reset cards error: \(e)") }
 
     if let s = scan {
         func t(_ x: TokenScanner.Stats) -> String {
