@@ -996,7 +996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else { s += "暂无数据" }
             if stale { s += " · ⚠️ 已过期" }
             if let error = error { s += " · 刷新失败：\(error)" }
-            s += " · 最后成功 \(last.map { Fmt.dayTime($0) } ?? "--")"
+            if let last = last, stale || error != nil { s += " · 最后成功 \(Fmt.dayTime(last))" }
             return s
         }
         menu.addItem(info(windowLine("5 小时窗口", usage.fiveHour)))
@@ -1064,7 +1064,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
-        menu.addItem(info("最近尝试刷新 \(Fmt.time(lastAttemptAt)) · 各项最后成功时间见上方"))
+        menu.addItem(info("最近尝试刷新 \(Fmt.time(lastAttemptAt))"))
         menu.addItem(.separator())
         let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(onRefresh), keyEquivalent: "r")
         refreshItem.target = self
