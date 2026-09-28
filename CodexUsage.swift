@@ -101,15 +101,18 @@ enum CodexFreshness {
         cards.filter { $0.expires > now }.sorted { $0.expires < $1.expires }
     }
 
-    static func apply<T>(fresh: T?, failure: String?, value: inout T?,
-                         lastSuccess: inout Date?, error: inout String?, now: Date) {
+    /// 纯函数：fresh 成功 → 新值+新成功时间+清错误；仅失败 → 保留旧值/旧成功时间+记录错误；
+    /// 两者皆无 → 原样返回。调用处对结果做顺序赋值——不要把 self 的多个子字段同时作为
+    /// inout 实参传入一个调用（同一存储属性的并发独占访问会触发 Swift 运行时崩溃）。
+    static func apply<T>(fresh: T?, failure: String?, old: T?, oldLastOK: Date?, oldError: String?,
+                         now: Date) -> (value: T?, lastOK: Date?, error: String?) {
         if let fresh = fresh {
-            value = fresh
-            lastSuccess = now
-            error = nil
-        } else if let failure = failure {
-            error = failure
+            return (fresh, now, nil)
         }
+        if let failure = failure {
+            return (old, oldLastOK, failure)
+        }
+        return (old, oldLastOK, oldError)
     }
 }
 
@@ -891,8 +894,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 充值卡：成功则更新并清错误；瞬时失败保留上次数据、仅记录错误
     // （有旧数据时菜单仍展示未过期的旧卡；卡数据状态与额度窗口互相独立）
     private func applyResetCards(_ cards: [ResetCard]?, _ err: String?) {
-        CodexFreshness.apply(fresh: cards, failure: err, value: &usage.resetCards,
-            lastSuccess: &resetCardsLastOK, error: &usage.resetCardsError, now: Date())
+        let r = CodexFreshness.apply(fresh: cards, failure: err,
+            old: usage.resetCards, oldLastOK: resetCardsLastOK, oldError: usage.resetCardsError, now: Date())
+        usage.resetCards = r.value
+        resetCardsLastOK = r.lastOK
+        usage.resetCardsError = r.error
         usage.updatedAt = Date()
         renderBar()
         rebuildMenu()
@@ -1237,13 +1243,10 @@ enum CodexOfflineRegression {
             try expect(emptyCards.cards?.isEmpty == true && emptyCards.error == nil,
                        "valid empty card list was rejected")
 
-            var cachedCards: [ResetCard]? = cards
             let priorCardsOK = now.addingTimeInterval(-1_000)
-            var cardsOK: Date? = priorCardsOK
-            var cardsError: String?
-            CodexFreshness.apply(fresh: missingCards.cards, failure: missingCards.error,
-                value: &cachedCards, lastSuccess: &cardsOK, error: &cardsError, now: now)
-            try expect(cachedCards?.count == 1 && cardsOK == priorCardsOK && cardsError != nil,
+            let cardsR = CodexFreshness.apply(fresh: missingCards.cards, failure: missingCards.error,
+                old: cards, oldLastOK: priorCardsOK, oldError: nil, now: now)
+            try expect(cardsR.value?.count == 1 && cardsR.lastOK == priorCardsOK && cardsR.error != nil,
                        "failed card response cleared old cards or advanced last-success")
 
             let authPath = root.appendingPathComponent("auth.json").path
