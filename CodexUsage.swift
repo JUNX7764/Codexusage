@@ -1,5 +1,106 @@
 import Cocoa
 import Foundation
+import CoreFoundation
+import Darwin
+
+enum CodexNumber {
+    static func finite(_ value: Any?) -> Double? {
+        if let text = value as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, let number = Double(trimmed), number.isFinite else { return nil }
+            return number
+        }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let result = number.doubleValue
+        return result.isFinite ? result : nil
+    }
+}
+
+enum AtomicJSONFile {
+    static func replace(_ data: Data, at path: String) throws {
+        let directory = (path as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        let existingMode = (try? FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber)
+            .map { Int16(truncating: $0) }
+        let requested = existingMode ?? 0o600
+        let safeMode = requested & 0o600 == 0 ? 0o600 : requested & 0o600
+        let temp = directory + "/." + (path as NSString).lastPathComponent + "." + UUID().uuidString + ".tmp"
+        let fd = open(temp, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o600))
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        var fdOpen = true
+        var shouldRemove = true
+        defer {
+            if fdOpen { _ = close(fd) }
+            if shouldRemove { _ = unlink(temp) }
+        }
+        var offset = 0
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            while offset < data.count {
+                let count = write(fd, base.advanced(by: offset), data.count - offset)
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                }
+                guard count > 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO)) }
+                offset += count
+            }
+        }
+        guard fchmod(fd, mode_t(safeMode)) == 0, fsync(fd) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard close(fd) == 0 else {
+            fdOpen = false
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        fdOpen = false
+        guard rename(temp, path) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        shouldRemove = false
+    }
+}
+
+final class RefreshGate {
+    private let lock = NSLock()
+    private var active = false
+    private var queuedManual = false
+
+    func begin(manual: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !active else { if manual { queuedManual = true }; return false }
+        active = true
+        return true
+    }
+
+    func finish() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if queuedManual { queuedManual = false; return true }
+        active = false
+        return false
+    }
+}
+
+enum CodexFreshness {
+    static func updated(_ previous: Date?, succeeded: Bool, at: Date) -> Date? {
+        succeeded ? at : previous
+    }
+
+    static func isStale(lastSuccess: Date?, hasData: Bool, now: Date, after: TimeInterval) -> Bool {
+        guard hasData else { return false }
+        guard let lastSuccess = lastSuccess else { return true }
+        return now.timeIntervalSince(lastSuccess) > after
+    }
+
+    static func availableCards(_ cards: [ResetCard], now: Date) -> [ResetCard] {
+        cards.filter { $0.expires > now }.sorted { $0.expires < $1.expires }
+    }
+}
+
+enum CodexRefreshSchedule {
+    static func slowItemsDue(cycle: Int, every: Int = 5, manual: Bool) -> Bool {
+        manual || (every > 0 && cycle % every == 0)
+    }
+}
 
 // MARK: - CodexUsage：监控 OpenAI Codex 订阅（ChatGPT Plus 的 Codex 额度）的菜单栏工具
 //
@@ -27,14 +128,13 @@ enum CodexAuth {
         var idToken: String?
         var email: String?
     }
-    /// tokens + 原始 JSON（401 刷新成功后写回时保留全部字段用），仅存活于内存
+    /// 当前认证字段快照；写回时必须重新读取最新 JSON，不能复用旧文档。
     struct Snapshot {
         var tokens: Tokens
-        var raw: [String: Any]
     }
 
-    static func load() -> Snapshot? {
-        guard let data = FileManager.default.contents(atPath: authPath),
+    static func load(at path: String = authPath) -> Snapshot? {
+        guard let data = FileManager.default.contents(atPath: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let tokens = obj["tokens"] as? [String: Any],
               let access = tokens["access_token"] as? String, !access.isEmpty else {
@@ -44,37 +144,36 @@ enum CodexAuth {
         let id = tokens["id_token"] as? String
         return Snapshot(
             tokens: Tokens(accessToken: access, refreshToken: refresh,
-                           idToken: id, email: id.flatMap(jwtEmail)),
-            raw: obj)
+                           idToken: id, email: id.flatMap(jwtEmail)))
     }
 
-    /// 401 刷新成功后原子写回：保留原 JSON 全部字段，仅更新 access/refresh/id_token
-    /// （响应缺失则保留原值）与 last_refresh。原子写 = 先写同目录 .tmp 再 rename()。
-    static func writeBack(raw: [String: Any], accessToken: String,
-                          refreshToken: String?, idToken: String?) -> Bool {
-        var obj = raw
-        var tokens = (obj["tokens"] as? [String: Any]) ?? [:]
+    static func sameAuth(_ a: Tokens, _ b: Tokens) -> Bool {
+        a.accessToken == b.accessToken && a.refreshToken == b.refreshToken && a.idToken == b.idToken
+    }
+
+    /// Re-read and merge into the newest document. A Codex CLI rotation during refresh wins.
+    static func writeBack(at path: String = authPath, expected: Tokens, accessToken: String,
+                          refreshToken: String?, idToken: String?) throws -> (access: String, wrote: Bool) {
+        guard let data = FileManager.default.contents(atPath: path),
+              var obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var tokens = obj["tokens"] as? [String: Any],
+              let latestAccess = tokens["access_token"] as? String, !latestAccess.isEmpty else {
+            throw NSError(domain: "CodexUsage.Auth", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "auth.json missing tokens.access_token"])
+        }
+        let latest = Tokens(accessToken: latestAccess,
+                            refreshToken: tokens["refresh_token"] as? String,
+                            idToken: tokens["id_token"] as? String,
+                            email: (tokens["id_token"] as? String).flatMap(jwtEmail))
+        guard sameAuth(expected, latest) else { return (latestAccess, false) }
         tokens["access_token"] = accessToken
         if let r = refreshToken, !r.isEmpty { tokens["refresh_token"] = r }
         if let i = idToken, !i.isEmpty { tokens["id_token"] = i }
         obj["tokens"] = tokens
         obj["last_refresh"] = Fmt.isoFrac.string(from: Date())
-        guard JSONSerialization.isValidJSONObject(obj),
-              let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted])
-        else { return false }
-        let tmp = authPath + ".tmp"
-        // 保持原文件权限（凭证文件通常 0600），读取失败按 0600 兜底
-        let perms = ((try? FileManager.default.attributesOfItem(atPath: authPath))?[.posixPermissions] as? NSNumber)
-            ?? NSNumber(value: 0o600)
-        guard FileManager.default.createFile(atPath: tmp, contents: data,
-                                             attributes: [.posixPermissions: perms]) else {
-            return false
-        }
-        if rename(tmp, authPath) != 0 {
-            try? FileManager.default.removeItem(atPath: tmp)
-            return false
-        }
-        return true
+        let updated = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+        try AtomicJSONFile.replace(updated, at: path)
+        return (accessToken, true)
     }
 
     /// JWT 第二段 Base64URL 解码 → payload claim "https://api.openai.com/profile".email
@@ -110,6 +209,8 @@ struct QuotaData {
     var planType: String?
     var resetCredits: Int?
     var email: String?
+    var fiveHourError: String?
+    var sevenDayError: String?
     var error: String?
 }
 
@@ -132,7 +233,15 @@ struct UsageData {
     var tokens30d: TokenScanner.Stats?
     var quotaError: String?
     var tokensError: String?
+    var fiveHourError: String?
+    var sevenDayError: String?
     var updatedAt: Date = Date()
+}
+
+enum QuotaMerge {
+    static func preferred(_ fresh: QuotaWindow?, old: QuotaWindow?) -> QuotaWindow? {
+        fresh ?? old
+    }
 }
 
 // MARK: - 额度接口（wham/usage）+ 401 兜底刷新
@@ -160,6 +269,8 @@ enum Fetcher {
         guard let auth = CodexAuth.load() else {
             var e = QuotaData()
             e.error = "未找到 Codex 凭证（~/.codex/auth.json）"
+            e.fiveHourError = e.error
+            e.sevenDayError = e.error
             completion(e)
             return
         }
@@ -183,13 +294,15 @@ enum Fetcher {
         }
     }
 
-    private static func finish(_ obj: [String: Any]?, status: Int?, err: String?,
+    static func finish(_ obj: [String: Any]?, status: Int?, err: String?,
                                email: String?) -> QuotaData {
         if status == 200, let obj = obj {
             return parseUsage(obj, now: Date(), email: email)
         }
         var e = QuotaData(email: email)
         if let err = err { e.error = err } else { e.error = "HTTP \(status ?? 0)" }
+        e.fiveHourError = e.error
+        e.sevenDayError = e.error
         return e
     }
 
@@ -227,6 +340,13 @@ enum Fetcher {
     /// 401 兜底刷新。返回 nil 表示成功，否则返回失败原因（绝不包含任何 token 值）。
     private static func attemptRefresh(auth: CodexAuth.Snapshot,
                                        completion: @escaping (String?) -> Void) {
+        guard let current = CodexAuth.load() else {
+            completion("auth.json 读取失败"); return
+        }
+        if !CodexAuth.sameAuth(auth.tokens, current.tokens) {
+            // Codex CLI already rotated credentials after the failed request; caller will reload and retry.
+            completion(nil); return
+        }
         refreshLock.lock()
         let now = Date()
         if let last = lastRefreshAttempt, now.timeIntervalSince(last) < refreshMinInterval {
@@ -236,7 +356,7 @@ enum Fetcher {
         lastRefreshAttempt = now
         refreshLock.unlock()
 
-        guard let rt = auth.tokens.refreshToken, !rt.isEmpty else {
+        guard let rt = current.tokens.refreshToken, !rt.isEmpty else {
             completion("auth.json 中无 refresh_token"); return
         }
         guard let url = URL(string: refreshURL) else {
@@ -256,33 +376,46 @@ enum Fetcher {
                 completion(err?.localizedDescription ?? "刷新请求 HTTP \(status)")
                 return
             }
-            let ok = CodexAuth.writeBack(raw: auth.raw, accessToken: access,
-                                         refreshToken: obj["refresh_token"] as? String,
-                                         idToken: obj["id_token"] as? String)
-            completion(ok ? nil : "写回 auth.json 失败")
+            do {
+                let write = try CodexAuth.writeBack(expected: current.tokens, accessToken: access,
+                    refreshToken: obj["refresh_token"] as? String, idToken: obj["id_token"] as? String)
+                if write.wrote { NSLog("[CodexUsage] OAuth credentials atomically updated") }
+                else { NSLog("[CodexUsage] Codex CLI changed credentials during refresh; kept latest auth.json") }
+                completion(nil)
+            } catch {
+                NSLog("[CodexUsage] OAuth credential write failed: %@", error.localizedDescription)
+                completion("写回 auth.json 失败")
+            }
         }.resume()
     }
 
     /// 兼容新旧两种额度格式；同一 code 新格式（usage.limits）优先
-    private static func parseUsage(_ obj: [String: Any], now: Date, email: String?) -> QuotaData {
+    static func parseUsage(_ obj: [String: Any], now: Date, email: String?) -> QuotaData {
         var out = QuotaData(email: email)
         out.planType = (obj["plan_type"] as? String) ?? (obj["planType"] as? String)
-        if let rc = (obj["rate_limit_reset_credits"] as? [String: Any])?["available_count"] as? NSNumber {
-            out.resetCredits = rc.intValue
+        if let raw = (obj["rate_limit_reset_credits"] as? [String: Any])?["available_count"],
+           let count = CodexNumber.finite(raw), count >= 0,
+           count.rounded(.towardZero) == count, count <= Double(Int.max) {
+            out.resetCredits = Int(count)
         }
         var byCode: [String: (used: Double, reset: Date?)] = [:]
+        var errors = ["5h": "missing or invalid 5H used_percent", "7d": "missing or invalid 7D used_percent"]
 
         // 旧格式（当前实际返回）：rate_limit.primary_window → 5h，secondary_window → 7d，
         // used_percent 直接是已用百分比；limit_window_seconds 用于校验窗口类型
         if let rl = obj["rate_limit"] as? [String: Any] {
             for (key, fallback) in [("primary_window", "5h"), ("secondary_window", "7d")] {
                 guard let w = rl[key] as? [String: Any] else { continue }
-                let seconds = (w["limit_window_seconds"] as? NSNumber)?.doubleValue ?? 0
+                let seconds = CodexNumber.finite(w["limit_window_seconds"]) ?? 0
                 var code = fallback
                 if abs(seconds - 18000) <= 60 { code = "5h" }
                 else if abs(seconds - 604800) <= 3600 { code = "7d" }
-                let used = (w["used_percent"] as? NSNumber)?.doubleValue ?? 0
-                byCode[code] = (used, resetDate(w, now: now))
+                if let used = CodexNumber.finite(w["used_percent"]), (0...100).contains(used) {
+                    byCode[code] = (used, resetDate(w, now: now))
+                    errors[code] = ""
+                } else {
+                    errors[code] = "invalid \(code.uppercased()) used_percent"
+                }
             }
         }
         // 新格式：usage.limits[]，percentUsed = used/limit×100（同 code 覆盖旧格式）
@@ -290,23 +423,30 @@ enum Fetcher {
         if let limits = usageNode["limits"] as? [[String: Any]] {
             for e in limits {
                 guard let code = e["window"] as? String, code == "5h" || code == "7d" else { continue }
-                let used = (e["used"] as? NSNumber)?.doubleValue ?? 0
-                let limit = (e["limit"] as? NSNumber)?.doubleValue ?? 0
-                guard limit > 0 else { continue }
+                guard let used = CodexNumber.finite(e["used"]), used >= 0,
+                      let limit = CodexNumber.finite(e["limit"]), limit > 0,
+                      used <= limit else {
+                    if byCode[code] == nil { errors[code] = "invalid \(code.uppercased()) used/limit" }
+                    continue
+                }
                 byCode[code] = (used / limit * 100, resetDate(e, now: now))
+                errors[code] = ""
             }
         }
 
         if let v = byCode["5h"] { out.fiveHour = QuotaWindow(usedPercent: v.used, reset: v.reset) }
+        else { out.fiveHourError = errors["5h"] }
         if let v = byCode["7d"] { out.sevenDay = QuotaWindow(usedPercent: v.used, reset: v.reset) }
-        if out.fiveHour == nil && out.sevenDay == nil { out.error = "unexpected payload" }
+        else { out.sevenDayError = errors["7d"] }
+        if out.fiveHour == nil && out.sevenDay == nil {
+            out.error = [out.fiveHourError, out.sevenDayError].compactMap { $0 }.joined(separator: "; ")
+        }
         return out
     }
 
     private static func resetDate(_ w: [String: Any], now: Date) -> Date? {
         if let d = Fmt.parseDateValue(w["reset_at"] ?? w["resetAt"] ?? w["resets_at"]) { return d }
-        let after = ((w["reset_after_seconds"] as? NSNumber)
-            ?? (w["reset_after"] as? NSNumber))?.doubleValue ?? 0
+        let after = CodexNumber.finite(w["reset_after_seconds"] ?? w["reset_after"]) ?? 0
         return after > 0 ? now.addingTimeInterval(after) : nil
     }
 
@@ -328,7 +468,7 @@ enum Fetcher {
     /// 明细解析（与 CodexMeter parseResetCreditsPayload 口径一致）：容器字段兼容
     /// credits / reset_credits / resetCredits / data；有效卡 = status 为空或不在已失效
     /// 集合，且 expires_at > now；按过期时间升序；title 含 "Full reset" → "全额重置卡"。
-    private static func parseResetCards(_ obj: [String: Any], now: Date) -> [ResetCard] {
+    static func parseResetCards(_ obj: [String: Any], now: Date) -> [ResetCard] {
         let invalid: Set<String> = ["redeemed", "used", "consumed", "expired", "unavailable"]
         let container = obj["credits"] ?? obj["reset_credits"] ?? obj["resetCredits"] ?? obj["data"]
         guard let list = container as? [[String: Any]] else { return [] }
@@ -606,7 +746,7 @@ enum Fmt {
     static func parseDateValue(_ v: Any?) -> Date? {
         if let n = v as? NSNumber {
             let s = n.doubleValue
-            guard s > 0 else { return nil }
+            guard s.isFinite, s > 0 else { return nil }
             return Date(timeIntervalSince1970: s > 10_000_000_000 ? s / 1000 : s)
         }
         if let str = v as? String, !str.isEmpty {
@@ -625,14 +765,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var usage = UsageData()
     private var cycle = 0
+    private let refreshGate = RefreshGate()
     // token 扫描每 N 个刷新周期做一次（额度仍每 60s 刷新）
     private let tokenEveryCycles = 5
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
     // （与 GlmUsage 的静默保留旧数据不同，这是刻意改进：过期数据必须可见）
     private let quotaStaleAfter: TimeInterval = 600
     private let tokensStaleAfter: TimeInterval = 1800
-    private var quotaLastOK: Date?
+    private var fiveHourLastOK: Date?
+    private var sevenDayLastOK: Date?
     private var tokensLastOK: Date?
+    private var resetCardsLastOK: Date?
+    private var lastAttemptAt = Date()
     private let launchAgentLabel = "com.local.codex-usage"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -641,43 +785,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.isVisible = true
         rebuildMenu()
         renderBar()
-        refresh(tokens: true)
+        refresh(tokens: true, manual: true)
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.cycle += 1
-            self.refresh(tokens: self.cycle % self.tokenEveryCycles == 0)
+            self.refresh(tokens: CodexRefreshSchedule.slowItemsDue(cycle: self.cycle,
+                every: self.tokenEveryCycles, manual: false))
         }
+        timer?.tolerance = 6
     }
 
     // 拉取数据：额度走网络（回调内含 401 兜底刷新），token 扫描与充值卡明细走每 5 分钟周期
-    private func refresh(tokens: Bool) {
+    private func refresh(tokens: Bool, manual: Bool = false) {
+        guard refreshGate.begin(manual: manual) else { return }
+        performRefresh(tokens: tokens || manual)
+    }
+
+    private func performRefresh(tokens: Bool) {
+        lastAttemptAt = Date()
+        renderBar()
+        rebuildMenu()
+        let group = DispatchGroup()
+        group.enter()
         Fetcher.fetchQuota { [weak self] r in
-            DispatchQueue.main.async { self?.applyQuota(r) }
+            DispatchQueue.main.async {
+                self?.applyQuota(r)
+                group.leave()
+            }
         }
         if tokens {
+            group.enter()
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 let r = TokenScanner.scan()
-                DispatchQueue.main.async { self?.applyTokens(r) }
+                DispatchQueue.main.async {
+                    self?.applyTokens(r)
+                    group.leave()
+                }
             }
             // 充值卡（额度重置卡）：与 token 统计同周期；失败不触发额度 ⚠ 过期标注
+            group.enter()
             Fetcher.fetchResetCards { [weak self] cards, err in
-                DispatchQueue.main.async { self?.applyResetCards(cards, err) }
+                DispatchQueue.main.async {
+                    self?.applyResetCards(cards, err)
+                    group.leave()
+                }
             }
+        }
+        group.notify(queue: .main) { [weak self] in
+            guard let self = self else { return }
+            if self.refreshGate.finish() { self.performRefresh(tokens: true) }
         }
     }
 
     // 本次新拉到的值非 nil 才算成功、才推进 lastOK；失败时保留旧数据 + 错误行
     private func applyQuota(_ r: QuotaData) {
-        if r.error == nil, r.fiveHour != nil || r.sevenDay != nil {
-            quotaLastOK = Date()
-            usage.fiveHour = r.fiveHour ?? usage.fiveHour
-            usage.sevenDay = r.sevenDay ?? usage.sevenDay
-            usage.planType = r.planType ?? usage.planType
-            usage.resetCredits = r.resetCredits ?? usage.resetCredits
-            usage.quotaError = nil
-        } else {
-            usage.quotaError = r.error ?? "unexpected payload"
-        }
+        let now = Date()
+        fiveHourLastOK = CodexFreshness.updated(fiveHourLastOK, succeeded: r.fiveHour != nil, at: now)
+        sevenDayLastOK = CodexFreshness.updated(sevenDayLastOK, succeeded: r.sevenDay != nil, at: now)
+        usage.fiveHour = QuotaMerge.preferred(r.fiveHour, old: usage.fiveHour)
+        usage.sevenDay = QuotaMerge.preferred(r.sevenDay, old: usage.sevenDay)
+        usage.planType = r.planType ?? usage.planType
+        usage.resetCredits = r.resetCredits ?? usage.resetCredits
+        usage.fiveHourError = r.fiveHour == nil ? (r.fiveHourError ?? r.error) : nil
+        usage.sevenDayError = r.sevenDay == nil ? (r.sevenDayError ?? r.error) : nil
+        usage.quotaError = r.error
         usage.email = r.email ?? usage.email
         usage.updatedAt = Date()
         renderBar()
@@ -685,10 +856,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyTokens(_ r: TokenScanner.Result) {
+        tokensLastOK = CodexFreshness.updated(tokensLastOK, succeeded: r.error == nil, at: Date())
         if let e = r.error {
             usage.tokensError = e
         } else {
-            tokensLastOK = Date()
             usage.tokensToday = r.today
             usage.tokens7d = r.seven
             usage.tokens30d = r.thirty
@@ -700,8 +871,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // 充值卡：成功则更新并清错误；瞬时失败保留上次数据、仅记录错误
-    // （有旧数据时菜单仍展示旧卡；不触碰 quotaLastOK，不影响额度 ⚠ 过期标注）
+    // （有旧数据时菜单仍展示未过期的旧卡；卡数据状态与额度窗口互相独立）
     private func applyResetCards(_ cards: [ResetCard]?, _ err: String?) {
+        resetCardsLastOK = CodexFreshness.updated(resetCardsLastOK, succeeded: cards != nil, at: Date())
         if let cards = cards {
             usage.resetCards = cards
             usage.resetCardsError = nil
@@ -716,29 +888,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
     // 无数据不算过期——菜单里本就显示"暂无数据"，无需再标注。
     private func isStale(_ lastOK: Date?, hasData: Bool, after: TimeInterval) -> Bool {
-        guard hasData else { return false }
-        guard let t = lastOK else { return true }
-        return Date().timeIntervalSince(t) > after
+        CodexFreshness.isStale(lastSuccess: lastOK, hasData: hasData, now: Date(), after: after)
     }
-    private var quotaStale: Bool {
-        isStale(quotaLastOK, hasData: usage.fiveHour != nil || usage.sevenDay != nil,
-                after: quotaStaleAfter)
+    private var fiveHourStale: Bool {
+        isStale(fiveHourLastOK, hasData: usage.fiveHour != nil, after: quotaStaleAfter)
+    }
+    private var sevenDayStale: Bool {
+        isStale(sevenDayLastOK, hasData: usage.sevenDay != nil, after: quotaStaleAfter)
     }
     private var tokensStale: Bool {
         isStale(tokensLastOK,
                 hasData: usage.tokensToday != nil || usage.tokens7d != nil || usage.tokens30d != nil,
                 after: tokensStaleAfter)
     }
+    private var resetCardsStale: Bool {
+        isStale(resetCardsLastOK, hasData: usage.resetCards != nil, after: 900)
+    }
 
     // 菜单栏显示：5H / 7D 两行堆叠（剩余口径）；额度过期时第一行前缀 ⚠
     private func renderBar() {
-        let line1 = (quotaStale ? "⚠ " : "") + "5H \(Fmt.remainingPct(usage.fiveHour?.usedPercent))"
-        let line2 = "7D \(Fmt.remainingPct(usage.sevenDay?.usedPercent))"
+        let line1 = (fiveHourStale ? "⚠ " : "") + "5H \(Fmt.remainingPct(usage.fiveHour?.usedPercent))"
+        let line2 = (sevenDayStale ? "⚠ " : "") + "7D \(Fmt.remainingPct(usage.sevenDay?.usedPercent))"
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
-        statusItem.button?.toolTip = "Codex 用量 · 额度最后成功 \(quotaLastOK.map { Fmt.time($0) } ?? "--")"
+        statusItem.button?.toolTip = "Codex 用量 · 5H成功 \(fiveHourLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · 7D成功 \(sevenDayLastOK.map { Fmt.time($0) } ?? "--")"
             + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · 充值卡最后成功 \(resetCardsLastOK.map { Fmt.time($0) } ?? "--")"
         writeStatus(line1: line1, line2: line2)
     }
 
@@ -747,6 +924,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let dir = NSHomeDirectory() + "/Library/Application Support/CodexUsage"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         func iso(_ d: Date?) -> String { d.map { ISO8601DateFormatter().string(from: $0) } ?? "" }
+        let cardsNow = CodexFreshness.availableCards(usage.resetCards ?? [], now: Date())
         let info: [String: Any] = [
             "line1": line1,
             "line2": line2,
@@ -756,17 +934,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "fiveHourReset": usage.fiveHour?.reset.map { Fmt.dayTime($0) } ?? "",
             "sevenDayReset": usage.sevenDay?.reset.map { Fmt.dayTime($0) } ?? "",
             "resetCredits": usage.resetCredits ?? -1,
-            "resetCards": (usage.resetCards ?? []).map { iso($0.expires) },
+            "resetCards": cardsNow.map { iso($0.expires) },
             "resetCardsError": usage.resetCardsError ?? "",
-            "quotaLastSuccess": iso(quotaLastOK),
+            "quotaLastSuccess": ["fiveHour": iso(fiveHourLastOK), "sevenDay": iso(sevenDayLastOK)],
             "tokensLastSuccess": iso(tokensLastOK),
-            "quotaStale": quotaStale,
+            "resetCardsLastSuccess": iso(resetCardsLastOK),
+            "resetCardsStale": resetCardsStale,
+            "fiveHourStale": fiveHourStale,
+            "sevenDayStale": sevenDayStale,
             "tokensStale": tokensStale,
+            "fiveHourError": usage.fiveHourError ?? "",
+            "sevenDayError": usage.sevenDayError ?? "",
             "quotaError": usage.quotaError ?? "",
             "tokensError": usage.tokensError ?? "",
-            "updatedAt": ISO8601DateFormatter().string(from: Date())
+            "lastAttemptAt": iso(lastAttemptAt)
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted]) {
+        if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: URL(fileURLWithPath: dir + "/status.json"))
         }
     }
@@ -789,9 +972,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         func windowLine(_ label: String, _ w: QuotaWindow?) -> String {
-            guard let w = w else { return "\(label)：暂无数据" }
-            var s = "\(label)：剩余 \(Fmt.remainingPct(w.usedPercent))"
-            if let r = w.reset { s += "（重置 \(Fmt.dayTime(r))）" }
+            let isFive = label == "5 小时窗口"
+            let last = isFive ? fiveHourLastOK : sevenDayLastOK
+            let stale = isFive ? fiveHourStale : sevenDayStale
+            let error = isFive ? usage.fiveHourError : usage.sevenDayError
+            var s = "\(label)："
+            if let w = w {
+                s += "剩余 \(Fmt.remainingPct(w.usedPercent))"
+                if let r = w.reset { s += "（重置 \(Fmt.dayTime(r))）" }
+            } else { s += "暂无数据" }
+            if stale { s += " · ⚠️ 已过期" }
+            if let error = error { s += " · 刷新失败：\(error)" }
+            s += " · 最后成功 \(last.map { Fmt.dayTime($0) } ?? "--")"
             return s
         }
         menu.addItem(info(windowLine("5 小时窗口", usage.fiveHour)))
@@ -804,7 +996,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return (warn ? "⚠️ " : "  ") + "\(name) · \(Fmt.expires(d)) 过期"
         }
         var cardLines: [String] = []
-        if let cards = usage.resetCards {
+        if let storedCards = usage.resetCards {
+            let cards = CodexFreshness.availableCards(storedCards, now: Date())
             if cards.isEmpty {
                 cardLines = ["充值卡（额度重置）：暂无可用"]
             } else {
@@ -820,15 +1013,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 cardLines = ["充值卡获取失败：\(short)（Codex 登录态可能过期，运行 codex login 后重试）"]
             }
         }
+        if resetCardsStale {
+            cardLines.append("⚠️ 充值卡数据已过期 · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")")
+        }
+        if let e = usage.resetCardsError, usage.resetCards != nil {
+            cardLines.append("充值卡刷新失败：\(e) · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")")
+        }
         if !cardLines.isEmpty {
             menu.addItem(.separator())
             for l in cardLines { menu.addItem(info(l)) }
         }
         menu.addItem(.separator())
 
-        if let e = usage.tokensError {
-            menu.addItem(info("Token 统计失败：\(e)"))
-        } else if usage.tokensToday == nil && usage.tokens7d == nil && usage.tokens30d == nil {
+        if usage.tokensToday == nil && usage.tokens7d == nil && usage.tokens30d == nil {
             menu.addItem(info("Token 用量：暂无数据"))
         } else {
             menu.addItem(info("Token 今天 \(Fmt.tokensAbbr(usage.tokensToday?.total))"
@@ -845,22 +1042,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // 数据过期提示（本工具对 GlmUsage/KimiUsage 的刻意改进）
-        if quotaStale {
-            menu.addItem(info("⚠ 额度数据过期（最后成功 \(quotaLastOK.map { Fmt.dayTime($0) } ?? "--")）"))
-        }
         if tokensStale {
             menu.addItem(info("⚠ tokens 过期（最后成功 \(tokensLastOK.map { Fmt.dayTime($0) } ?? "--")）"))
         }
+        if let e = usage.tokensError { menu.addItem(info("Token 统计失败：\(e)")) }
         if let e = usage.quotaError {
             menu.addItem(info("额度错误：\(e)"))
         }
-        if let e = usage.tokensError {
-            menu.addItem(info("Token 错误：\(e)"))
-        }
 
         menu.addItem(.separator())
-        menu.addItem(info("更新于 \(Fmt.time(usage.updatedAt))"))
+        menu.addItem(info("最近尝试刷新 \(Fmt.time(lastAttemptAt)) · 各项最后成功时间见上方"))
         menu.addItem(.separator())
         let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(onRefresh), keyEquivalent: "r")
         refreshItem.target = self
@@ -879,7 +1070,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    @objc private func onRefresh() { refresh(tokens: true) }
+    @objc private func onRefresh() { refresh(tokens: true, manual: true) }
 
     // MARK: 开机自启（LaunchAgent，与 GlmUsage/KimiUsage 同款）
 
@@ -918,6 +1109,159 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 // MARK: - 入口（支持 --once 命令行自检）
+
+enum CodexOfflineRegression {
+    struct Failure: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    private static func expect(_ value: @autoclosure () -> Bool, _ message: String) throws {
+        if !value() { throw Failure(description: message) }
+    }
+
+    static func run() -> Int32 {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexUsage-self-test-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+            try expect(CodexNumber.finite(Double.nan) == nil, "NaN accepted as a quota value")
+            try expect(CodexNumber.finite(Double.infinity) == nil, "infinity accepted as a quota value")
+            try expect(CodexNumber.finite(true) == nil, "boolean accepted as a quota value")
+
+            let missing = Fetcher.parseUsage([:], now: now, email: nil)
+            try expect(missing.fiveHour == nil && missing.fiveHourError != nil, "missing 5H was not rejected")
+            try expect(missing.sevenDay == nil && missing.sevenDayError != nil, "missing 7D was not rejected")
+            try expect(missing.error != nil, "empty quota response was reported successful")
+
+            let partial = Fetcher.parseUsage([
+                "rate_limit": [
+                    "primary_window": ["used_percent": "NaN"],
+                    "secondary_window": ["used_percent": 35]
+                ]
+            ], now: now, email: nil)
+            try expect(partial.fiveHour == nil && partial.fiveHourError != nil, "invalid 5H became zero")
+            try expect(partial.sevenDay?.usedPercent == 35 && partial.sevenDayError == nil,
+                       "valid 7D was discarded with invalid 5H")
+
+            let reverse = Fetcher.parseUsage([
+                "usage": ["limits": [
+                    ["window": "5h", "used": 0, "limit": 100],
+                    ["window": "7d", "used": Double.nan, "limit": 100]
+                ]],
+                "rate_limit_reset_credits": ["available_count": true]
+            ], now: now, email: nil)
+            try expect(reverse.fiveHour?.usedPercent == 0, "valid zero-use value was rejected")
+            try expect(reverse.sevenDay == nil && reverse.sevenDayError != nil, "invalid 7D was treated as zero")
+            try expect(reverse.resetCredits == nil, "boolean reset-card count was accepted")
+            let legacy = Fetcher.parseUsage(["rate_limit": [
+                "primary_window": ["used_percent": 15, "limit_window_seconds": 18_000],
+                "secondary_window": ["used_percent": 64, "limit_window_seconds": 604_800]
+            ]], now: now, email: nil)
+            try expect(legacy.fiveHour?.usedPercent == 15 && legacy.sevenDay?.usedPercent == 64,
+                       "valid legacy windows did not parse")
+
+            let old5 = QuotaWindow(usedPercent: 20, reset: nil)
+            try expect(QuotaMerge.preferred(nil, old: old5)?.usedPercent == 20,
+                       "failed window did not retain its previous value")
+            let last = now.addingTimeInterval(-100)
+            try expect(CodexFreshness.updated(last, succeeded: false, at: now) == last,
+                       "failed refresh advanced last-success time")
+            try expect(CodexFreshness.isStale(lastSuccess: last, hasData: true, now: now, after: 50),
+                       "retained old data was not stale")
+
+            let gate = RefreshGate()
+            try expect(gate.begin(manual: false), "initial refresh gate did not open")
+            try expect(!gate.begin(manual: false), "overlapping timer refresh started")
+            try expect(!gate.begin(manual: true) && !gate.begin(manual: true), "manual overlap started immediately")
+            try expect(gate.finish(), "manual requests did not coalesce to one follow-up")
+            try expect(!gate.begin(manual: false), "gate did not remain active for queued follow-up")
+            try expect(!gate.finish() && gate.begin(manual: false), "gate was not released after follow-up")
+            try expect(!CodexRefreshSchedule.slowItemsDue(cycle: 4, manual: false)
+                       && CodexRefreshSchedule.slowItemsDue(cycle: 5, manual: false)
+                       && CodexRefreshSchedule.slowItemsDue(cycle: 1, manual: true),
+                       "60s/300s/manual refresh schedule is incorrect")
+
+            let cardPayload: [String: Any] = ["credits": [
+                ["status": "available", "expires_at": now.addingTimeInterval(3_600).timeIntervalSince1970,
+                 "title": "Full reset (Weekly + 5 hr)"],
+                ["status": "available", "expires_at": now.addingTimeInterval(-1).timeIntervalSince1970,
+                 "title": "expired by time"],
+                ["status": "used", "expires_at": now.addingTimeInterval(86_400).timeIntervalSince1970,
+                 "title": "already used"]
+            ]]
+            let cards = Fetcher.parseResetCards(cardPayload, now: now)
+            try expect(cards.count == 1 && cards[0].name == "全额重置卡", "expired/used reset cards counted as available")
+            try expect(CodexFreshness.availableCards(cards + [
+                ResetCard(expires: now.addingTimeInterval(-1), name: "stale cache")
+            ], now: now).count == 1, "expired cached card counted as usable")
+
+            let authPath = root.appendingPathComponent("auth.json").path
+            func authDocument(_ access: String, _ refresh: String, _ id: String, _ marker: String) -> [String: Any] {
+                ["auth_mode": "chatgpt", "marker": marker,
+                 "tokens": ["access_token": access, "refresh_token": refresh,
+                            "id_token": id, "account_id": "fake-account"]]
+            }
+            let initialData = try JSONSerialization.data(withJSONObject: authDocument("old-a", "old-r", "old-i", "before"))
+            try initialData.write(to: URL(fileURLWithPath: authPath))
+            try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: authPath)
+            guard let expected = CodexAuth.load(at: authPath) else {
+                throw Failure(description: "temporary auth file could not be read")
+            }
+
+            // Simulate the Codex CLI rotating all auth fields while our request is in flight.
+            let clientData = try JSONSerialization.data(withJSONObject: authDocument("client-a", "client-r", "client-i", "client-change"))
+            try clientData.write(to: URL(fileURLWithPath: authPath), options: .atomic)
+            let beforeConflict = try Data(contentsOf: URL(fileURLWithPath: authPath))
+            let conflict = try CodexAuth.writeBack(at: authPath, expected: expected.tokens,
+                accessToken: "stale-response", refreshToken: "stale-refresh", idToken: "stale-id")
+            try expect(!conflict.wrote && conflict.access == "client-a", "CLI credential rotation was overwritten")
+            let afterConflict = try Data(contentsOf: URL(fileURLWithPath: authPath))
+            try expect(beforeConflict == afterConflict, "conflict path changed the latest auth document")
+            guard let latest = CodexAuth.load(at: authPath) else {
+                throw Failure(description: "latest temporary auth file could not be read")
+            }
+            try expect(!CodexAuth.sameAuth(expected.tokens, latest.tokens),
+                       "pre-request freshness check missed rotated authentication fields")
+
+            let success = try CodexAuth.writeBack(at: authPath, expected: latest.tokens,
+                accessToken: "rotated-a", refreshToken: "rotated-r", idToken: "rotated-i")
+            try expect(success.wrote && success.access == "rotated-a", "credential refresh did not save")
+            let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: authPath))) as! [String: Any]
+            let savedTokens = saved["tokens"] as! [String: Any]
+            try expect(saved["marker"] as? String == "client-change", "new unrelated auth document data was lost")
+            try expect(savedTokens["account_id"] as? String == "fake-account", "unrelated token field was lost")
+            try expect(savedTokens["access_token"] as? String == "rotated-a"
+                       && savedTokens["refresh_token"] as? String == "rotated-r"
+                       && savedTokens["id_token"] as? String == "rotated-i", "rotated auth fields were not saved")
+            let permissions = try FileManager.default.attributesOfItem(atPath: authPath)[.posixPermissions] as! NSNumber
+            try expect(permissions.intValue & 0o077 == 0, "auth file gained group/other permissions")
+
+            let failedTarget = root.appendingPathComponent("directory-target").path
+            try FileManager.default.createDirectory(atPath: failedTarget, withIntermediateDirectories: false)
+            try Data("marker".utf8).write(to: URL(fileURLWithPath: failedTarget).appendingPathComponent("marker"))
+            var writeFailed = false
+            do { try AtomicJSONFile.replace(Data("new".utf8), at: failedTarget) }
+            catch { writeFailed = true }
+            try expect(writeFailed, "atomic credential write failure was swallowed")
+            let tempFiles = try FileManager.default.contentsOfDirectory(atPath: root.path)
+                .filter { $0.hasSuffix(".tmp") }
+            try expect(tempFiles.isEmpty, "failed write left a temporary credential file")
+
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, refresh gate/schedule, temp auth merge/permissions/failure)")
+            return 0
+        } catch {
+            fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
+            return 1
+        }
+    }
+}
+
+if CommandLine.arguments.contains("--self-test") {
+    exit(CodexOfflineRegression.run())
+}
 
 func onceMode() {
     let group = DispatchGroup()

@@ -74,7 +74,7 @@ Content-Type: application/x-www-form-urlencoded
 body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_token=<tokens.refresh_token>
 ```
 
-响应 `{ access_token, refresh_token?, id_token?, expires_in }`。成功后**原子写回** `~/.codex/auth.json`：保留原 JSON 全部字段，仅更新 `tokens.access_token` / `tokens.refresh_token`（响应缺失则保留原值）/ `tokens.id_token`（同前）/ `last_refresh`（now ISO8601）。原子写 = 先写同目录 `.tmp` 再 `rename()`。刷新成功后用新 token 重试一次额度请求。刷新失败 → 记 quotaError。
+响应 `{ access_token, refresh_token?, id_token?, expires_in }`。发刷新请求前重新读取 auth.json；刷新成功写回前再次读取最新 JSON，并比较 access/refresh/id 三个认证字段。若 Codex CLI 已更新任一字段，则保留客户端的新凭据并用它重试额度请求。否则仅在最新文档上合并续期认证字段与 `last_refresh`，使用同目录唯一临时文件、原子 `rename()`，权限限制为仅所有者可访问。写入失败要作为失败返回，不能吞掉错误后报告续期成功。Codex CLI 不使用本应用的文件锁，因此检查最新字段到原子替换之间仍存在无法完全消除的并发写入窗口。刷新失败 → 记 quotaError。
 
 ## 3. Token 统计（本地扫描，每 5 分钟一轮 = 每 5 个额度周期）
 
@@ -103,7 +103,7 @@ body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_to
 
 （100 − used_percent，四舍五入取整。）
 
-**数据新鲜度标注（v1 内置，重要）**：分别记录额度（quota）与 token 统计（tokens）的**最后成功时间**。额度 >10 分钟未成功 → 菜单栏第一行前缀 `⚠ `，菜单显示 `⚠ 额度数据过期（最后成功 MM-dd HH:mm）`；tokens >30 分钟同理。刷新成功即恢复。这是本工具区别于两个前辈的改进点（KimiUsage/GlmUsage 目前失败时静默保留旧数据，易误导）。
+**数据新鲜度标注（v1 内置，重要）**：5H、7D、token 统计、充值卡分别记录**最后成功时间**。每个项目失败时保留旧值、保留原成功时间，并显示当前错误；5H/7D 超过 10 分钟、tokens 超过 30 分钟、充值卡超过 15 分钟未成功即标 ⚠。菜单栏 5H/7D 行分别标注各自状态。菜单“最近尝试刷新”显示请求开始时间，状态文件使用同一口径的 `lastAttemptAt`。
 
 **下拉菜单**（自上而下）：
 
@@ -171,7 +171,7 @@ Headers: 与 §1 的 wham/usage 完全相同（Bearer access_token + OpenAI-Beta
 
 ### 行为细节
 
-- 刷新周期：与 token 统计同周期（每 5 分钟，tokenEveryCycles）；瞬时失败保留上次数据（同 §5 静默保留规则），充值卡失败**不触发**额度 ⚠ 过期标注（增强信息，与 GlmUsage 一致）。
+- 刷新周期：额度 60 秒；token 统计与充值卡每 5 分钟（tokenEveryCycles）；定时器容差 6 秒。单轮刷新只允许一份；定时器重叠直接合并丢弃，刷新中的重复手动请求合并为最多一轮后续完整刷新。瞬时失败保留上次数据；充值卡失败**不触发**额度 ⚠ 过期标注。
 - status.json 增加 `resetCards` 字段：`["2026-10-04T05:13:13Z", …]`（各卡过期 ISO，无敏感信息）。
 - `--once` 打印每张有效卡的过期时间（本地时区）。
 - 套餐到期行：GlmUsage 有（subscription/list 接口），OpenAI 侧无对应公开接口，**v1.1 不做**，菜单已有的 plus 套餐展示保持。
@@ -185,8 +185,8 @@ Headers: 与 §1 的 wham/usage 完全相同（Bearer access_token + OpenAI-Beta
 
 ## 6. 验收标准
 
-1. `./build.sh` 编译零错误（允许无害 warning，尽量消掉）。
-2. `./CodexUsage.app/Contents/MacOS/CodexUsage --once` 输出：plan_type=plus、5H 剩余 ≈86%、7D 剩余 ≈37%（数字随时间小幅漂移属正常，与接口一致性以能拉到为准）、token 三窗口数字非空（近 30 天有会话）。
+1. `./build.sh` 编译零错误（允许无害 warning，尽量消掉）；`./CodexUsage.app/Contents/MacOS/CodexUsage --self-test` 离线回归通过。
+2. 网络验收：在确认没有并发旧实例续期后再运行 `./CodexUsage.app/Contents/MacOS/CodexUsage --once`，核对 plan_type、额度和本地 token 汇总。隔离开发阶段不读取真实凭据、不执行此命令。
 3. 代码/提交/输出/status.json 中无任何密钥值（grep 验证：不得出现 access_token/refresh_token 的值片段）。
 4. `git log` 有清晰中文提交。
 
