@@ -165,6 +165,7 @@ Headers: 与 §1 的 wham/usage 完全相同（Bearer access_token + OpenAI-Beta
 ```
 
 - 空列表 → `充值卡（额度重置）：暂无可用`
+- 缺少列表容器、列表类型错误或卡记录字段损坏均算明细失败，保留旧卡和原成功时间；仅合法空数组表示暂无可用卡。
 - 明细端点失败但 wham/usage 的 available_count > 0 → `充值卡（额度重置）：×N（明细获取失败）`
 - 两者都失败 → `充值卡获取失败：<截断60字>`（GlmUsage 同款句式；提示语用 Codex 语境，不要提 ZCode）
 - 时间格式照搬 GlmUsage 的 `Fmt.expires`：今天 → `今天 HH:mm`；明天 → `明天 HH:mm`；否则 `yyyy-MM-dd HH:mm`（本地时区）。

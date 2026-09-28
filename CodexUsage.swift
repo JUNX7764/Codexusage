@@ -15,6 +15,12 @@ enum CodexNumber {
         let result = number.doubleValue
         return result.isFinite ? result : nil
     }
+
+    static func nonnegativeInteger(_ value: Any?) -> Int? {
+        guard let number = finite(value), number >= 0,
+              number.rounded(.towardZero) == number else { return nil }
+        return Int(exactly: number)
+    }
 }
 
 enum AtomicJSONFile {
@@ -93,6 +99,17 @@ enum CodexFreshness {
 
     static func availableCards(_ cards: [ResetCard], now: Date) -> [ResetCard] {
         cards.filter { $0.expires > now }.sorted { $0.expires < $1.expires }
+    }
+
+    static func apply<T>(fresh: T?, failure: String?, value: inout T?,
+                         lastSuccess: inout Date?, error: inout String?, now: Date) {
+        if let fresh = fresh {
+            value = fresh
+            lastSuccess = now
+            error = nil
+        } else if let failure = failure {
+            error = failure
+        }
     }
 }
 
@@ -393,10 +410,8 @@ enum Fetcher {
     static func parseUsage(_ obj: [String: Any], now: Date, email: String?) -> QuotaData {
         var out = QuotaData(email: email)
         out.planType = (obj["plan_type"] as? String) ?? (obj["planType"] as? String)
-        if let raw = (obj["rate_limit_reset_credits"] as? [String: Any])?["available_count"],
-           let count = CodexNumber.finite(raw), count >= 0,
-           count.rounded(.towardZero) == count, count <= Double(Int.max) {
-            out.resetCredits = Int(count)
+        if let raw = (obj["rate_limit_reset_credits"] as? [String: Any])?["available_count"] {
+            out.resetCredits = CodexNumber.nonnegativeInteger(raw)
         }
         var byCode: [String: (used: Double, reset: Date?)] = [:]
         var errors = ["5h": "missing or invalid 5H used_percent", "7d": "missing or invalid 7D used_percent"]
@@ -461,29 +476,33 @@ enum Fetcher {
             guard status == 200, let obj = obj else {
                 completion(nil, "HTTP \(status ?? 0)"); return
             }
-            completion(parseResetCards(obj, now: Date()), nil)
+            let parsed = parseResetCards(obj, now: Date())
+            completion(parsed.cards, parsed.error)
         }
     }
 
     /// 明细解析（与 CodexMeter parseResetCreditsPayload 口径一致）：容器字段兼容
     /// credits / reset_credits / resetCredits / data；有效卡 = status 为空或不在已失效
     /// 集合，且 expires_at > now；按过期时间升序；title 含 "Full reset" → "全额重置卡"。
-    static func parseResetCards(_ obj: [String: Any], now: Date) -> [ResetCard] {
+    static func parseResetCards(_ obj: [String: Any], now: Date) -> (cards: [ResetCard]?, error: String?) {
         let invalid: Set<String> = ["redeemed", "used", "consumed", "expired", "unavailable"]
         let container = obj["credits"] ?? obj["reset_credits"] ?? obj["resetCredits"] ?? obj["data"]
-        guard let list = container as? [[String: Any]] else { return [] }
+        guard let container = container else { return (nil, "missing card list") }
+        guard let list = container as? [[String: Any]] else { return (nil, "invalid card list") }
         var cards: [ResetCard] = []
         for c in list {
             let status = ((c["status"] as? String) ?? "").lowercased()
             guard !invalid.contains(status) else { continue }
-            guard let exp = Fmt.parseDateValue(c["expires_at"] ?? c["expiresAt"]),
-                  exp > now else { continue }
+            guard let exp = Fmt.parseDateValue(c["expires_at"] ?? c["expiresAt"]) else {
+                return (nil, "invalid card expiration")
+            }
+            guard exp > now else { continue }
             let title = (c["title"] as? String) ?? ""
             let name = title.contains("Full reset") ? "全额重置卡"
                 : (title.isEmpty ? "额度重置卡" : title)
             cards.append(ResetCard(expires: exp, name: name))
         }
-        return cards.sorted { $0.expires < $1.expires }
+        return (cards.sorted { $0.expires < $1.expires }, nil)
     }
 }
 
@@ -744,9 +763,8 @@ enum Fmt {
     }()
     /// reset_at 兼容：epoch 秒 / epoch 毫秒（>10^10）/ ISO8601 字符串
     static func parseDateValue(_ v: Any?) -> Date? {
-        if let n = v as? NSNumber {
-            let s = n.doubleValue
-            guard s.isFinite, s > 0 else { return nil }
+        if v is NSNumber {
+            guard let s = CodexNumber.finite(v), s > 0 else { return nil }
             return Date(timeIntervalSince1970: s > 10_000_000_000 ? s / 1000 : s)
         }
         if let str = v as? String, !str.isEmpty {
@@ -873,13 +891,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 充值卡：成功则更新并清错误；瞬时失败保留上次数据、仅记录错误
     // （有旧数据时菜单仍展示未过期的旧卡；卡数据状态与额度窗口互相独立）
     private func applyResetCards(_ cards: [ResetCard]?, _ err: String?) {
-        resetCardsLastOK = CodexFreshness.updated(resetCardsLastOK, succeeded: cards != nil, at: Date())
-        if let cards = cards {
-            usage.resetCards = cards
-            usage.resetCardsError = nil
-        } else if let err = err {
-            usage.resetCardsError = err
-        }
+        CodexFreshness.apply(fresh: cards, failure: err, value: &usage.resetCards,
+            lastSuccess: &resetCardsLastOK, error: &usage.resetCardsError, now: Date())
         usage.updatedAt = Date()
         renderBar()
         rebuildMenu()
@@ -1130,6 +1143,12 @@ enum CodexOfflineRegression {
             try expect(CodexNumber.finite(Double.nan) == nil, "NaN accepted as a quota value")
             try expect(CodexNumber.finite(Double.infinity) == nil, "infinity accepted as a quota value")
             try expect(CodexNumber.finite(true) == nil, "boolean accepted as a quota value")
+            try expect(CodexNumber.nonnegativeInteger(Double(Int.max)) == nil
+                       && CodexNumber.nonnegativeInteger(1e100) == nil
+                       && CodexNumber.nonnegativeInteger(1.5) == nil,
+                       "out-of-range or fractional card count was accepted")
+            try expect(CodexNumber.nonnegativeInteger(0) == 0,
+                       "valid zero card count was rejected")
 
             let missing = Fetcher.parseUsage([:], now: now, email: nil)
             try expect(missing.fiveHour == nil && missing.fiveHourError != nil, "missing 5H was not rejected")
@@ -1156,6 +1175,11 @@ enum CodexOfflineRegression {
             try expect(reverse.fiveHour?.usedPercent == 0, "valid zero-use value was rejected")
             try expect(reverse.sevenDay == nil && reverse.sevenDayError != nil, "invalid 7D was treated as zero")
             try expect(reverse.resetCredits == nil, "boolean reset-card count was accepted")
+            for badCount: Any in [Double(Int.max), 1e100, 1.5, true] {
+                let parsed = Fetcher.parseUsage(["rate_limit_reset_credits": ["available_count": badCount]],
+                                                now: now, email: nil)
+                try expect(parsed.resetCredits == nil, "invalid available_count was converted unsafely")
+            }
             let legacy = Fetcher.parseUsage(["rate_limit": [
                 "primary_window": ["used_percent": 15, "limit_window_seconds": 18_000],
                 "secondary_window": ["used_percent": 64, "limit_window_seconds": 604_800]
@@ -1192,11 +1216,35 @@ enum CodexOfflineRegression {
                 ["status": "used", "expires_at": now.addingTimeInterval(86_400).timeIntervalSince1970,
                  "title": "already used"]
             ]]
-            let cards = Fetcher.parseResetCards(cardPayload, now: now)
+            let cardsResult = Fetcher.parseResetCards(cardPayload, now: now)
+            guard let cards = cardsResult.cards else {
+                throw Failure(description: "valid card list failed: \(cardsResult.error ?? "unknown")")
+            }
             try expect(cards.count == 1 && cards[0].name == "全额重置卡", "expired/used reset cards counted as available")
             try expect(CodexFreshness.availableCards(cards + [
                 ResetCard(expires: now.addingTimeInterval(-1), name: "stale cache")
             ], now: now).count == 1, "expired cached card counted as usable")
+            let missingCards = Fetcher.parseResetCards(["error": "upstream"], now: now)
+            try expect(missingCards.cards == nil && missingCards.error != nil,
+                       "missing card container was accepted as an empty success")
+            let wrongCards = Fetcher.parseResetCards(["credits": [:]], now: now)
+            try expect(wrongCards.cards == nil && wrongCards.error != nil,
+                       "wrong-type card container was accepted as an empty success")
+            let malformedCard = Fetcher.parseResetCards(["credits": [["expires_at": true]]], now: now)
+            try expect(malformedCard.cards == nil && malformedCard.error != nil,
+                       "invalid card expiration was treated as an expired card")
+            let emptyCards = Fetcher.parseResetCards(["credits": []], now: now)
+            try expect(emptyCards.cards?.isEmpty == true && emptyCards.error == nil,
+                       "valid empty card list was rejected")
+
+            var cachedCards: [ResetCard]? = cards
+            let priorCardsOK = now.addingTimeInterval(-1_000)
+            var cardsOK: Date? = priorCardsOK
+            var cardsError: String?
+            CodexFreshness.apply(fresh: missingCards.cards, failure: missingCards.error,
+                value: &cachedCards, lastSuccess: &cardsOK, error: &cardsError, now: now)
+            try expect(cachedCards?.count == 1 && cardsOK == priorCardsOK && cardsError != nil,
+                       "failed card response cleared old cards or advanced last-success")
 
             let authPath = root.appendingPathComponent("auth.json").path
             func authDocument(_ access: String, _ refresh: String, _ id: String, _ marker: String) -> [String: Any] {
