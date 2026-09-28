@@ -990,8 +990,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(.separator())
 
-        func windowLine(_ label: String, _ w: QuotaWindow?) -> String {
-            let isFive = label == "5 小时窗口"
+        func windowLine(_ label: String, _ w: QuotaWindow?, isFive: Bool) -> String {
             let last = isFive ? fiveHourLastOK : sevenDayLastOK
             let stale = isFive ? fiveHourStale : sevenDayStale
             let error = isFive ? usage.fiveHourError : usage.sevenDayError
@@ -1005,8 +1004,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let last = last, stale || error != nil { s += " · 最后成功 \(Fmt.dayTime(last))" }
             return s
         }
-        menu.addItem(info(windowLine("5 小时窗口", usage.fiveHour)))
-        menu.addItem(info(windowLine("7 天窗口", usage.sevenDay)))
+        menu.addItem(info(windowLine("5 小时窗口", usage.fiveHour, isFive: true)))
+        menu.addItem(info(windowLine("7 天窗口", usage.sevenDay, isFive: false)))
 
         // 充值卡（额度重置卡）：独立成区两侧加横条（沿用原"重置卡：×N"的分区）；
         // 有效卡按过期时间升序，≤72 小时临期加 ⚠️ 前缀（展示格式与 GlmUsage 逐行对齐）
@@ -1316,27 +1315,35 @@ if CommandLine.arguments.contains("--self-test") {
 
 func onceMode() {
     let group = DispatchGroup()
-    var quota: QuotaData?
-    var scan: TokenScanner.Result?
-    var cards: [ResetCard]?
-    var cardsErr: String?
+    // 各结果单一写者；wait 超时返回时打印线程可能与迟到回调并发访问，统一经锁保护
+    let onceLock = NSLock()
+    var quotaVar: QuotaData?
+    var scanVar: TokenScanner.Result?
+    var cardsVar: [ResetCard]?
+    var cardsErrVar: String?
     group.enter()
     Fetcher.fetchQuota { r in
-        quota = r
+        onceLock.lock(); quotaVar = r; onceLock.unlock()
         group.leave()
     }
     group.enter()
     DispatchQueue.global(qos: .userInitiated).async {
-        scan = TokenScanner.scan()
+        let result = TokenScanner.scan()
+        onceLock.lock(); scanVar = result; onceLock.unlock()
         group.leave()
     }
     group.enter()
     Fetcher.fetchResetCards { c, e in
-        cards = c
-        cardsErr = e
+        onceLock.lock(); cardsVar = c; cardsErrVar = e; onceLock.unlock()
         group.leave()
     }
     _ = group.wait(timeout: .now() + 60)
+    onceLock.lock()
+    let quota = quotaVar
+    let scan = scanVar
+    let cards = cardsVar
+    let cardsErr = cardsErrVar
+    onceLock.unlock()
 
     if let q = quota {
         print("plan_type: \(q.planType ?? "?")")
