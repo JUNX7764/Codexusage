@@ -569,7 +569,8 @@ enum Fetcher {
         tiboLock.unlock()
         if let etag = etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
         URLSession.shared.dataTask(with: req) { data, resp, err in
-            let status = (resp as? HTTPURLResponse)?.statusCode
+            let http = resp as? HTTPURLResponse
+            let status = http?.statusCode
             if let err = err { completion(.failure(err.localizedDescription)); return }
             guard let status = status else { completion(.failure("no response")); return }
             if status == 304 { completion(.unchanged); return }
@@ -582,7 +583,7 @@ enum Fetcher {
             guard let events = parsed.events else {
                 completion(.failure(parsed.error ?? "parse failed")); return
             }
-            if let etag = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "ETag"), !etag.isEmpty {
+            if let etag = http?.value(forHTTPHeaderField: "ETag"), !etag.isEmpty {
                 tiboLock.lock()
                 tiboETag = etag
                 tiboLock.unlock()
@@ -1109,7 +1110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + " · 7D成功 \(sevenDayLastOK.map { Fmt.time($0) } ?? "--")"
             + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
             + " · 充值卡最后成功 \(resetCardsLastOK.map { Fmt.time($0) } ?? "--")"
-            + " · Tibo最后成功 \(tiboLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · Tibo 最后成功 \(tiboLastOK.map { Fmt.time($0) } ?? "--")"
         writeStatus(line1: line1, line2: line2)
     }
 
