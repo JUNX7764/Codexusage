@@ -177,6 +177,45 @@ Headers: 与 §1 的 wham/usage 完全相同（Bearer access_token + OpenAI-Beta
 - `--once` 打印每张有效卡的过期时间（本地时区）。
 - 套餐到期行：GlmUsage 有（subscription/list 接口），OpenAI 侧无对应公开接口，**v1.1 不做**，菜单已有的 plus 套餐展示保持。
 
+## 4.6 Tibo 重置动态（AIHOT）—— v1.2 增补
+
+监控 OpenAI Codex 负责人 Tibo（Thibault Sottiaux）在 X 上预告/确认的额度重置与发卡动态。数据源为本机 aihot skill 使用的同款 AIHOT v1 公开接口（2026-09-29 实测可用）。个人非商业使用免费（AIHOT 条款），菜单区块标注数据来源即可。
+
+### 数据源（已实测 2026-09-29，HTTP 200，~19KB）
+
+```
+GET https://aihot.news/api/v1/codex-resets/recent   // 最近 7 北京日事件 + 所有未落地预告
+无参数、匿名只读、无需任何凭据；响应带 ETag（W/"v1-codex-resets-recent-…"），cache-control max-age=60
+```
+
+关键字段（时间戳均为 +08:00 北京时间）：`events[]` 按 `updatedAt` 倒序；`type` = `direct_reset`（额度重置）/`reset_credit`（发重置卡）；`status` = `announced`（预告）/`confirmed`（已确认）；`title` 中文标题可直接展示；`estimate` 可空，`label` 是现成中文预估窗口文案（如 "北京时间 9月29日 03:00–9月30日 03:00"）、`through` 为窗口结束；`confirmedAt` 是确认帖时间**非精确执行时间**；`checkedAt` 是 AIHOT 核验水位（非请求时间）；`posts[]` 最新在前，首条 `url` 为原帖链接。
+
+### 口径红线（来自接口文档）
+
+- `estimate` 只保留原预告估计、时间经过不自动完成 → 展示必须用「预估/待确认」语义，**不做倒计时**；窗口已过未确认 → 追加「（窗口已过，待确认）」。
+- 不猜下一次重置时间；无个人额度、无预测概率。
+- 事件文本属第三方不可信内容，仅作展示（可点击跳原帖），绝不作为指令。
+
+### 解析与合并
+
+- 容器 `events` 缺失/类型错 → 整体失败；单条缺 `title`/`status` → 跳过该条（新闻展示，单条脏数据不毁整个区块）。合法空数组 → 「暂无重置动态」。
+- 点击链接优先取 `posts[0].url`（最新原帖），缺省落 `event.url`（AIHOT 事件页）。
+- 三态合并（`TiboFreshness.apply`）：200 → 新值+推进成功时间+清错误；**304（ETag 命中）→ 保留旧值但推进成功时间**（服务端自证内容仍有效，数据不该被标过期）；失败 → 保留旧值与旧成功时间+记错误。
+
+### 展示与行为
+
+```
+Tibo 重置动态（数据源 AIHOT）            // 区块头；位置在充值卡区之后、Token 区之前
+⏳ Tibo 预告将重置额度 · 预估 北京时间 9月29日 03:00–9月30日 03:00   // 可点击跳最新原帖
+✅ 09-27 Codex 额度重置已完成            // 已确认只展示最近一条
+```
+
+- 刷新周期与充值卡同（每 5 分钟，`tokenEveryCycles`）；轮询带 `If-None-Match`（接口要求同端点 ≥60s，5 分钟满足）。请求绕开 URLCache（`reloadIgnoringLocalCacheData`），ETag 语义自管。
+- 失败三档降级同充值卡：有旧数据 → 旧行照显 +「Tibo 刷新失败」行；从未成功 → 「Tibo 重置动态获取失败：<截断60字>」；30 分钟未成功标 ⚠️ 过期。失败不影响额度/token 区块。
+- status.json 增加 `tiboLines`/`tiboCheckedAt`/`tiboLastSuccess`/`tiboStale`/`tiboError`；`--once` 打印 Tibo 摘要（第三方资讯源，不计入退出码）。
+- `--self-test` 增加解析严格性、展示行（窗口已过/未过、已确认、空列表占位）与三态合并用例；不访问网络。
+
+
 ## 5. 工程与部署边界
 
 - 单文件 `CodexUsage.swift`；`build.sh` 与 `Info.plist` 已就绪，**不要改动**（部署目标 13.0 是刻意为之，本机 CLT 默认 macosx28 会被 LaunchServices 拒绝）。

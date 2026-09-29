@@ -122,12 +122,28 @@ enum CodexRefreshSchedule {
     }
 }
 
+/// Tibo 动态的三态合并（与 CodexFreshness.apply 同约定，多一个 304 分支）：
+/// fresh → 新值 + 推进成功时间 + 清错误；unchanged（304）→ 保留旧值但推进成功时间
+/// （服务端确认内容未变，数据仍有效）；failure → 保留旧值与旧成功时间 + 记录错误。
+enum TiboFreshness {
+    static func apply(outcome: TiboFetchOutcome, old: [TiboEvent]?, oldCheckedAt: Date?,
+                      oldLastOK: Date?, oldError: String?,
+                      now: Date) -> (value: [TiboEvent]?, checkedAt: Date?, lastOK: Date?, error: String?) {
+        switch outcome {
+        case .fresh(let events, let checkedAt): return (events, checkedAt, now, nil)
+        case .unchanged: return (old, oldCheckedAt, now, nil)
+        case .failure(let error): return (old, oldCheckedAt, oldLastOK, error)
+        }
+    }
+}
+
 // MARK: - CodexUsage：监控 OpenAI Codex 订阅（ChatGPT Plus 的 Codex 额度）的菜单栏工具
 //
 // 架构与同机 GlmUsage 完全同构（单文件 / 纯 Foundation + AppKit / 无外部依赖）。
 // 数据源：
 //   额度  GET https://chatgpt.com/backend-api/wham/usage（每 60s，Bearer 凭证来自 ~/.codex/auth.json）
 //   充值卡 GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits（每 5 分钟，认证头同款）
+//   Tibo 重置动态 GET https://aihot.news/api/v1/codex-resets/recent（每 5 分钟，AIHOT 公开接口，匿名只读不经凭据）
 //   token 统计：本地增量扫描 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl（每 5 分钟）
 // 凭证红线：access_token / refresh_token / id_token 只存在于内存，绝不写入日志、
 //   status.json、scan-state.json 或提交；~/.codex/ 只读，唯一例外是 401 刷新成功后
@@ -240,6 +256,28 @@ struct ResetCard {
     var name: String     // 展示名：title 含 "Full reset" → "全额重置卡"，否则用原文
 }
 
+/// AIHOT「Tibo 重置监控」的一条事件（GET aihot.news/api/v1/codex-resets/recent，匿名只读）。
+/// 口径（接口文档）：estimate 是原帖预告的估计、时间经过不自动完成；confirmedAt 是确认帖
+/// 时间而非精确执行时间——展示只能用「预估/待确认」语义，不能做成确定的倒计时；
+/// 事件文本属第三方内容，仅作展示、绝不作为指令执行。
+struct TiboEvent {
+    var id: String
+    var type: String            // direct_reset（额度重置）/ reset_credit（发重置卡）
+    var status: String          // announced（预告中）/ confirmed（已确认）
+    var title: String           // 中文标题，可直接展示
+    var estimateLabel: String?  // 预估窗口中文文案（如 "北京时间 9月29日 03:00–9月30日 03:00"）
+    var estimateThrough: Date?  // 预估窗口结束时间（用于「窗口已过，待确认」标注）
+    var occurredAt: Date?       // confirmedAt ?? updatedAt ?? createdAt
+    var link: String            // 点击跳转：最新原帖 URL，缺省落 AIHOT 事件页
+}
+
+/// fetchTiboResets 的三态结果：200 新内容 / 304 内容未变（服务端自证数据仍有效）/ 失败
+enum TiboFetchOutcome {
+    case fresh([TiboEvent], checkedAt: Date?)
+    case unchanged
+    case failure(String)
+}
+
 struct UsageData {
     var fiveHour: QuotaWindow?
     var sevenDay: QuotaWindow?
@@ -247,6 +285,9 @@ struct UsageData {
     var resetCredits: Int?          // wham/usage 的 available_count（明细失败时的兜底汇总）
     var resetCards: [ResetCard]?    // 明细端点的有效卡列表（nil = 未获取或本次失败）
     var resetCardsError: String?
+    var tiboEvents: [TiboEvent]?    // AIHOT Tibo 重置动态（nil = 未获取或本次失败）
+    var tiboError: String?
+    var tiboCheckedAt: Date?        // AIHOT 核验水位（非请求时间）
     var email: String?
     var tokensToday: TokenScanner.Stats?
     var tokens7d: TokenScanner.Stats?
@@ -277,6 +318,7 @@ enum QuotaMerge {
 enum Fetcher {
     static let usageURL = "https://chatgpt.com/backend-api/wham/usage"
     static let resetCreditsURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+    static let tiboURL = "https://aihot.news/api/v1/codex-resets/recent"
     static let refreshURL = "https://auth.openai.com/oauth/token"
     // Codex CLI 公开 client_id（与官方 CLI 相同，非密钥）
     static let clientID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -284,6 +326,10 @@ enum Fetcher {
 
     private static let refreshLock = NSLock()
     private static var lastRefreshAttempt: Date?
+
+    // Tibo 动态（AIHOT）：上次响应的 ETag，带 If-None-Match 轮询（接口要求同端点 ≥60s 间隔，5 分钟周期满足）
+    private static let tiboLock = NSLock()
+    private static var tiboETag: String?
 
     static func fetchQuota(completion: @escaping (QuotaData) -> Void) {
         guard let auth = CodexAuth.load() else {
@@ -507,6 +553,100 @@ enum Fetcher {
         }
         return (cards.sorted { $0.expires < $1.expires }, nil)
     }
+
+    /// Tibo 重置动态（AIHOT v1 公开接口，匿名只读、无需凭据）。每 5 分钟轮询一次并带上
+    /// 上次响应的 ETag：304 = 内容未变，视为有效成功（服务端自证数据仍当前）。
+    static func fetchTiboResets(completion: @escaping (TiboFetchOutcome) -> Void) {
+        guard let url = URL(string: tiboURL) else {
+            completion(.failure("bad url")); return
+        }
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.cachePolicy = .reloadIgnoringLocalCacheData   // ETag/304 语义自己管，不用 URLCache
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("CodexUsage/1.0 (menubar; data source aihot.news)", forHTTPHeaderField: "User-Agent")
+        tiboLock.lock()
+        let etag = tiboETag
+        tiboLock.unlock()
+        if let etag = etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            let status = (resp as? HTTPURLResponse)?.statusCode
+            if let err = err { completion(.failure(err.localizedDescription)); return }
+            guard let status = status else { completion(.failure("no response")); return }
+            if status == 304 { completion(.unchanged); return }
+            guard status == 200 else { completion(.failure("HTTP \(status)")); return }
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                completion(.failure("bad response")); return
+            }
+            let parsed = parseTiboResets(obj)
+            guard let events = parsed.events else {
+                completion(.failure(parsed.error ?? "parse failed")); return
+            }
+            if let etag = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "ETag"), !etag.isEmpty {
+                tiboLock.lock()
+                tiboETag = etag
+                tiboLock.unlock()
+            }
+            completion(.fresh(events, checkedAt: parsed.checkedAt))
+        }.resume()
+    }
+
+    /// 解析（严格性对齐充值卡）：events 容器缺失/类型错 → 整体失败；单条缺 title/status
+    /// → 跳过该条（新闻展示，单条脏数据不值得毁掉整个区块）。checkedAt 是 AIHOT 的
+    /// 核验水位（非请求时间），仅进 status.json；posts 最新在前，取首条原帖做点击链接。
+    static func parseTiboResets(_ obj: [String: Any]) -> (events: [TiboEvent]?, checkedAt: Date?, error: String?) {
+        guard let list = obj["events"] as? [[String: Any]] else {
+            return (nil, nil, "missing or invalid events")
+        }
+        func nonEmpty(_ s: String?) -> String? { (s?.isEmpty ?? true) ? nil : s }
+        var events: [TiboEvent] = []
+        for e in list {
+            guard let title = nonEmpty(e["title"] as? String),
+                  let status = nonEmpty(e["status"] as? String) else { continue }
+            let estimate = e["estimate"] as? [String: Any]
+            let postLink = nonEmpty(((e["posts"] as? [[String: Any]])?.first)?["url"] as? String)
+            events.append(TiboEvent(
+                id: (e["id"] as? String) ?? "",
+                type: (e["type"] as? String) ?? "",
+                status: status,
+                title: title,
+                estimateLabel: nonEmpty(estimate?["label"] as? String),
+                estimateThrough: estimate.flatMap { Fmt.parseDateValue($0["through"]) },
+                occurredAt: Fmt.parseDateValue(e["confirmedAt"])
+                    ?? Fmt.parseDateValue(e["updatedAt"])
+                    ?? Fmt.parseDateValue(e["createdAt"]),
+                link: postLink ?? nonEmpty(e["url"] as? String) ?? ""
+            ))
+        }
+        return (events, Fmt.parseDateValue(obj["checkedAt"]), nil)
+    }
+}
+
+// MARK: - Tibo 重置动态菜单区块（AIHOT codex-resets）
+
+enum TiboDisplay {
+    /// 区块行（纯函数，离线回归覆盖）：预告中（announced）全部在前、带预估窗口；
+    /// 预估窗口已过但未确认 → 标「窗口已过，待确认」（schedule 不随时间自动完成）；
+    /// 已确认（confirmed）只展示最近一条。空列表 → 占位行。
+    static func rows(_ events: [TiboEvent], now: Date) -> [(text: String, link: String)] {
+        guard !events.isEmpty else { return [("暂无重置动态", "")] }
+        var out: [(text: String, link: String)] = []
+        for e in events.filter({ $0.status == "announced" }).sorted(by: timeDesc) {
+            var s = "⏳ " + e.title
+            if let label = e.estimateLabel { s += " · 预估 \(label)" }
+            if let through = e.estimateThrough, through < now { s += "（窗口已过，待确认）" }
+            out.append((text: s, link: e.link))
+        }
+        if let latest = events.filter({ $0.status != "announced" }).sorted(by: timeDesc).first {
+            let day = latest.occurredAt.map { Fmt.day($0) } ?? ""
+            out.append((text: "✅ " + (day.isEmpty ? "" : day + " ") + latest.title, link: latest.link))
+        }
+        return out
+    }
+
+    private static func timeDesc(_ a: TiboEvent, _ b: TiboEvent) -> Bool {
+        (a.occurredAt ?? .distantPast) > (b.occurredAt ?? .distantPast)
+    }
 }
 
 // MARK: - 本地会话 token 统计（增量扫描 ~/.codex/sessions）
@@ -724,6 +864,13 @@ enum Fmt {
         f.dateFormat = "MM-dd HH:mm"
         return f.string(from: d)
     }
+    static func day(_ d: Date?) -> String {
+        guard let d = d else { return "" }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "MM-dd"
+        return f.string(from: d)
+    }
     /// 充值卡到期提示（本地时区）：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期
     static func expires(_ d: Date) -> String {
         let f = DateFormatter()
@@ -793,10 +940,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // （与 GlmUsage 的静默保留旧数据不同，这是刻意改进：过期数据必须可见）
     private let quotaStaleAfter: TimeInterval = 600
     private let tokensStaleAfter: TimeInterval = 1800
+    private let tiboStaleAfter: TimeInterval = 1800
     private var fiveHourLastOK: Date?
     private var sevenDayLastOK: Date?
     private var tokensLastOK: Date?
     private var resetCardsLastOK: Date?
+    private var tiboLastOK: Date?
     private var lastAttemptAt = Date()
     private let launchAgentLabel = "com.local.codex-usage"
 
@@ -848,6 +997,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Fetcher.fetchResetCards { [weak self] cards, err in
                 DispatchQueue.main.async {
                     self?.applyResetCards(cards, err)
+                    group.leave()
+                }
+            }
+            // Tibo 重置动态（AIHOT 公开接口，匿名只读）：同周期；失败只降级本区块
+            group.enter()
+            Fetcher.fetchTiboResets { [weak self] outcome in
+                DispatchQueue.main.async {
+                    self?.applyTibo(outcome)
                     group.leave()
                 }
             }
@@ -904,6 +1061,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    // Tibo 动态：304 = 内容未变但服务端确认有效（推进成功时间）；失败保留旧数据与旧成功时间。
+    // 纯函数返回结果后顺序赋值（不把 usage 的多个子字段同时作 inout 实参）
+    private func applyTibo(_ outcome: TiboFetchOutcome) {
+        let r = TiboFreshness.apply(outcome: outcome, old: usage.tiboEvents,
+            oldCheckedAt: usage.tiboCheckedAt, oldLastOK: tiboLastOK, oldError: usage.tiboError, now: Date())
+        usage.tiboEvents = r.value
+        usage.tiboCheckedAt = r.checkedAt
+        tiboLastOK = r.lastOK
+        usage.tiboError = r.error
+        usage.updatedAt = Date()
+        renderBar()
+        rebuildMenu()
+    }
+
     // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
     // 无数据不算过期——菜单里本就显示"暂无数据"，无需再标注。
     private func isStale(_ lastOK: Date?, hasData: Bool, after: TimeInterval) -> Bool {
@@ -923,6 +1094,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var resetCardsStale: Bool {
         isStale(resetCardsLastOK, hasData: usage.resetCards != nil, after: 900)
     }
+    private var tiboStale: Bool {
+        isStale(tiboLastOK, hasData: usage.tiboEvents != nil, after: tiboStaleAfter)
+    }
 
     // 菜单栏显示：5H / 7D 两行堆叠（剩余口径）；额度过期时第一行前缀 ⚠
     private func renderBar() {
@@ -935,6 +1109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + " · 7D成功 \(sevenDayLastOK.map { Fmt.time($0) } ?? "--")"
             + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
             + " · 充值卡最后成功 \(resetCardsLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · Tibo最后成功 \(tiboLastOK.map { Fmt.time($0) } ?? "--")"
         writeStatus(line1: line1, line2: line2)
     }
 
@@ -955,6 +1130,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "resetCredits": usage.resetCredits ?? -1,
             "resetCards": cardsNow.map { iso($0.expires) },
             "resetCardsError": usage.resetCardsError ?? "",
+            "tiboLines": TiboDisplay.rows(usage.tiboEvents ?? [], now: Date()).map { $0.text },
+            "tiboCheckedAt": iso(usage.tiboCheckedAt),
+            "tiboLastSuccess": iso(tiboLastOK),
+            "tiboStale": tiboStale,
+            "tiboError": usage.tiboError ?? "",
             "quotaLastSuccess": ["fiveHour": iso(fiveHourLastOK), "sevenDay": iso(sevenDayLastOK)],
             "tokensLastSuccess": iso(tokensLastOK),
             "resetCardsLastSuccess": iso(resetCardsLastOK),
@@ -1043,6 +1223,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(.separator())
 
+        // Tibo 重置动态（数据源 AIHOT）：事件行点击跳最新原帖；预估窗口文案来自接口，
+        // 语义是原帖预告的估计（时间经过不自动完成），因此呈现为「预估/待确认」而非倒计时
+        var tiboItems: [NSMenuItem] = []
+        if let events = usage.tiboEvents {
+            tiboItems.append(info("Tibo 重置动态（数据源 AIHOT）"))
+            for row in TiboDisplay.rows(events, now: Date()) {
+                let item = NSMenuItem(title: row.text, action: nil, keyEquivalent: "")
+                if let url = URL(string: row.link) {
+                    item.action = #selector(openLink(_:))
+                    item.target = self
+                    item.representedObject = url
+                } else {
+                    item.isEnabled = false
+                }
+                tiboItems.append(item)
+            }
+            if tiboStale {
+                tiboItems.append(info("⚠️ Tibo 动态已过期 · 最后成功 \(tiboLastOK.map { Fmt.dayTime($0) } ?? "--")"))
+            }
+            if let e = usage.tiboError {
+                tiboItems.append(info("Tibo 刷新失败：\(e) · 最后成功 \(tiboLastOK.map { Fmt.dayTime($0) } ?? "--")"))
+            }
+        } else if let e = usage.tiboError {
+            let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
+            tiboItems.append(info("Tibo 重置动态获取失败：\(short)"))
+        }
+        if !tiboItems.isEmpty {
+            for i in tiboItems { menu.addItem(i) }
+            menu.addItem(.separator())
+        }
+
         if usage.tokensToday == nil && usage.tokens7d == nil && usage.tokens30d == nil {
             menu.addItem(info("Token 用量：暂无数据"))
         } else {
@@ -1089,6 +1300,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func onRefresh() { refresh(tokens: true, manual: true) }
+
+    @objc private func openLink(_ sender: NSMenuItem) {
+        if let url = sender.representedObject as? URL { NSWorkspace.shared.open(url) }
+    }
 
     // MARK: 开机自启（LaunchAgent，与 GlmUsage/KimiUsage 同款）
 
@@ -1248,6 +1463,85 @@ enum CodexOfflineRegression {
             try expect(cardsR.value?.count == 1 && cardsR.lastOK == priorCardsOK && cardsR.error != nil,
                        "failed card response cleared old cards or advanced last-success")
 
+            // Tibo 重置动态（AIHOT codex-resets）：解析严格性、展示行、三态合并
+            let tiboPayload: [String: Any] = [
+                "checkedAt": "2026-09-29T11:25:32.988+08:00",
+                "events": [
+                    ["id": "t1", "type": "direct_reset", "status": "announced",
+                     "title": "Tibo 预告将重置额度",
+                     "createdAt": "2026-09-27T05:41:35.000+08:00",
+                     "estimate": ["label": "北京时间 9月29日 03:00–9月30日 03:00",
+                                  "through": "2026-09-30T03:00:00.000+08:00"],
+                     "posts": [["url": "https://x.com/thsottiaux/status/2103963215885701493"]],
+                     "url": "https://aihot.news/codex-reset"],
+                    ["id": "t2", "type": "reset_credit", "status": "confirmed",
+                     "title": "重置卡已发放",
+                     "createdAt": "2026-09-26T08:07:13.000+08:00",
+                     "confirmedAt": "2026-09-27T02:17:54.000+08:00",
+                     "posts": [], "url": "https://aihot.news/codex-reset"],
+                    ["id": "t3", "status": "announced"]   // 缺 title：单条脏数据，跳过
+                ]
+            ]
+            let tiboParsed = Fetcher.parseTiboResets(tiboPayload)
+            guard let tiboEvents = tiboParsed.events else {
+                throw Failure(description: "valid tibo payload failed: \(tiboParsed.error ?? "unknown")")
+            }
+            try expect(tiboEvents.count == 2, "malformed tibo event was not skipped")
+            try expect(tiboEvents[0].estimateLabel?.contains("9月29日") == true
+                       && tiboEvents[0].estimateThrough != nil,
+                       "tibo estimate window did not parse")
+            try expect(tiboEvents[0].link.hasPrefix("https://x.com/"),
+                       "tibo post link did not win over page url")
+            try expect(tiboEvents[1].occurredAt == Fmt.isoFrac.date(from: "2026-09-27T02:17:54.000+08:00"),
+                       "tibo confirmedAt did not win over createdAt")
+            try expect(tiboEvents[1].link == "https://aihot.news/codex-reset",
+                       "tibo page url fallback was lost")
+            try expect(tiboParsed.checkedAt != nil, "tibo checkedAt watermark was dropped")
+            let noTibo = Fetcher.parseTiboResets(["error": "upstream"])
+            try expect(noTibo.events == nil && noTibo.error != nil,
+                       "missing tibo events container was accepted")
+            let badTibo = Fetcher.parseTiboResets(["events": [:]])
+            try expect(badTibo.events == nil && badTibo.error != nil,
+                       "wrong-type tibo events container was accepted")
+            let emptyTibo = Fetcher.parseTiboResets(["events": []])
+            try expect(emptyTibo.events?.isEmpty == true && emptyTibo.error == nil,
+                       "valid empty tibo event list was rejected")
+
+            // 展示行：预告在前带预估窗口；窗口未过不标「待确认」、已过必须标；已确认取最近一条
+            guard let duringWindow = Fmt.isoFrac.date(from: "2026-09-29T12:00:00.000+08:00"),
+                  let afterWindow = Fmt.isoFrac.date(from: "2026-10-01T12:00:00.000+08:00") else {
+                throw Failure(description: "tibo display fixture dates failed to parse")
+            }
+            let rowsDuring = TiboDisplay.rows(tiboEvents, now: duringWindow)
+            try expect(rowsDuring.count == 2 && rowsDuring[0].text.hasPrefix("⏳")
+                       && rowsDuring[0].text.contains("预估 北京时间 9月29日"),
+                       "announced tibo row missing prefix or estimate window")
+            try expect(!rowsDuring[0].text.contains("待确认"),
+                       "pending marker shown while estimate window still open")
+            try expect(rowsDuring[1].text.hasPrefix("✅") && rowsDuring[1].text.contains("重置卡已发放"),
+                       "confirmed tibo row missing marker or title")
+            let rowsAfter = TiboDisplay.rows(tiboEvents, now: afterWindow)
+            try expect(rowsAfter[0].text.contains("窗口已过，待确认"),
+                       "expired tibo estimate window was not marked pending")
+            try expect(TiboDisplay.rows([], now: duringWindow).first?.text == "暂无重置动态",
+                       "empty tibo events did not render the placeholder")
+
+            // 三态合并：fresh 推进成功时间；unchanged(304) 保留旧值但推进成功时间；failure 保留旧值旧时间
+            let tiboOldOK = now.addingTimeInterval(-1_000)
+            let tiboFreshR = TiboFreshness.apply(outcome: .fresh(tiboEvents, checkedAt: tiboParsed.checkedAt),
+                old: nil, oldCheckedAt: nil, oldLastOK: nil, oldError: nil, now: now)
+            try expect(tiboFreshR.value?.count == 2 && tiboFreshR.lastOK == now && tiboFreshR.error == nil,
+                       "fresh tibo outcome did not advance state")
+            let tiboUnchangedR = TiboFreshness.apply(outcome: .unchanged,
+                old: tiboEvents, oldCheckedAt: tiboParsed.checkedAt, oldLastOK: tiboOldOK, oldError: nil, now: now)
+            try expect(tiboUnchangedR.value?.count == 2 && tiboUnchangedR.lastOK == now
+                       && tiboUnchangedR.checkedAt == tiboParsed.checkedAt,
+                       "304 tibo outcome cleared data or did not advance last-success")
+            let tiboFailR = TiboFreshness.apply(outcome: .failure("HTTP 500"),
+                old: tiboEvents, oldCheckedAt: nil, oldLastOK: tiboOldOK, oldError: nil, now: now)
+            try expect(tiboFailR.value?.count == 2 && tiboFailR.lastOK == tiboOldOK && tiboFailR.error == "HTTP 500",
+                       "failed tibo outcome cleared old events or advanced last-success")
+
             let authPath = root.appendingPathComponent("auth.json").path
             func authDocument(_ access: String, _ refresh: String, _ id: String, _ marker: String) -> [String: Any] {
                 ["auth_mode": "chatgpt", "marker": marker,
@@ -1300,7 +1594,7 @@ enum CodexOfflineRegression {
                 .filter { $0.hasSuffix(".tmp") }
             try expect(tempFiles.isEmpty, "failed write left a temporary credential file")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, refresh gate/schedule, temp auth merge/permissions/failure)")
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, refresh gate/schedule, temp auth merge/permissions/failure)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
@@ -1321,6 +1615,7 @@ func onceMode() {
     var scanVar: TokenScanner.Result?
     var cardsVar: [ResetCard]?
     var cardsErrVar: String?
+    var tiboVar: TiboFetchOutcome?
     group.enter()
     Fetcher.fetchQuota { r in
         onceLock.lock(); quotaVar = r; onceLock.unlock()
@@ -1335,6 +1630,11 @@ func onceMode() {
     group.enter()
     Fetcher.fetchResetCards { c, e in
         onceLock.lock(); cardsVar = c; cardsErrVar = e; onceLock.unlock()
+        group.leave()
+    }
+    group.enter()
+    Fetcher.fetchTiboResets { outcome in
+        onceLock.lock(); tiboVar = outcome; onceLock.unlock()
         group.leave()
     }
     _ = group.wait(timeout: .now() + 60)
@@ -1368,6 +1668,21 @@ func onceMode() {
         for c in cs { print("  \(c.name) · \(Fmt.expires(c.expires)) 过期") }
     }
     if let e = cardsErr { print("reset cards error: \(e)") }
+
+    // Tibo 重置动态（AIHOT 公开接口）：第三方资讯源，只打印结果、不计入退出码
+    if let outcome = tiboVar {
+        switch outcome {
+        case .fresh(let events, let checkedAt):
+            print("tibo resets: \(events.count) events (AIHOT 核验 \(checkedAt.map { Fmt.dayTime($0) } ?? "--"))")
+            for row in TiboDisplay.rows(events, now: Date()) { print("  " + row.text) }
+        case .unchanged:
+            print("tibo resets: unchanged (304)")
+        case .failure(let e):
+            print("tibo error: \(e)")
+        }
+    } else {
+        print("tibo: no result (timeout)")
+    }
 
     if let s = scan {
         func t(_ x: TokenScanner.Stats) -> String {
