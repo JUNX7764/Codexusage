@@ -232,8 +232,8 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 ### 甄别与口径
 
 - `isOpenAIModel`：`gpt*` / `codex*` / `chatgpt*` / `o+数字`（o1/o3/o4-mini）；缺失 model 或他家模型（glm/k3/mimo/claude/qwen/deepseek/ark…）一律不计——外部工具混接多家 API，宁漏勿错。
-- **input 不含 cache**（cache_read/cache_creation 剔除）：cache_read 是长会话每轮的上下文全额重读（实测占 95%+；hermes 侧 input 5M vs cache_read 107M），计入会把量级放大一个数量级；与 Codex CLI Token 统计（total_tokens 不含 cached）口径一致。今日/近 7 天/近 30 天按本地时区日聚合，31 天余量清理。
-- 状态文件 `~/Library/Application Support/CodexUsage/external-scan-state-v2.json`（与 Codex CLI 的 scan-state.json 分开；文件名带 v2——口径变更后弃用 v1 缓存强制重建）。
+- **input 含 cache read/write**：对齐外部中转/用量 monitor 的总量口径（实测用户 monitor 今天 OpenAI ≈59M，与含 cache 口径同量级；cache_read 是长会话每轮的上下文全额重读，净 input 通常只占 5% 左右）。今日/近 7 天/近 30 天按本地时区日聚合，31 天余量清理。
+- 状态文件 `~/Library/Application Support/CodexUsage/external-scan-state-v3.json`（与 Codex CLI 的 scan-state.json 分开；文件名带版本——口径变更后弃旧缓存强制重建：v2 目录去重、v3 恢复含 cache）。
 
 ### 增量与健壮性
 
