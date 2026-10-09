@@ -147,12 +147,13 @@ enum TiboFreshness {
 //   Tibo 重置动态 GET https://aihot.news/api/v1/codex-resets/recent（每 5 分钟，AIHOT 公开接口，匿名只读不经凭据）
 //   token 统计：本地增量扫描 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl（每 5 分钟）
 //   外部用量：Codex CLI 之外消费 OpenAI 系模型（gpt* 等）的 token——本地增量扫描
-//     ~/.proma/sdk-config/sessions（唯一在写的运行时日志；agent-sessions 是同一批
-//     会话的并行双写、内容重复，再扫会双算）、~/.proma/sdk-config/projects（最早一代）
-//     与 ~/.claude/projects 的 Claude SDK 风格 JSONL，加 ~/.hermes/state.db 的
-//     session_model_usage 累计行快照差分（只读打开）。input 含 cache read——与外部
-//     中转/用量 monitor 的总量口径一致（实测用户 monitor 今天 OpenAI ≈59M，落在
-//     含 cache 口径的量级上）；双写目录只扫超集侧防双算
+//     ~/.proma/agent-sessions（与 Token Monitor 的 proma 来源同款，回合级口径；
+//     sdk-config/sessions 是同一批会话更细粒度的运行时日志，多记子请求/续写调用，
+//     两者都扫会双算、只扫 sdk 又与 Token Monitor 对不上，均不取）、
+//     ~/.proma/sdk-config/projects（最早一代）与 ~/.claude/projects 的
+//     Claude SDK 风格 JSONL，加 ~/.hermes/state.db 的 session_model_usage
+//     累计行快照差分（只读打开）。input 含 cache read——与 Token Monitor 的
+//     totalTokens 口径一致（其值 = input + cacheRead + output，实测对账吻合）
 // 凭证红线：access_token / refresh_token / id_token 只存在于内存，绝不写入日志、
 //   status.json、scan-state.json 或提交；~/.codex/ 只读，唯一例外是 401 刷新成功后
 //   按 PLAN §2 原子写回 auth.json 本身。
@@ -831,10 +832,11 @@ enum TokenScanner {
 //
 // 统计 Codex CLI 之外消费 OpenAI 系模型的 token，两个来源（与 KimiUsage 的
 // 「API 客户端」同构，参考其 TokenAggregator）：
-//   1) Claude SDK 风格 JSONL：Proma sdk-config/sessions（运行时日志，2026-10 实测
-//      仍在写入且是 agent-sessions 的超集——两目录对同一会话并行双写、数值一致，
-//      只扫这一个，agent-sessions 不扫防双算）+ sdk-config/projects（最早一代）+
-//      ~/.claude/projects（Claude Code 本机，可经 ccswitch/Proma 接 OpenAI 模型）。
+//   1) Claude SDK 风格 JSONL：Proma agent-sessions（2026-10 实测与 Token Monitor
+//      的 proma 来源一致，今日 sol 逐分位对账吻合；sdk-config/sessions 为并行双写
+//      的运行时细粒度日志——重会话多记 ~30% 子请求/续写调用，取口径一致性、不扫；
+//      其 08-26 前的独有历史在 30 天窗口外，无损失）+ sdk-config/projects（最早一代）
+//      + ~/.claude/projects（Claude Code 本机，可经 ccswitch/Proma 接 OpenAI 模型）。
 //      逐条 assistant 行 message.usage 计入；Proma result 行的 modelUsage/顶层 usage
 //      是全会话累计汇总，跳过避免双算。甄别只看 model 字段（isOpenAIModel）。
 //   2) hermes：~/.hermes/state.db 的 session_model_usage 是 (session,model,…) 级
@@ -872,16 +874,18 @@ enum ExternalTokenScanner {
     }
 
     static let fileRoots = [
-        // Proma 只扫 sdk-config/sessions：agent-sessions 是同一批会话的并行双写（孪生
-        // 文件 token 数值完全一致），两者都扫会把外部用量翻倍
-        NSHomeDirectory() + "/.proma/sdk-config/sessions",
+        // Proma 只扫 agent-sessions：与 Token Monitor 的 proma 来源一致（对账基准）；
+        // sdk-config/sessions 是同一批会话更细粒度的运行时双写（重会话多记子请求/
+        // 续写调用），两者都扫会双算、只扫 sdk 会与 Token Monitor 对不上
+        NSHomeDirectory() + "/.proma/agent-sessions",
         NSHomeDirectory() + "/.proma/sdk-config/projects",
         NSHomeDirectory() + "/.claude/projects",
     ]
     static let hermesDBPath = NSHomeDirectory() + "/.hermes/state.db"
-    // 文件名带版本号：口径变更（v2 目录去重、v3 恢复含 cache）后弃用旧缓存强制重建
+    // 文件名带版本号：口径/来源变更后弃用旧缓存强制重建（v2 目录去重、v3 含 cache、
+    // v4 proma 源切 agent-sessions 对齐 Token Monitor）
     static let defaultStatePath = NSHomeDirectory()
-        + "/Library/Application Support/CodexUsage/external-scan-state-v3.json"
+        + "/Library/Application Support/CodexUsage/external-scan-state-v4.json"
 
     // 只关心近 30 天窗口，日聚合保留 31 天余量
     private static let retainSeconds: TimeInterval = 31 * 86400

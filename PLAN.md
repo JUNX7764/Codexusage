@@ -223,7 +223,7 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 ### 数据源（两路，全部只读）
 
 1. **Claude SDK 风格 JSONL 增量扫描**，roots 三个：
-   - `~/.proma/sdk-config/sessions`：Proma 运行时日志，2026-10 实测仍在写且是超集。**`~/.proma/agent-sessions` 是同一批会话的并行双写（孪生文件 token 数值完全一致），不扫防双算**——首版两目录都扫导致外部用量约翻倍，已修正；
+   - `~/.proma/agent-sessions`：**与 Token Monitor 的 proma 来源同款**（2026-10-09 实测：Token Monitor 今日 sol6.1 = 59.54M ≈ agent-sessions 55.35M + hermes 3.5M，逐分位吻合）。`~/.proma/sdk-config/sessions` 是同一批会话更细粒度的运行时并行双写（重会话多记 ~30% 的子请求/续写调用；普通会话两侧行数与数值完全一致）——都扫会双算、只扫 sdk 与 Token Monitor 对不上，均不取；其 08-26 前的独有历史落在 30 天窗口外，无损失；
    - `~/.proma/sdk-config/projects`（最早一代，已停写）；
    - `~/.claude/projects`（Claude Code 本机，可经 ccswitch/Proma 接 OpenAI 模型）。
    行级口径：逐条 assistant 行 `message.usage` 计入；Proma result 行的 `modelUsage`/顶层 usage 是全会话累计汇总，**跳过防双算**；时间字段 `_createdAt`(ms) / `timestamp`(ISO8601) / `time`(ms) 兜底。
@@ -232,8 +232,8 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 ### 甄别与口径
 
 - `isOpenAIModel`：`gpt*` / `codex*` / `chatgpt*` / `o+数字`（o1/o3/o4-mini）；缺失 model 或他家模型（glm/k3/mimo/claude/qwen/deepseek/ark…）一律不计——外部工具混接多家 API，宁漏勿错。
-- **input 含 cache read/write**：对齐外部中转/用量 monitor 的总量口径（实测用户 monitor 今天 OpenAI ≈59M，与含 cache 口径同量级；cache_read 是长会话每轮的上下文全额重读，净 input 通常只占 5% 左右）。今日/近 7 天/近 30 天按本地时区日聚合，31 天余量清理。
-- 状态文件 `~/Library/Application Support/CodexUsage/external-scan-state-v3.json`（与 Codex CLI 的 scan-state.json 分开；文件名带版本——口径变更后弃旧缓存强制重建：v2 目录去重、v3 恢复含 cache）。
+- **input 含 cache read/write**：对齐 Token Monitor 的 totalTokens 口径（实测其值 = input + cacheRead + output；cache_read 是长会话每轮的上下文全额重读，净 input 通常只占 5% 左右）。今日/近 7 天/近 30 天按本地时区日聚合，31 天余量清理。
+- 状态文件 `~/Library/Application Support/CodexUsage/external-scan-state-v4.json`（与 Codex CLI 的 scan-state.json 分开；文件名带版本——口径变更后弃旧缓存强制重建：v2 目录去重、v3 含 cache、v4 proma 源切 agent-sessions）。
 
 ### 增量与健壮性
 
