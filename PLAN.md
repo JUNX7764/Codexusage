@@ -242,7 +242,7 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 
 ### 展示与行为
 
-- Token 区块之后新增：`外部用量（OpenAI 模型 · 非 Codex CLI）今天 X · 7 天 Y · 30 天 Z` + 今日/近 7 天/近 30 天 input/output 树状明细（与 Token 区块同款式）。
+- Token 区块之后新增：`外部用量（非Codex）今天 X · 7 天 Y · 30 天 Z` + 今日/近 7 天/近 30 天 input/output 树状明细（与 Token 区块同款式）。
 - 刷新周期与 token 统计同（每 5 分钟，同一 utility 块串行执行）；纯本地扫描、无失败面，每次推进最后成功时间。
 - status.json 增 `externalTokensToday/7d/30d`（缩写展示值）、`externalTokensLastSuccess`、`externalTokensStale`；菜单栏 tooltip 增「外部最后成功」。
 - `--once` 打印 external 三行摘要（本地统计，不计入退出码）。

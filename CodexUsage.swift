@@ -1630,7 +1630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 外部用量（OpenAI 模型 · 非 Codex CLI）：Proma / Claude Code / hermes 里的
         // gpt* 等 OpenAI 系模型 token，与上方 Codex CLI 本机会话口径互补、不混算
         if usage.extToday != nil || usage.ext7d != nil || usage.ext30d != nil {
-            menu.addItem(info("外部用量（OpenAI 模型 · 非 Codex CLI）今天 \(Fmt.tokensAbbr(usage.extToday?.total))"
+            menu.addItem(info("外部用量（非Codex）今天 \(Fmt.tokensAbbr(usage.extToday?.total))"
                 + " · 7 天 \(Fmt.tokensAbbr(usage.ext7d?.total))"
                 + " · 30 天 \(Fmt.tokensAbbr(usage.ext30d?.total))"))
             var extDetails: [(label: String, s: ExternalTokenScanner.Stats)] = []
