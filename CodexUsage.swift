@@ -147,9 +147,11 @@ enum TiboFreshness {
 //   Tibo 重置动态 GET https://aihot.news/api/v1/codex-resets/recent（每 5 分钟，AIHOT 公开接口，匿名只读不经凭据）
 //   token 统计：本地增量扫描 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl（每 5 分钟）
 //   外部用量：Codex CLI 之外消费 OpenAI 系模型（gpt* 等）的 token——本地增量扫描
-//     ~/.proma（agent-sessions / sdk-config/sessions 两代目录均在写入且互不重复、
-//     sdk-config/projects 为最早一代）与 ~/.claude/projects 的 Claude SDK 风格 JSONL，
-//     加 ~/.hermes/state.db 的 session_model_usage 累计行快照差分（只读打开）
+//     ~/.proma/sdk-config/sessions（唯一在写的运行时日志；agent-sessions 是同一批
+//     会话的并行双写、内容重复，再扫会双算）、~/.proma/sdk-config/projects（最早一代）
+//     与 ~/.claude/projects 的 Claude SDK 风格 JSONL，加 ~/.hermes/state.db 的
+//     session_model_usage 累计行快照差分（只读打开）。input 不含 cache，与 Codex
+//     CLI 的 Token 统计口径一致（cache_read 是长会话每轮的上下文全额重读）
 // 凭证红线：access_token / refresh_token / id_token 只存在于内存，绝不写入日志、
 //   status.json、scan-state.json 或提交；~/.codex/ 只读，唯一例外是 401 刷新成功后
 //   按 PLAN §2 原子写回 auth.json 本身。
@@ -828,8 +830,9 @@ enum TokenScanner {
 //
 // 统计 Codex CLI 之外消费 OpenAI 系模型的 token，两个来源（与 KimiUsage 的
 // 「API 客户端」同构，参考其 TokenAggregator）：
-//   1) Claude SDK 风格 JSONL：Proma（agent-sessions 与 sdk-config/sessions 两代目录
-//      2026-10 实测均在写入且内容零重复，sdk-config/projects 为最早一代）+
+//   1) Claude SDK 风格 JSONL：Proma sdk-config/sessions（运行时日志，2026-10 实测
+//      仍在写入且是 agent-sessions 的超集——两目录对同一会话并行双写、数值一致，
+//      只扫这一个，agent-sessions 不扫防双算）+ sdk-config/projects（最早一代）+
 //      ~/.claude/projects（Claude Code 本机，可经 ccswitch/Proma 接 OpenAI 模型）。
 //      逐条 assistant 行 message.usage 计入；Proma result 行的 modelUsage/顶层 usage
 //      是全会话累计汇总，跳过避免双算。甄别只看 model 字段（isOpenAIModel）。
@@ -868,14 +871,16 @@ enum ExternalTokenScanner {
     }
 
     static let fileRoots = [
-        NSHomeDirectory() + "/.proma/agent-sessions",
+        // Proma 只扫 sdk-config/sessions：agent-sessions 是同一批会话的并行双写（孪生
+        // 文件 token 数值完全一致），两者都扫会把外部用量翻倍
         NSHomeDirectory() + "/.proma/sdk-config/sessions",
         NSHomeDirectory() + "/.proma/sdk-config/projects",
         NSHomeDirectory() + "/.claude/projects",
     ]
     static let hermesDBPath = NSHomeDirectory() + "/.hermes/state.db"
+    // v2：口径变更（input 去掉 cache、目录去重）后弃用 v1 缓存文件，文件名升级强制重建
     static let defaultStatePath = NSHomeDirectory()
-        + "/Library/Application Support/CodexUsage/external-scan-state.json"
+        + "/Library/Application Support/CodexUsage/external-scan-state-v2.json"
 
     // 只关心近 30 天窗口，日聚合保留 31 天余量
     private static let retainSeconds: TimeInterval = 31 * 86400
@@ -987,7 +992,7 @@ enum ExternalTokenScanner {
     /// 解析一批完整行，把 OpenAI 系模型的 usage 按日累加进 days。
     /// 时间字段：_createdAt(ms, Proma) / timestamp(ISO8601, Claude SDK) / time(ms, 兜底)；
     /// usage 位置：event.usage / 顶层 usage / message.usage（与 KimiUsage 同序）；
-    /// input 含 cache read/write（与 hermes 来源口径一致）。
+    /// input 不含 cache（与 Codex CLI Token 统计一致，口径见 fileRoots 注释）。
     static func parseLines(_ text: String, cutoffKey: String, into st: inout FileState) {
         for line in text.split(separator: "\n", omittingEmptySubsequences: true)
         where line.contains("\"usage\"") {
@@ -1013,8 +1018,7 @@ enum ExternalTokenScanner {
                 ?? obj["model"] as? String
             guard isOpenAIModel(model) else { continue }
             var input: Double = 0
-            for k in ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
-                      "input", "cacheRead", "cacheWrite"] {
+            for k in ["input_tokens", "input"] {
                 if let v = CodexNumber.finite(usage[k]) { input += v }
             }
             var output: Double = 0
@@ -1038,10 +1042,11 @@ enum ExternalTokenScanner {
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db = db
         else { _ = db.map { sqlite3_close($0) }; return }
         defer { sqlite3_close(db) }
-        // 行身份键与 KimiUsage 一致：同一 (session,model) 可因 task/billing 拆成多行
+        // 行身份键与 KimiUsage 一致：同一 (session,model) 可因 task/billing 拆成多行；
+        // input 只取 input_tokens（cache_read 是上下文重读，计入会放大一个数量级）
         let sql = """
             SELECT session_id, model, billing_provider, billing_base_url, billing_mode, task,
-                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, last_seen
+                   input_tokens, output_tokens, last_seen
             FROM session_model_usage
             """
         var stmt: OpaquePointer?
@@ -1058,12 +1063,9 @@ enum ExternalTokenScanner {
             guard isOpenAIModel(model) else { continue }
             let key = (0...5).map { col(Int32($0)) }.joined(separator: "|")
             alive.insert(key)
-            // 与文件来源口径一致：input 含 cache read/write
             let cumIn = Double(sqlite3_column_int64(stmt, 6))
-                + Double(sqlite3_column_int64(stmt, 8))
-                + Double(sqlite3_column_int64(stmt, 9))
             let cumOut = Double(sqlite3_column_int64(stmt, 7))
-            let lastSeen = sqlite3_column_double(stmt, 10)
+            let lastSeen = sqlite3_column_double(stmt, 8)
             let old = hs.rows[key] ?? [0, 0]
             var dIn = cumIn - old[0], dOut = cumOut - old[1]
             if dIn < 0 || dOut < 0 { dIn = max(dIn, 0); dOut = max(dOut, 0) }
@@ -1946,9 +1948,9 @@ enum CodexOfflineRegression {
                        && !ExternalTokenScanner.isOpenAIModel(nil),
                        "non-OpenAI or missing model names were accepted")
 
-            // 行解析：_createdAt(ms)/timestamp(ISO8601) 双格式、cache 计入 input、
-            // 非 OpenAI 模型剔除、modelUsage 汇总行跳过、缺时间/坏 usage 跳过。
-            // 基准取「本地正午」，任何时区下 ±数小时偏移都不跨日。
+            // 行解析：_createdAt(ms)/timestamp(ISO8601) 双格式、cache 不计入 input
+            //（口径对齐 Codex CLI）、非 OpenAI 模型剔除、modelUsage 汇总行跳过、
+            // 缺时间/坏 usage 跳过。基准取「本地正午」，任何时区下 ±数小时偏移都不跨日。
             guard let extBase = ExternalTokenScanner.dayFmt.date(from: "2026-10-09")?
                 .addingTimeInterval(12 * 3600) else {
                 throw Failure(description: "external scan fixture base date failed to parse")
@@ -1970,7 +1972,8 @@ enum CodexOfflineRegression {
                 "{\"type\":\"assistant\",\"_createdAt\":\(extMS),\"message\":{\"model\":\"gpt-5.6-sol\",\"usage\":\"bad\"}}"
             ].joined(separator: "\n"), cutoffKey: "2000-01-01", into: &fs)
             let extDayKey = ExternalTokenScanner.dayFmt.string(from: extBase)
-            try expect(fs.days.count == 1 && fs.days[extDayKey] == [370, 70],
+            // 100(input_tokens) + 200(input_tokens)，cache_read 50 / cache_creation 20 不计
+            try expect(fs.days.count == 1 && fs.days[extDayKey] == [300, 70],
                        "external parse did not aggregate OpenAI usage only (got \(fs.days))")
 
             // 增量扫描端到端（临时 roots + 临时状态文件，不碰真实 ~/.proma / ~/.claude）：

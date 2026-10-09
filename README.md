@@ -6,7 +6,7 @@ macOS 菜单栏应用，显示 OpenAI Codex（ChatGPT Plus）订阅的 5 小时 
 
 - 菜单栏两行：5H / 7D 剩余百分比
 - 下拉：套餐、重置时间、重置卡、Tibo 重置动态、今天/7天/30天 token 统计、外部用量
-- 外部用量（OpenAI 模型 · 非 Codex CLI）：统计 Proma（两代在写目录 + 最早一代）、Claude Code 本机会话与 hermes 中 OpenAI 系模型（gpt* / codex* / chatgpt* / o+数字）的 token，与 Codex CLI 本机口径互补、不混算；input 含 cache；外部目录与 hermes 数据库全程只读，hermes 走累计行快照差分（首扫按 last_seen 回填近 30 天）
+- 外部用量（非Codex）：统计 Proma（sdk-config/sessions 在写目录 + projects 最早一代）、Claude Code 本机会话与 hermes 中 OpenAI 系模型（gpt* / codex* / chatgpt* / o+数字）的 token，与 Codex CLI 本机口径互补、不混算；input 不含 cache、Proma 双写目录只扫超集侧（agent-sessions 为并行双写不扫），避免虚高；外部目录与 hermes 数据库全程只读，hermes 走累计行快照差分（首扫按 last_seen 回填近 30 天）
 - 5H、7D、Token、充值卡分别记录最后成功时间；刷新失败时保留旧值，同时显示错误，超过对应时限后标 ⚠
 - “最近尝试刷新”显示请求开始时间；额度每 60 秒刷新，Token/充值卡每 5 分钟刷新，手动刷新会拉取全部项目
 - 一轮刷新最多运行一次；刷新中的多次手动请求合并为一轮后续完整刷新

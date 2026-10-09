@@ -222,8 +222,8 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 
 ### 数据源（两路，全部只读）
 
-1. **Claude SDK 风格 JSONL 增量扫描**，roots 四个：
-   - `~/.proma/agent-sessions` 与 `~/.proma/sdk-config/sessions`：2026-10 实测**两代目录均在写入且内容零重复**（不同组件各写各的），都要扫；
+1. **Claude SDK 风格 JSONL 增量扫描**，roots 三个：
+   - `~/.proma/sdk-config/sessions`：Proma 运行时日志，2026-10 实测仍在写且是超集。**`~/.proma/agent-sessions` 是同一批会话的并行双写（孪生文件 token 数值完全一致），不扫防双算**——首版两目录都扫导致外部用量约翻倍，已修正；
    - `~/.proma/sdk-config/projects`（最早一代，已停写）；
    - `~/.claude/projects`（Claude Code 本机，可经 ccswitch/Proma 接 OpenAI 模型）。
    行级口径：逐条 assistant 行 `message.usage` 计入；Proma result 行的 `modelUsage`/顶层 usage 是全会话累计汇总，**跳过防双算**；时间字段 `_createdAt`(ms) / `timestamp`(ISO8601) / `time`(ms) 兜底。
@@ -232,8 +232,8 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 ### 甄别与口径
 
 - `isOpenAIModel`：`gpt*` / `codex*` / `chatgpt*` / `o+数字`（o1/o3/o4-mini）；缺失 model 或他家模型（glm/k3/mimo/claude/qwen/deepseek/ark…）一律不计——外部工具混接多家 API，宁漏勿错。
-- input 含 cache read/write（文件与 hermes 口径一致）；今日/近 7 天/近 30 天按本地时区日聚合，31 天余量清理。
-- 状态文件 `~/Library/Application Support/CodexUsage/external-scan-state.json`（与 Codex CLI 的 scan-state.json 分开，互不影响）。
+- **input 不含 cache**（cache_read/cache_creation 剔除）：cache_read 是长会话每轮的上下文全额重读（实测占 95%+；hermes 侧 input 5M vs cache_read 107M），计入会把量级放大一个数量级；与 Codex CLI Token 统计（total_tokens 不含 cached）口径一致。今日/近 7 天/近 30 天按本地时区日聚合，31 天余量清理。
+- 状态文件 `~/Library/Application Support/CodexUsage/external-scan-state-v2.json`（与 Codex CLI 的 scan-state.json 分开；文件名带 v2——口径变更后弃用 v1 缓存强制重建）。
 
 ### 增量与健壮性
 
