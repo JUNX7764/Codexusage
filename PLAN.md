@@ -216,6 +216,38 @@ Tibo 重置动态                            // 区块头；位置在充值卡�
 - `--self-test` 增加解析严格性、展示行（窗口已过/未过、已确认、空列表占位）与三态合并用例；不访问网络。
 
 
+## 4.7 外部用量（OpenAI 模型 · 非 Codex CLI）—— v1.3 增补
+
+Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent 工具也在消费 OpenAI 系模型（本机实测：`gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-6.1-sol` / `gpt-5.5`，多经中转路由）。实现与 KimiUsage 的「API 客户端」同构（参考其 TokenAggregator）。
+
+### 数据源（两路，全部只读）
+
+1. **Claude SDK 风格 JSONL 增量扫描**，roots 四个：
+   - `~/.proma/agent-sessions` 与 `~/.proma/sdk-config/sessions`：2026-10 实测**两代目录均在写入且内容零重复**（不同组件各写各的），都要扫；
+   - `~/.proma/sdk-config/projects`（最早一代，已停写）；
+   - `~/.claude/projects`（Claude Code 本机，可经 ccswitch/Proma 接 OpenAI 模型）。
+   行级口径：逐条 assistant 行 `message.usage` 计入；Proma result 行的 `modelUsage`/顶层 usage 是全会话累计汇总，**跳过防双算**；时间字段 `_createdAt`(ms) / `timestamp`(ISO8601) / `time`(ms) 兜底。
+2. **hermes**（`~/.hermes/state.db`，`SQLITE_OPEN_READONLY` 只读打开）：`session_model_usage` 是 (session,model,…) 级**累计行**，与持久化快照做差，delta 按行 `last_seen` 归日；首扫把存量累计值按 `last_seen` 回填（自动获得近 30 天窗口）；计数变小说明上游重置，rebase 不倒扣；行被删除（ON DELETE CASCADE）移出快照、保留历史差分。
+
+### 甄别与口径
+
+- `isOpenAIModel`：`gpt*` / `codex*` / `chatgpt*` / `o+数字`（o1/o3/o4-mini）；缺失 model 或他家模型（glm/k3/mimo/claude/qwen/deepseek/ark…）一律不计——外部工具混接多家 API，宁漏勿错。
+- input 含 cache read/write（文件与 hermes 口径一致）；今日/近 7 天/近 30 天按本地时区日聚合，31 天余量清理。
+- 状态文件 `~/Library/Application Support/CodexUsage/external-scan-state.json`（与 Codex CLI 的 scan-state.json 分开，互不影响）。
+
+### 增量与健壮性
+
+- 未变化文件只 stat；首见且 mtime 超 31 天的文件记录大小后跳过；截断/轮换清零重扫；只消费到最后一个完整换行。
+- 已删除文件剔除其贡献：roots 记录 **realpath 形式**（枚举器产出的 url.path 会解析符号链接，如 `/var` → `/private/var`；URL 的 `resolvingSymlinksInPath` 不解析根级链接，必须用 `realpath(3)` 对齐口径）。
+
+### 展示与行为
+
+- Token 区块之后新增：`外部用量（OpenAI 模型 · 非 Codex CLI）今天 X · 7 天 Y · 30 天 Z` + 今日/近 7 天/近 30 天 input/output 树状明细（与 Token 区块同款式）。
+- 刷新周期与 token 统计同（每 5 分钟，同一 utility 块串行执行）；纯本地扫描、无失败面，每次推进最后成功时间。
+- status.json 增 `externalTokensToday/7d/30d`（缩写展示值）、`externalTokensLastSuccess`、`externalTokensStale`；菜单栏 tooltip 增「外部最后成功」。
+- `--once` 打印 external 三行摘要（本地统计，不计入退出码）。
+- `--self-test`：甄别正负例（正负例均取本机外部工具实测模型名）、行解析（双时间格式/cache 计入/汇总行跳过/坏行跳过）、临时目录端到端（分桶/嵌套枚举/旧文件跳过/追加增量/删除剔除/截断重扫）、hermes sqlite 夹具（回填/差分入日/计数重置/行删除）。全部用临时 roots 与状态文件，不碰真实 `~/.proma` / `~/.claude` / `~/.hermes`。
+
 ## 5. 工程与部署边界
 
 - 单文件 `CodexUsage.swift`；`build.sh` 与 `Info.plist` 已就绪，**不要改动**（部署目标 13.0 是刻意为之，本机 CLT 默认 macosx28 会被 LaunchServices 拒绝）。

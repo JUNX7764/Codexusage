@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import SQLite3
 import CoreFoundation
 import Darwin
 
@@ -145,6 +146,10 @@ enum TiboFreshness {
 //   充值卡 GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits（每 5 分钟，认证头同款）
 //   Tibo 重置动态 GET https://aihot.news/api/v1/codex-resets/recent（每 5 分钟，AIHOT 公开接口，匿名只读不经凭据）
 //   token 统计：本地增量扫描 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl（每 5 分钟）
+//   外部用量：Codex CLI 之外消费 OpenAI 系模型（gpt* 等）的 token——本地增量扫描
+//     ~/.proma（agent-sessions / sdk-config/sessions 两代目录均在写入且互不重复、
+//     sdk-config/projects 为最早一代）与 ~/.claude/projects 的 Claude SDK 风格 JSONL，
+//     加 ~/.hermes/state.db 的 session_model_usage 累计行快照差分（只读打开）
 // 凭证红线：access_token / refresh_token / id_token 只存在于内存，绝不写入日志、
 //   status.json、scan-state.json 或提交；~/.codex/ 只读，唯一例外是 401 刷新成功后
 //   按 PLAN §2 原子写回 auth.json 本身。
@@ -292,6 +297,9 @@ struct UsageData {
     var tokensToday: TokenScanner.Stats?
     var tokens7d: TokenScanner.Stats?
     var tokens30d: TokenScanner.Stats?
+    var extToday: ExternalTokenScanner.Stats?    // 外部用量（OpenAI 模型 · 非 Codex CLI）
+    var ext7d: ExternalTokenScanner.Stats?
+    var ext30d: ExternalTokenScanner.Stats?
     var quotaError: String?
     var tokensError: String?
     var fiveHourError: String?
@@ -816,6 +824,316 @@ enum TokenScanner {
     }
 }
 
+// MARK: - 外部用量（OpenAI 模型 · 非 Codex CLI，本地扫描）
+//
+// 统计 Codex CLI 之外消费 OpenAI 系模型的 token，两个来源（与 KimiUsage 的
+// 「API 客户端」同构，参考其 TokenAggregator）：
+//   1) Claude SDK 风格 JSONL：Proma（agent-sessions 与 sdk-config/sessions 两代目录
+//      2026-10 实测均在写入且内容零重复，sdk-config/projects 为最早一代）+
+//      ~/.claude/projects（Claude Code 本机，可经 ccswitch/Proma 接 OpenAI 模型）。
+//      逐条 assistant 行 message.usage 计入；Proma result 行的 modelUsage/顶层 usage
+//      是全会话累计汇总，跳过避免双算。甄别只看 model 字段（isOpenAIModel）。
+//   2) hermes：~/.hermes/state.db 的 session_model_usage 是 (session,model,…) 级
+//      累计行，只读查询后与持久化快照做差，delta 按行 last_seen 归日；首次运行把
+//      存量累计值归入各自 last_seen 当天（自动回填近 30 天窗口）。
+// 增量策略与 TokenScanner 同思路：offset 记已消费字节、未变化文件只 stat、追加只读
+// 新增字节、只消费到最后一个完整换行；31 天外日聚合清理；~/.proma、~/.claude、
+// ~/.hermes 全程只读，绝不写入。
+
+enum ExternalTokenScanner {
+    struct Stats {
+        var input = 0.0
+        var output = 0.0
+        var total: Double { input + output }
+    }
+    struct Result {
+        var today = Stats()
+        var seven = Stats()
+        var thirty = Stats()
+    }
+
+    /// 按文件增量扫描状态：offset 为已消费字节数，days 为按日聚合 [input, output]
+    struct FileState: Codable {
+        var offset: UInt64 = 0
+        var days: [String: [Double]] = [:]
+    }
+    /// hermes 快照：rows 存上次各累计行的值，days 存按 last_seen 归日的差分历史
+    struct HermesState: Codable {
+        var rows: [String: [Double]] = [:]
+        var days: [String: [Double]] = [:]
+    }
+    struct State: Codable {
+        var files: [String: FileState] = [:]
+        var hermes: HermesState?
+    }
+
+    static let fileRoots = [
+        NSHomeDirectory() + "/.proma/agent-sessions",
+        NSHomeDirectory() + "/.proma/sdk-config/sessions",
+        NSHomeDirectory() + "/.proma/sdk-config/projects",
+        NSHomeDirectory() + "/.claude/projects",
+    ]
+    static let hermesDBPath = NSHomeDirectory() + "/.hermes/state.db"
+    static let defaultStatePath = NSHomeDirectory()
+        + "/Library/Application Support/CodexUsage/external-scan-state.json"
+
+    // 只关心近 30 天窗口，日聚合保留 31 天余量
+    private static let retainSeconds: TimeInterval = 31 * 86400
+
+    static let dayFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"   // 本地时区，与 TokenScanner 口径一致
+        return f
+    }()
+
+    /// 甄别 OpenAI 系模型（只看 model 字符串，本机外部工具实测值见 --self-test）：
+    /// gpt*（gpt-5.6-sol / gpt-6.1-sol / gpt2）、codex*、chatgpt*（chatgpt-4o-latest）、
+    /// o+数字（o1 / o3 / o4-mini）。非 OpenAI（glm/k3/mimo/claude/qwen/deepseek/ark…）
+    /// 与缺失 model 一律不计——外部工具混接多家 API，宁可漏记不可错记。
+    static func isOpenAIModel(_ model: String?) -> Bool {
+        guard let m = model?.lowercased(), !m.isEmpty else { return false }
+        if m.hasPrefix("gpt") || m.hasPrefix("codex") || m.hasPrefix("chatgpt") { return true }
+        guard m.hasPrefix("o"), m.count > 1 else { return false }
+        return m[m.index(after: m.startIndex)].isNumber
+    }
+
+    /// 全量刷新入口（GUI 每 5 分钟与 token 统计同周期调用；--once 单次）。
+    /// roots/hermesDB/statePath/now 均可注入，--self-test 用临时目录做封闭回归。
+    static func scan(roots: [String] = fileRoots,
+                     hermesDB: String? = hermesDBPath,
+                     statePath: String = defaultStatePath,
+                     now: Date = Date()) -> Result {
+        var st = loadState(at: statePath)
+        let cutoff = now.addingTimeInterval(-retainSeconds)
+        let cutoffKey = dayFmt.string(from: cutoff)
+        scanFiles(roots: roots, cutoff: cutoff, cutoffKey: cutoffKey, into: &st)
+        if let db = hermesDB {
+            scanHermes(path: db, cutoffKey: cutoffKey, into: &st)
+        }
+        saveState(st, at: statePath)
+        return buckets(st, now: now)
+    }
+
+    /// 全解析符号链接的绝对路径（realpath(3)）；路径不存在时原样返回
+    private static func realPath(_ p: String) -> String {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard realpath(p, &buf) != nil else { return p }
+        return String(cString: buf)
+    }
+
+    /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
+    /// 已被删除的文件从状态中剔除（枚举失败的 root 不动，避免目录临时不可用时误清）
+    private static func scanFiles(roots: [String], cutoff: Date, cutoffKey: String,
+                                  into st: inout State) {
+        var seen = Set<String>()
+        var enumedRoots: [String] = []
+
+        for root in roots {
+            guard let enumerator = FileManager.default.enumerator(
+                at: URL(fileURLWithPath: root),
+                includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles])
+            else { continue }
+            // 枚举器产出的 url.path 是 realpath 形式（/var → /private/var，URL 的
+            // resolvingSymlinksInPath 不解析根级符号链接），前缀清理必须同口径，
+            // 否则永不匹配、已删文件清不掉
+            enumedRoots.append(realPath(root))
+
+            for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+                let path = url.path
+                seen.insert(path)
+                guard let vals = try? url.resourceValues(
+                        forKeys: [.fileSizeKey, .contentModificationDateKey]),
+                      let size = vals.fileSize
+                else { continue }
+                let sizeU = UInt64(size)
+                var fs = st.files[path] ?? FileState()
+                // 文件只增不改：大小未变直接跳过（绝大多数文件走这里）
+                if fs.offset == sizeU { st.files[path] = fs; continue }
+                // 首次见到且 31 天未修改：旧内容不可能贡献近 30 天数据，记录大小后跳过
+                if fs.offset == 0, fs.days.isEmpty,
+                   let mtime = vals.contentModificationDate, mtime < cutoff {
+                    fs.offset = sizeU; st.files[path] = fs; continue
+                }
+                // 截断/轮换：该文件的旧聚合已不可信，清零重扫
+                if sizeU < fs.offset { fs = FileState() }
+
+                guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
+                fh.seek(toFileOffset: fs.offset)
+                let data = fh.readDataToEndOfFile()
+                try? fh.close()
+                // 只消费到最后一个完整换行：正在被写入的残缺行留给下次
+                guard let lastNL = data.lastIndex(of: UInt8(ascii: "\n")) else { continue }
+                let consumed = fs.offset + UInt64(lastNL + 1)
+                if let text = String(data: data[..<lastNL], encoding: .utf8) {
+                    parseLines(text, cutoffKey: cutoffKey, into: &fs)
+                }
+                fs.offset = consumed
+                fs.days = fs.days.filter { $0.key >= cutoffKey }
+                st.files[path] = fs
+            }
+        }
+
+        // 先快照再删：迭代中变更字典可能跳过条目（TokenScanner 同款写法）
+        let vanished = st.files.keys.filter { path in
+            !seen.contains(path) && enumedRoots.contains(where: { path.hasPrefix($0 + "/") })
+        }
+        for path in vanished {
+            st.files.removeValue(forKey: path)
+        }
+    }
+
+    /// 解析一批完整行，把 OpenAI 系模型的 usage 按日累加进 days。
+    /// 时间字段：_createdAt(ms, Proma) / timestamp(ISO8601, Claude SDK) / time(ms, 兜底)；
+    /// usage 位置：event.usage / 顶层 usage / message.usage（与 KimiUsage 同序）；
+    /// input 含 cache read/write（与 hermes 来源口径一致）。
+    static func parseLines(_ text: String, cutoffKey: String, into st: inout FileState) {
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true)
+        where line.contains("\"usage\"") {
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            // Proma result 行的 modelUsage / 顶层 usage 是全会话累计汇总，
+            // 逐条 assistant 行已含每次调用，跳过汇总行避免双算
+            if obj["modelUsage"] != nil { continue }
+            let t: Date
+            if let ms = CodexNumber.finite(obj["_createdAt"]) {
+                t = Date(timeIntervalSince1970: ms / 1000)
+            } else if let ts = Fmt.iso(obj["timestamp"] as? String) {
+                t = ts
+            } else if let ms = CodexNumber.finite(obj["time"]) {
+                t = Date(timeIntervalSince1970: ms / 1000)
+            } else { continue }
+            let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any]
+                ?? obj["usage"] as? [String: Any]
+                ?? (obj["message"] as? [String: Any])?["usage"] as? [String: Any]
+            guard let usage = usage else { continue }
+            let model = (obj["message"] as? [String: Any])?["model"] as? String
+                ?? obj["model"] as? String
+            guard isOpenAIModel(model) else { continue }
+            var input: Double = 0
+            for k in ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+                      "input", "cacheRead", "cacheWrite"] {
+                if let v = CodexNumber.finite(usage[k]) { input += v }
+            }
+            var output: Double = 0
+            for k in ["output", "output_tokens"] {
+                if let v = CodexNumber.finite(usage[k]) { output += v }
+            }
+            let dayKey = dayFmt.string(from: t)
+            if dayKey >= cutoffKey {
+                var day = st.days[dayKey] ?? [0, 0]
+                day[0] += input
+                day[1] += output
+                st.days[dayKey] = day
+            }
+        }
+    }
+
+    /// hermes 用量库（sqlite，只读打开，绝不写入）。累计行与上次快照做差，
+    /// delta 按 last_seen 归日；计数变小说明上游重置，rebase 不倒扣。
+    private static func scanHermes(path: String, cutoffKey: String, into st: inout State) {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db = db
+        else { _ = db.map { sqlite3_close($0) }; return }
+        defer { sqlite3_close(db) }
+        // 行身份键与 KimiUsage 一致：同一 (session,model) 可因 task/billing 拆成多行
+        let sql = """
+            SELECT session_id, model, billing_provider, billing_base_url, billing_mode, task,
+                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, last_seen
+            FROM session_model_usage
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+
+        var hs = st.hermes ?? HermesState()
+        var alive = Set<String>()
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            func col(_ i: Int32) -> String {
+                sqlite3_column_text(stmt, i).map { String(cString: $0) } ?? ""
+            }
+            let model = col(1)
+            guard isOpenAIModel(model) else { continue }
+            let key = (0...5).map { col(Int32($0)) }.joined(separator: "|")
+            alive.insert(key)
+            // 与文件来源口径一致：input 含 cache read/write
+            let cumIn = Double(sqlite3_column_int64(stmt, 6))
+                + Double(sqlite3_column_int64(stmt, 8))
+                + Double(sqlite3_column_int64(stmt, 9))
+            let cumOut = Double(sqlite3_column_int64(stmt, 7))
+            let lastSeen = sqlite3_column_double(stmt, 10)
+            let old = hs.rows[key] ?? [0, 0]
+            var dIn = cumIn - old[0], dOut = cumOut - old[1]
+            if dIn < 0 || dOut < 0 { dIn = max(dIn, 0); dOut = max(dOut, 0) }
+            hs.rows[key] = [cumIn, cumOut]
+            guard dIn > 0 || dOut > 0, lastSeen > 0 else { continue }
+            let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: lastSeen))
+            if dayKey >= cutoffKey {
+                var day = hs.days[dayKey] ?? [0, 0]
+                day[0] += dIn; day[1] += dOut
+                hs.days[dayKey] = day
+            }
+        }
+        // 会话被 hermes 删除（ON DELETE CASCADE）的行：移出快照，停止差分
+        hs.rows = hs.rows.filter { alive.contains($0.key) }
+        hs.days = hs.days.filter { $0.key >= cutoffKey }
+        st.hermes = hs
+    }
+
+    /// 按日聚合 → 今日/近7天/近30天（边界与 TokenScanner 一致：dayKey >= 起算日）
+    private static func buckets(_ st: State, now: Date) -> Result {
+        let todayKey = dayFmt.string(from: now)
+        let d7Key = dayFmt.string(from: now.addingTimeInterval(-7 * 86400))
+        let d30Key = dayFmt.string(from: now.addingTimeInterval(-30 * 86400))
+        var allDays: [String: [Double]] = [:]
+        for (_, f) in st.files {
+            for (day, v) in f.days {
+                var a = allDays[day] ?? [0, 0]
+                a[0] += v[0]; a[1] += v[1]
+                allDays[day] = a
+            }
+        }
+        if let hd = st.hermes?.days {
+            for (day, v) in hd {
+                var a = allDays[day] ?? [0, 0]
+                a[0] += v[0]; a[1] += v[1]
+                allDays[day] = a
+            }
+        }
+        var r = Result()
+        for (day, v) in allDays where day >= d30Key {
+            r.thirty.input += v[0]; r.thirty.output += v[1]
+            if day >= d7Key { r.seven.input += v[0]; r.seven.output += v[1] }
+            if day >= todayKey { r.today.input += v[0]; r.today.output += v[1] }
+        }
+        return r
+    }
+
+    private static func loadState(at path: String) -> State {
+        if let data = FileManager.default.contents(atPath: path),
+           let s = try? JSONDecoder().decode(State.self, from: data) {
+            return s
+        }
+        return State()
+    }
+
+    private static func saveState(_ s: State, at path: String) {
+        guard let data = try? JSONEncoder().encode(s) else { return }
+        try? FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true)
+        // 与 AtomicJSONFile.replace 同思路：临时文件 + 原子 rename，避免半写状态
+        let dir = (path as NSString).deletingLastPathComponent
+        let tmp = dir + "/." + (path as NSString).lastPathComponent + ".tmp"
+        if (try? data.write(to: URL(fileURLWithPath: tmp), options: [.atomic])) != nil {
+            _ = try? FileManager.default.replaceItemAt(
+                URL(fileURLWithPath: path), withItemAt: URL(fileURLWithPath: tmp))
+        }
+    }
+}
+
 // MARK: - 菜单栏堆叠两行文字渲染（与 GlmUsage 同款）
 
 enum StackImage {
@@ -906,6 +1224,11 @@ enum Fmt {
         return f
     }()
     private static let isoPlain = ISO8601DateFormatter()
+    /// ISO8601 字符串（带/不带毫秒）→ Date；外部会话 timestamp 字段用
+    static func iso(_ s: String?) -> Date? {
+        guard let s = s else { return nil }
+        return isoFrac.date(from: s) ?? isoPlain.date(from: s)
+    }
     private static let isoNoZone: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -947,6 +1270,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var tokensLastOK: Date?
     private var resetCardsLastOK: Date?
     private var tiboLastOK: Date?
+    private var extLastOK: Date?
     private var lastAttemptAt = Date()
     private let launchAgentLabel = "com.local.codex-usage"
 
@@ -987,9 +1311,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if tokens {
             group.enter()
             DispatchQueue.global(qos: .utility).async { [weak self] in
+                // Codex CLI 本机会话与外部用量（Proma/Claude Code/hermes）都是纯本地扫描，
+                // 串在同一 utility 块里，互不争抢也只进出一个 group 名额
                 let r = TokenScanner.scan()
+                let e = ExternalTokenScanner.scan()
                 DispatchQueue.main.async {
                     self?.applyTokens(r)
+                    self?.applyExternal(e)
                     group.leave()
                 }
             }
@@ -1049,6 +1377,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    // 外部用量：纯本地扫描，无网络失败面，结果总是全量可信快照
+    private func applyExternal(_ r: ExternalTokenScanner.Result) {
+        extLastOK = CodexFreshness.updated(extLastOK, succeeded: true, at: Date())
+        usage.extToday = r.today
+        usage.ext7d = r.seven
+        usage.ext30d = r.thirty
+        usage.updatedAt = Date()
+        renderBar()
+        rebuildMenu()
+    }
+
     // 充值卡：成功则更新并清错误；瞬时失败保留上次数据、仅记录错误
     // （有旧数据时菜单仍展示未过期的旧卡；卡数据状态与额度窗口互相独立）
     private func applyResetCards(_ cards: [ResetCard]?, _ err: String?) {
@@ -1098,6 +1437,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var tiboStale: Bool {
         isStale(tiboLastOK, hasData: usage.tiboEvents != nil, after: tiboStaleAfter)
     }
+    private var extStale: Bool {
+        isStale(extLastOK,
+                hasData: usage.extToday != nil || usage.ext7d != nil || usage.ext30d != nil,
+                after: tokensStaleAfter)
+    }
 
     // 菜单栏显示：5H / 7D 两行堆叠（剩余口径）；额度过期时第一行前缀 ⚠
     private func renderBar() {
@@ -1109,6 +1453,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = "Codex 用量 · 5H成功 \(fiveHourLastOK.map { Fmt.time($0) } ?? "--")"
             + " · 7D成功 \(sevenDayLastOK.map { Fmt.time($0) } ?? "--")"
             + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · 外部最后成功 \(extLastOK.map { Fmt.time($0) } ?? "--")"
             + " · 充值卡最后成功 \(resetCardsLastOK.map { Fmt.time($0) } ?? "--")"
             + " · Tibo 最后成功 \(tiboLastOK.map { Fmt.time($0) } ?? "--")"
         writeStatus(line1: line1, line2: line2)
@@ -1138,6 +1483,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "tiboError": usage.tiboError ?? "",
             "quotaLastSuccess": ["fiveHour": iso(fiveHourLastOK), "sevenDay": iso(sevenDayLastOK)],
             "tokensLastSuccess": iso(tokensLastOK),
+            "externalTokensToday": Fmt.tokensAbbr(usage.extToday?.total),
+            "externalTokens7d": Fmt.tokensAbbr(usage.ext7d?.total),
+            "externalTokens30d": Fmt.tokensAbbr(usage.ext30d?.total),
+            "externalTokensLastSuccess": iso(extLastOK),
+            "externalTokensStale": extStale,
             "resetCardsLastSuccess": iso(resetCardsLastOK),
             "resetCardsStale": resetCardsStale,
             "fiveHourStale": fiveHourStale,
@@ -1276,6 +1626,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(info("⚠ tokens 过期（最后成功 \(tokensLastOK.map { Fmt.dayTime($0) } ?? "--")）"))
         }
         if let e = usage.tokensError { menu.addItem(info("Token 统计失败：\(e)")) }
+
+        // 外部用量（OpenAI 模型 · 非 Codex CLI）：Proma / Claude Code / hermes 里的
+        // gpt* 等 OpenAI 系模型 token，与上方 Codex CLI 本机会话口径互补、不混算
+        if usage.extToday != nil || usage.ext7d != nil || usage.ext30d != nil {
+            menu.addItem(info("外部用量（OpenAI 模型 · 非 Codex CLI）今天 \(Fmt.tokensAbbr(usage.extToday?.total))"
+                + " · 7 天 \(Fmt.tokensAbbr(usage.ext7d?.total))"
+                + " · 30 天 \(Fmt.tokensAbbr(usage.ext30d?.total))"))
+            var extDetails: [(label: String, s: ExternalTokenScanner.Stats)] = []
+            if let s = usage.extToday { extDetails.append(("今日", s)) }
+            if let s = usage.ext7d { extDetails.append(("近 7 天", s)) }
+            if let s = usage.ext30d { extDetails.append(("近 30 天", s)) }
+            for (i, d) in extDetails.enumerated() {
+                let branch = i < extDetails.count - 1 ? "├" : "└"
+                menu.addItem(info("  \(branch) \(d.label)：input \(Fmt.tokensAbbr(d.s.input))"
+                    + " / output \(Fmt.tokensAbbr(d.s.output))"))
+            }
+            if extStale {
+                menu.addItem(info("⚠ 外部用量已过期（最后成功 \(extLastOK.map { Fmt.dayTime($0) } ?? "--")）"))
+            }
+        }
+
         if let e = usage.quotaError {
             menu.addItem(info("额度错误：\(e)"))
         }
@@ -1551,6 +1922,166 @@ enum CodexOfflineRegression {
             try expect(tiboFailR.value?.count == 3 && tiboFailR.lastOK == tiboOldOK && tiboFailR.error == "HTTP 500",
                        "failed tibo outcome cleared old events or advanced last-success")
 
+            // 外部用量（OpenAI 模型 · 非 Codex CLI）：甄别谓词（正负例均取自本机外部工具实测模型名）
+            try expect(ExternalTokenScanner.isOpenAIModel("gpt-5.6-sol")
+                       && ExternalTokenScanner.isOpenAIModel("GPT-6.1-SOL")
+                       && ExternalTokenScanner.isOpenAIModel("gpt-5.5")
+                       && ExternalTokenScanner.isOpenAIModel("codex-mini-latest")
+                       && ExternalTokenScanner.isOpenAIModel("chatgpt-4o-latest")
+                       && ExternalTokenScanner.isOpenAIModel("o3")
+                       && ExternalTokenScanner.isOpenAIModel("o4-mini"),
+                       "OpenAI-family model names were rejected")
+            try expect(!ExternalTokenScanner.isOpenAIModel("glm-5.2")
+                       && !ExternalTokenScanner.isOpenAIModel("k3-256k")
+                       && !ExternalTokenScanner.isOpenAIModel("kimi-k3")
+                       && !ExternalTokenScanner.isOpenAIModel("claude-sonnet-5")
+                       && !ExternalTokenScanner.isOpenAIModel("minimax-m3")
+                       && !ExternalTokenScanner.isOpenAIModel("deepseek-v4-flash")
+                       && !ExternalTokenScanner.isOpenAIModel("qwen3.8-max")
+                       && !ExternalTokenScanner.isOpenAIModel("ark-code-latest")
+                       && !ExternalTokenScanner.isOpenAIModel("mimo-v2.5-pro")
+                       && !ExternalTokenScanner.isOpenAIModel("opus")
+                       && !ExternalTokenScanner.isOpenAIModel("auto")
+                       && !ExternalTokenScanner.isOpenAIModel("")
+                       && !ExternalTokenScanner.isOpenAIModel(nil),
+                       "non-OpenAI or missing model names were accepted")
+
+            // 行解析：_createdAt(ms)/timestamp(ISO8601) 双格式、cache 计入 input、
+            // 非 OpenAI 模型剔除、modelUsage 汇总行跳过、缺时间/坏 usage 跳过。
+            // 基准取「本地正午」，任何时区下 ±数小时偏移都不跨日。
+            guard let extBase = ExternalTokenScanner.dayFmt.date(from: "2026-10-09")?
+                .addingTimeInterval(12 * 3600) else {
+                throw Failure(description: "external scan fixture base date failed to parse")
+            }
+            let extMS = extBase.timeIntervalSince1970 * 1000
+            let localISO: String = {
+                let f = DateFormatter()
+                f.locale = Locale(identifier: "en_US_POSIX")
+                f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSZZZZZ"
+                return f.string(from: extBase)
+            }()
+            var fs = ExternalTokenScanner.FileState()
+            ExternalTokenScanner.parseLines([
+                "{\"type\":\"assistant\",\"_createdAt\":\(extMS),\"message\":{\"model\":\"gpt-5.6-sol\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":50,\"cache_creation_input_tokens\":20,\"output_tokens\":30}}}",
+                "{\"type\":\"assistant\",\"_createdAt\":\(extMS),\"message\":{\"model\":\"glm-5.2\",\"usage\":{\"input_tokens\":999,\"output_tokens\":999}}}",
+                "{\"type\":\"result\",\"_createdAt\":\(extMS),\"modelUsage\":{\"gpt-5.6-sol\":{}},\"usage\":{\"input\":700,\"output\":70}}",
+                "{\"type\":\"assistant\",\"timestamp\":\"\(localISO)\",\"message\":{\"model\":\"gpt-6.1-sol\",\"usage\":{\"input_tokens\":200,\"output_tokens\":40}}}",
+                "{\"type\":\"assistant\",\"message\":{\"model\":\"gpt-5.6-sol\",\"usage\":{\"input_tokens\":500,\"output_tokens\":50}}}",
+                "{\"type\":\"assistant\",\"_createdAt\":\(extMS),\"message\":{\"model\":\"gpt-5.6-sol\",\"usage\":\"bad\"}}"
+            ].joined(separator: "\n"), cutoffKey: "2000-01-01", into: &fs)
+            let extDayKey = ExternalTokenScanner.dayFmt.string(from: extBase)
+            try expect(fs.days.count == 1 && fs.days[extDayKey] == [370, 70],
+                       "external parse did not aggregate OpenAI usage only (got \(fs.days))")
+
+            // 增量扫描端到端（临时 roots + 临时状态文件，不碰真实 ~/.proma / ~/.claude）：
+            // 窗口分桶、嵌套枚举、首见旧文件跳过、追加增量、删除剔除、截断重扫
+            let extRootA = root.path + "/proma-a"
+            let extRootB = root.path + "/claude-b"
+            try FileManager.default.createDirectory(atPath: extRootA, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(atPath: extRootB + "/nested", withIntermediateDirectories: true)
+            func extLine(_ model: String, _ at: Date, inTok: Double, outTok: Double) -> String {
+                "{\"type\":\"assistant\",\"_createdAt\":\(at.timeIntervalSince1970 * 1000),"
+                    + "\"message\":{\"model\":\"\(model)\",\"usage\":{"
+                    + "\"input_tokens\":\(Int(inTok)),\"output_tokens\":\(Int(outTok))}}}"
+            }
+            let fileA = extRootA + "/a.jsonl"
+            let fileB = extRootB + "/nested/b.jsonl"   // 嵌套目录也必须枚举到
+            let fileC = extRootA + "/old.jsonl"
+            try [extLine("gpt-5.6-sol", extBase, inTok: 100, outTok: 10),
+                 extLine("gpt-5.6-sol", extBase.addingTimeInterval(-6 * 86400), inTok: 1000, outTok: 100)]
+                .joined(separator: "\n").appending("\n")
+                .write(toFile: fileA, atomically: true, encoding: .utf8)
+            try extLine("gpt-5.6-sol", extBase.addingTimeInterval(-29 * 86400), inTok: 10000, outTok: 1000)
+                .appending("\n").write(toFile: fileB, atomically: true, encoding: .utf8)
+            // 内容是今天但 mtime 在 40 天前：首见旧文件跳过，不计入
+            try extLine("gpt-5.5", extBase, inTok: 99999, outTok: 9999).appending("\n")
+                .write(toFile: fileC, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.modificationDate: extBase.addingTimeInterval(-40 * 86400)], ofItemAtPath: fileC)
+
+            let extRoots = [extRootA, extRootB]
+            let extStatePath = root.path + "/ext-scan-state.json"
+            let s1 = ExternalTokenScanner.scan(roots: extRoots, hermesDB: nil,
+                                               statePath: extStatePath, now: extBase)
+            try expect(s1.today.input == 100 && s1.today.output == 10,
+                       "external today window wrong (got \(s1.today.input)/\(s1.today.output))")
+            try expect(s1.seven.input == 1100 && s1.seven.output == 110,
+                       "external 7d window wrong (got \(s1.seven.input))")
+            try expect(s1.thirty.input == 11100 && s1.thirty.output == 1110,
+                       "external 30d window wrong (old-file skip or nested enumeration failed)")
+
+            let handleA = try FileHandle(forWritingTo: URL(fileURLWithPath: fileA))
+            _ = try handleA.seekToEnd()
+            handleA.write(Data(extLine("gpt-5.6-sol", extBase, inTok: 100, outTok: 10)
+                .appending("\n").utf8))
+            try handleA.close()
+            let s2 = ExternalTokenScanner.scan(roots: extRoots, hermesDB: nil,
+                                               statePath: extStatePath, now: extBase)
+            try expect(s2.today.input == 200 && s2.seven.input == 1200 && s2.thirty.input == 11200,
+                       "external incremental append was double-counted or missed")
+
+            try FileManager.default.removeItem(atPath: fileB)
+            let s3 = ExternalTokenScanner.scan(roots: extRoots, hermesDB: nil,
+                                               statePath: extStatePath, now: extBase)
+            try expect(s3.thirty.input == 1200,
+                       "deleted external session file still contributed to the 30d window "
+                       + "(got \(s3.thirty.input), state persisted: \(FileManager.default.contents(atPath: extStatePath) != nil))")
+
+            try extLine("gpt-5.6-sol", extBase, inTok: 30, outTok: 3).appending("\n")
+                .write(toFile: fileA, atomically: true, encoding: .utf8)
+            let s4 = ExternalTokenScanner.scan(roots: extRoots, hermesDB: nil,
+                                               statePath: extStatePath, now: extBase)
+            try expect(s4.today.input == 30 && s4.seven.input == 30 && s4.thirty.input == 30,
+                       "truncated external file did not rebase its aggregation")
+
+            // hermes 差分（临时 sqlite 夹具）：首扫按 last_seen 回填、累计行增长入当日、
+            // 计数重置 rebase 不倒扣、行删除移出快照但保留历史差分
+            let hdbPath = root.path + "/hermes-fixture.db"
+            var hdbPtr: OpaquePointer?
+            guard sqlite3_open_v2(hdbPath, &hdbPtr,
+                                  SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
+                  let hdb = hdbPtr else {
+                throw Failure(description: "hermes fixture db could not be created")
+            }
+            defer { sqlite3_close(hdb) }
+            func hexec(_ sql: String) throws {
+                var err: UnsafeMutablePointer<CChar>?
+                guard sqlite3_exec(hdb, sql, nil, nil, &err) == SQLITE_OK else {
+                    let msg = err.map { String(cString: $0) } ?? "unknown"
+                    sqlite3_free(err)
+                    throw Failure(description: "hermes fixture exec failed: \(msg)")
+                }
+            }
+            try hexec("""
+                CREATE TABLE session_model_usage (
+                    session_id TEXT, model TEXT, billing_provider TEXT, billing_base_url TEXT,
+                    billing_mode TEXT, task TEXT, input_tokens INTEGER, output_tokens INTEGER,
+                    cache_read_tokens INTEGER, cache_write_tokens INTEGER, last_seen REAL);
+                """)
+            try hexec("INSERT INTO session_model_usage VALUES ('s1', 'gpt-6.1-sol', 'p', 'u', 'm', 't', 1000, 100, 0, 0, \(extBase.timeIntervalSince1970 - 3600));")
+            try hexec("INSERT INTO session_model_usage VALUES ('s2', 'glm-5.2', 'p', 'u', 'm', 't', 5000, 500, 0, 0, \(extBase.timeIntervalSince1970 - 3600));")
+            let hStatePath = root.path + "/ext-hermes-state.json"
+            let h1 = ExternalTokenScanner.scan(roots: [], hermesDB: hdbPath,
+                                               statePath: hStatePath, now: extBase)
+            try expect(h1.today.input == 1000 && h1.today.output == 100 && h1.thirty.input == 1000,
+                       "hermes first scan did not backfill OpenAI rows by last_seen (got \(h1.today.input))")
+            try hexec("UPDATE session_model_usage SET input_tokens = 2500, last_seen = \(extBase.timeIntervalSince1970 - 1800) WHERE session_id = 's1'")
+            let h2 = ExternalTokenScanner.scan(roots: [], hermesDB: hdbPath,
+                                               statePath: hStatePath, now: extBase)
+            // 回填 1000（base-3600）+ 差分 1500（base-1800）同属今天 → 2500
+            try expect(h2.today.input == 2500 && h2.today.output == 100,
+                       "hermes cumulative diff did not land in the right day bucket (got \(h2.today.input))")
+            try hexec("UPDATE session_model_usage SET input_tokens = 10 WHERE session_id = 's1'")
+            let h3 = ExternalTokenScanner.scan(roots: [], hermesDB: hdbPath,
+                                               statePath: hStatePath, now: extBase)
+            try expect(h3.today.input == 2500 && h3.today.output == 100,
+                       "hermes counter reset produced negative or inflated usage")
+            try hexec("DELETE FROM session_model_usage WHERE session_id = 's1'")
+            let h4 = ExternalTokenScanner.scan(roots: [], hermesDB: hdbPath,
+                                               statePath: hStatePath, now: extBase)
+            try expect(h4.today.input == 2500 && h4.thirty.input == 2500,
+                       "deleted hermes row changed historical aggregation")
+
             let authPath = root.appendingPathComponent("auth.json").path
             func authDocument(_ access: String, _ refresh: String, _ id: String, _ marker: String) -> [String: Any] {
                 ["auth_mode": "chatgpt", "marker": marker,
@@ -1603,7 +2134,7 @@ enum CodexOfflineRegression {
                 .filter { $0.hasSuffix(".tmp") }
             try expect(tempFiles.isEmpty, "failed write left a temporary credential file")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, refresh gate/schedule, temp auth merge/permissions/failure)")
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, external usage model/parse/scan/hermes-diff, refresh gate/schedule, temp auth merge/permissions/failure)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
@@ -1625,6 +2156,7 @@ func onceMode() {
     var cardsVar: [ResetCard]?
     var cardsErrVar: String?
     var tiboVar: TiboFetchOutcome?
+    var extVar: ExternalTokenScanner.Result?
     group.enter()
     Fetcher.fetchQuota { r in
         onceLock.lock(); quotaVar = r; onceLock.unlock()
@@ -1634,6 +2166,12 @@ func onceMode() {
     DispatchQueue.global(qos: .userInitiated).async {
         let result = TokenScanner.scan()
         onceLock.lock(); scanVar = result; onceLock.unlock()
+        group.leave()
+    }
+    group.enter()
+    DispatchQueue.global(qos: .userInitiated).async {
+        let result = ExternalTokenScanner.scan()
+        onceLock.lock(); extVar = result; onceLock.unlock()
         group.leave()
     }
     group.enter()
@@ -1652,6 +2190,7 @@ func onceMode() {
     let scan = scanVar
     let cards = cardsVar
     let cardsErr = cardsErrVar
+    let ext = extVar
     onceLock.unlock()
 
     if let q = quota {
@@ -1704,6 +2243,19 @@ func onceMode() {
         if let e = s.error { print("tokens error: \(e)") }
     } else {
         print("tokens: no result (timeout)")
+    }
+
+    // 外部用量（OpenAI 模型 · 非 Codex CLI）：纯本地扫描，只打印、不计入退出码
+    if let e = ext {
+        func t(_ x: ExternalTokenScanner.Stats) -> String {
+            "total=\(Fmt.tokensAbbr(x.total)) input=\(Fmt.tokensAbbr(x.input))"
+                + " output=\(Fmt.tokensAbbr(x.output))"
+        }
+        print("external today: \(t(e.today))")
+        print("external 7d:    \(t(e.seven))")
+        print("external 30d:   \(t(e.thirty))")
+    } else {
+        print("external: no result (timeout)")
     }
 
     let ok = quota != nil && quota?.error == nil
