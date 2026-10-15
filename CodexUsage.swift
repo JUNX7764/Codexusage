@@ -143,7 +143,7 @@ enum TiboFreshness {
 // 架构与同机 GlmUsage 完全同构（单文件 / 纯 Foundation + AppKit / 无外部依赖）。
 // 数据源：
 //   额度  GET https://chatgpt.com/backend-api/wham/usage（每 60s，Bearer 凭证来自 ~/.codex/auth.json）
-//   充值卡 GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits（每 5 分钟，认证头同款）
+//   重置卡 GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits（每 5 分钟，认证头同款）
 //   Tibo 重置动态 GET https://aihot.news/api/v1/codex-resets/recent（每 5 分钟，AIHOT 公开接口，匿名只读不经凭据）
 //   token 统计：本地增量扫描 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl（每 5 分钟）
 //   外部用量：Codex CLI 之外消费 OpenAI 系模型（gpt* 等）的 token——本地增量扫描
@@ -259,7 +259,7 @@ struct QuotaData {
     var error: String?
 }
 
-/// 充值卡（官方名：额度重置卡）明细端点返回的一张有效卡
+/// 重置卡（官方名：额度重置卡）明细端点返回的一张有效卡
 struct ResetCard {
     var expires: Date    // 过期时间（expires_at）
     var name: String     // 展示名：title 含 "Full reset" → "全额重置卡"，否则用原文
@@ -324,7 +324,7 @@ enum QuotaMerge {
 // reset_at 兼容 epoch 秒 / epoch 毫秒（>10^10）/ ISO8601 字符串 / 缺失（用 reset_after_seconds 兜底）。
 // 401 时才尝试刷新（距上次刷新尝试 >5 分钟，防刷新风暴）：POST auth.openai.com/oauth/token，
 // 成功后原子写回 auth.json 并用新凭证重试一次额度请求。
-// 充值卡明细另走 GET wham/rate-limit-reset-credits（认证头完全同款；401 不做兜底刷新，
+// 重置卡明细另走 GET wham/rate-limit-reset-credits（认证头完全同款；401 不做兜底刷新，
 // 避免新增写 auth.json 的路径，失败由调用方降级展示）。
 
 enum Fetcher {
@@ -384,7 +384,7 @@ enum Fetcher {
         return e
     }
 
-    /// 认证 GET（额度与充值卡明细共用，header 与 wham/usage 完全同款）
+    /// 认证 GET（额度与重置卡明细共用，header 与 wham/usage 完全同款）
     private static func requestUsage(_ urlStr: String, token: String,
                                      completion: @escaping ([String: Any]?, Int?, String?) -> Void) {
         guard let url = URL(string: urlStr) else {
@@ -526,7 +526,7 @@ enum Fetcher {
         return after > 0 ? now.addingTimeInterval(after) : nil
     }
 
-    /// 充值卡（额度重置卡）明细：GET wham/rate-limit-reset-credits（认证头与 wham/usage 同款）。
+    /// 重置卡（额度重置卡）明细：GET wham/rate-limit-reset-credits（认证头与 wham/usage 同款）。
     /// 401 不做兜底刷新（避免新增写 auth.json 的路径），失败由调用方降级展示。
     static func fetchResetCards(completion: @escaping ([ResetCard]?, String?) -> Void) {
         guard let auth = CodexAuth.load() else {
@@ -604,7 +604,7 @@ enum Fetcher {
         }.resume()
     }
 
-    /// 解析（严格性对齐充值卡）：events 容器缺失/类型错 → 整体失败；单条缺 title/status
+    /// 解析（严格性对齐重置卡）：events 容器缺失/类型错 → 整体失败；单条缺 title/status
     /// → 跳过该条（新闻展示，单条脏数据不值得毁掉整个区块）。checkedAt 是 AIHOT 的
     /// 核验水位（非请求时间），仅进 status.json；posts 最新在前，取首条原帖做点击链接。
     static func parseTiboResets(_ obj: [String: Any]) -> (events: [TiboEvent]?, checkedAt: Date?, error: String?) {
@@ -1201,7 +1201,7 @@ enum Fmt {
         f.dateFormat = "MM-dd"
         return f.string(from: d)
     }
-    /// 充值卡到期提示（本地时区）：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期
+    /// 重置卡到期提示（本地时区）：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期
     static func expires(_ d: Date) -> String {
         let f = DateFormatter()
         f.locale = Locale(identifier: "zh_CN")
@@ -1301,7 +1301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timer?.tolerance = 6
     }
 
-    // 拉取数据：额度走网络（回调内含 401 兜底刷新），token 扫描与充值卡明细走每 5 分钟周期
+    // 拉取数据：额度走网络（回调内含 401 兜底刷新），token 扫描与重置卡明细走每 5 分钟周期
     private func refresh(tokens: Bool, manual: Bool = false) {
         guard refreshGate.begin(manual: manual) else { return }
         performRefresh(tokens: tokens || manual)
@@ -1332,7 +1332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     group.leave()
                 }
             }
-            // 充值卡（额度重置卡）：与 token 统计同周期；失败不触发额度 ⚠ 过期标注
+            // 重置卡（额度重置卡）：与 token 统计同周期；失败不触发额度 ⚠ 过期标注
             group.enter()
             Fetcher.fetchResetCards { [weak self] cards, err in
                 DispatchQueue.main.async {
@@ -1399,7 +1399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
-    // 充值卡：成功则更新并清错误；瞬时失败保留上次数据、仅记录错误
+    // 重置卡：成功则更新并清错误；瞬时失败保留上次数据、仅记录错误
     // （有旧数据时菜单仍展示未过期的旧卡；卡数据状态与额度窗口互相独立）
     private func applyResetCards(_ cards: [ResetCard]?, _ err: String?) {
         let r = CodexFreshness.apply(fresh: cards, failure: err,
@@ -1465,7 +1465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + " · 7D成功 \(sevenDayLastOK.map { Fmt.time($0) } ?? "--")"
             + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
             + " · 外部最后成功 \(extLastOK.map { Fmt.time($0) } ?? "--")"
-            + " · 充值卡最后成功 \(resetCardsLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · 重置卡最后成功 \(resetCardsLastOK.map { Fmt.time($0) } ?? "--")"
             + " · Tibo 最后成功 \(tiboLastOK.map { Fmt.time($0) } ?? "--")"
         writeStatus(line1: line1, line2: line2)
     }
@@ -1549,7 +1549,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info(windowLine("5 小时窗口", usage.fiveHour, isFive: true)))
         menu.addItem(info(windowLine("7 天窗口", usage.sevenDay, isFive: false)))
 
-        // 充值卡（额度重置卡）：独立成区两侧加横条（沿用原"重置卡：×N"的分区）；
+        // 重置卡（额度重置卡）：独立成区两侧加横条（沿用原"重置卡：×N"的分区）；
         // 有效卡按过期时间升序，≤72 小时临期加 ⚠️ 前缀（展示格式与 GlmUsage 逐行对齐）
         func cardLine(_ name: String, _ d: Date) -> String {
             let warn = d.timeIntervalSinceNow <= 72 * 3600
@@ -1559,25 +1559,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let storedCards = usage.resetCards {
             let cards = CodexFreshness.availableCards(storedCards, now: Date())
             if cards.isEmpty {
-                cardLines = ["充值卡（额度重置）：暂无可用"]
+                cardLines = ["重置卡：暂无可用"]
             } else {
-                cardLines = ["充值卡（额度重置）：×\(cards.count)"]
+                cardLines = ["重置卡：×\(cards.count)"]
                 cardLines += cards.map { cardLine($0.name, $0.expires) }
             }
         } else if let e = usage.resetCardsError {
             // 明细失败：wham/usage 的 available_count > 0 时兜底显示数量，否则整区报错
             if let n = usage.resetCredits, n > 0 {
-                cardLines = ["充值卡（额度重置）：×\(n)（明细获取失败）"]
+                cardLines = ["重置卡：×\(n)（明细获取失败）"]
             } else {
                 let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
-                cardLines = ["充值卡获取失败：\(short)（Codex 登录态可能过期，运行 codex login 后重试）"]
+                cardLines = ["重置卡获取失败：\(short)（Codex 登录态可能过期，运行 codex login 后重试）"]
             }
         }
         if resetCardsStale {
-            cardLines.append("⚠️ 充值卡数据已过期 · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")")
+            cardLines.append("⚠️ 重置卡数据已过期 · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")")
         }
         if let e = usage.resetCardsError, usage.resetCards != nil {
-            cardLines.append("充值卡刷新失败：\(e) · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")")
+            cardLines.append("重置卡刷新失败：\(e) · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")")
         }
         if !cardLines.isEmpty {
             menu.addItem(.separator())
@@ -2222,7 +2222,7 @@ func onceMode() {
         print("quota: no result (timeout)")
     }
 
-    // 充值卡（额度重置卡）：每张有效卡的过期时间（本地时区）
+    // 重置卡（额度重置卡）：每张有效卡的过期时间（本地时区）
     if let cs = cards {
         print("reset cards: \(cs.count) valid")
         for c in cs { print("  \(c.name) · \(Fmt.expires(c.expires)) 过期") }

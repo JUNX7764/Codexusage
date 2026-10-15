@@ -103,7 +103,7 @@ body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_to
 
 （100 − used_percent，四舍五入取整。）
 
-**数据新鲜度标注（v1 内置，重要）**：5H、7D、token 统计、充值卡分别记录**最后成功时间**。每个项目失败时保留旧值、保留原成功时间，并显示当前错误；5H/7D 超过 10 分钟、tokens 超过 30 分钟、充值卡超过 15 分钟未成功即标 ⚠。菜单栏 5H/7D 行分别标注各自状态。菜单“最近尝试刷新”显示请求开始时间，状态文件使用同一口径的 `lastAttemptAt`。
+**数据新鲜度标注（v1 内置，重要）**：5H、7D、token 统计、重置卡分别记录**最后成功时间**。每个项目失败时保留旧值、保留原成功时间，并显示当前错误；5H/7D 超过 10 分钟、tokens 超过 30 分钟、重置卡超过 15 分钟未成功即标 ⚠。菜单栏 5H/7D 行分别标注各自状态。菜单“最近尝试刷新”显示请求开始时间，状态文件使用同一口径的 `lastAttemptAt`。
 
 **下拉菜单**（自上而下）：
 
@@ -128,7 +128,7 @@ Token 今天 12.3 万 · 7 天 87 万 · 30 天 210 万   // 格式化见 Fmt
 
 **status.json 自诊断**：`~/Library/Application Support/CodexUsage/status.json`，字段：line1/line2/planType/五小时剩余/7天剩余/重置时间/quotaLastSuccess/tokensLastSuccess/quotaError/tokensError/updatedAt。**同样严禁写入 token 值。**
 
-## 4.5 充值卡（额度重置卡）展示 —— v1.1 增补，对齐 GlmUsage
+## 4.5 重置卡（额度重置卡）展示 —— v1.1 增补，对齐 GlmUsage
 
 GlmUsage（"充值卡监测"分支，已部署）已有同款功能，展示格式必须逐行对齐。完整参考实现：`/tmp/glm_resetcard.swift`（若不存在：`cd /Users/Chester/Documents/Zcode/Glmusage && git show '充值卡监测:GlmUsage.swift' > /tmp/glm_resetcard.swift` 自行提取，**只读，不要切分支**）。
 
@@ -159,20 +159,20 @@ Headers: 与 §1 的 wham/usage 完全相同（Bearer access_token + OpenAI-Beta
 ### 展示格式（对齐 GlmUsage rebuildMenu，替换现有"重置卡：×N"单行）
 
 ```
-充值卡（额度重置）：×3                          // 汇总行；位置在 7 天窗口行之后、Token 区之前
+重置卡（额度重置）：×3                          // 汇总行；位置在 7 天窗口行之后、Token 区之前
   ⚠️ 全额重置卡 · 2026-10-04 13:13 过期        // ≤72 小时临期 → "⚠️ " 前缀；非临期 → 两空格缩进
   全额重置卡 · 2026-10-04 13:13 过期
 ```
 
-- 空列表 → `充值卡（额度重置）：暂无可用`
+- 空列表 → `重置卡（额度重置）：暂无可用`
 - 缺少列表容器、列表类型错误或卡记录字段损坏均算明细失败，保留旧卡和原成功时间；仅合法空数组表示暂无可用卡。
-- 明细端点失败但 wham/usage 的 available_count > 0 → `充值卡（额度重置）：×N（明细获取失败）`
-- 两者都失败 → `充值卡获取失败：<截断60字>`（GlmUsage 同款句式；提示语用 Codex 语境，不要提 ZCode）
+- 明细端点失败但 wham/usage 的 available_count > 0 → `重置卡（额度重置）：×N（明细获取失败）`
+- 两者都失败 → `重置卡获取失败：<截断60字>`（GlmUsage 同款句式；提示语用 Codex 语境，不要提 ZCode）
 - 时间格式照搬 GlmUsage 的 `Fmt.expires`：今天 → `今天 HH:mm`；明天 → `明天 HH:mm`；否则 `yyyy-MM-dd HH:mm`（本地时区）。
 
 ### 行为细节
 
-- 刷新周期：额度 60 秒；token 统计与充值卡每 5 分钟（tokenEveryCycles）；定时器容差 6 秒。单轮刷新只允许一份；定时器重叠直接合并丢弃，刷新中的重复手动请求合并为最多一轮后续完整刷新。瞬时失败保留上次数据；充值卡失败**不触发**额度 ⚠ 过期标注。
+- 刷新周期：额度 60 秒；token 统计与重置卡每 5 分钟（tokenEveryCycles）；定时器容差 6 秒。单轮刷新只允许一份；定时器重叠直接合并丢弃，刷新中的重复手动请求合并为最多一轮后续完整刷新。瞬时失败保留上次数据；重置卡失败**不触发**额度 ⚠ 过期标注。
 - status.json 增加 `resetCards` 字段：`["2026-10-04T05:13:13Z", …]`（各卡过期 ISO，无敏感信息）。
 - `--once` 打印每张有效卡的过期时间（本地时区）。
 - 套餐到期行：GlmUsage 有（subscription/list 接口），OpenAI 侧无对应公开接口，**v1.1 不做**，菜单已有的 plus 套餐展示保持。
@@ -205,13 +205,13 @@ GET https://aihot.news/api/v1/codex-resets/recent   // 最近 7 北京日事件 
 ### 展示与行为
 
 ```
-Tibo 重置动态                            // 区块头；位置在充值卡区之后、Token 区之前
+Tibo 重置动态                            // 区块头；位置在重置卡区之后、Token 区之前
 预估 北京时间 9月29日 03:00–9月30日 03:00   // 预告行 = 预估窗口文案（无预估时回退事件标题）；可点击跳最新原帖
 ✅ 09-27 Codex 额度重置已完成            // 已确认只展示最近一条
 ```
 
-- 刷新周期与充值卡同（每 5 分钟，`tokenEveryCycles`）；轮询带 `If-None-Match`（接口要求同端点 ≥60s，5 分钟满足）。请求绕开 URLCache（`reloadIgnoringLocalCacheData`），ETag 语义自管。
-- 失败三档降级同充值卡：有旧数据 → 旧行照显 +「Tibo 刷新失败」行；从未成功 → 「Tibo 重置动态获取失败：<截断60字>」；30 分钟未成功标 ⚠️ 过期。失败不影响额度/token 区块。
+- 刷新周期与重置卡同（每 5 分钟，`tokenEveryCycles`）；轮询带 `If-None-Match`（接口要求同端点 ≥60s，5 分钟满足）。请求绕开 URLCache（`reloadIgnoringLocalCacheData`），ETag 语义自管。
+- 失败三档降级同重置卡：有旧数据 → 旧行照显 +「Tibo 刷新失败」行；从未成功 → 「Tibo 重置动态获取失败：<截断60字>」；30 分钟未成功标 ⚠️ 过期。失败不影响额度/token 区块。
 - status.json 增加 `tiboLines`/`tiboCheckedAt`/`tiboLastSuccess`/`tiboStale`/`tiboError`；`--once` 打印 Tibo 摘要（第三方资讯源，不计入退出码）。
 - `--self-test` 增加解析严格性、展示行（窗口已过/未过、已确认、空列表占位）与三态合并用例；不访问网络。
 
