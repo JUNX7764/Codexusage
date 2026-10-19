@@ -1269,8 +1269,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var usage = UsageData()
     private var cycle = 0
     private let refreshGate = RefreshGate()
-    // token 扫描每 N 个刷新周期做一次（额度仍每 60s 刷新）
-    private let tokenEveryCycles = 5
+    // token 扫描每 N 个刷新周期做一次（主循环 30s × 10 = 5 分钟；额度每轮都刷）
+    private let tokenEveryCycles = 10
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
     // （与 GlmUsage 的静默保留旧数据不同，这是刻意改进：过期数据必须可见）
     private let quotaStaleAfter: TimeInterval = 600
@@ -1292,7 +1292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
         renderBar()
         refresh(tokens: true, manual: true)
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.cycle += 1
             self.refresh(tokens: CodexRefreshSchedule.slowItemsDue(cycle: self.cycle,
@@ -1703,6 +1703,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? FileManager.default.removeItem(atPath: launchAgentPath)
         } else {
             let exec = Bundle.main.executablePath ?? ""
+            // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
             let plist = """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1712,7 +1713,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 <key>ProgramArguments</key>
                 <array><string>\(exec)</string></array>
                 <key>RunAtLoad</key><true/>
-                <key>KeepAlive</key><true/>
+                <key>KeepAlive</key>
+                <dict><key>SuccessfulExit</key><false/></dict>
             </dict>
             </plist>
             """
