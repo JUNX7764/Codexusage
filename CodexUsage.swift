@@ -934,8 +934,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var usage = UsageData()
     private var cycle = 0
     private let refreshGate = RefreshGate()
-    // token 扫描每 N 个刷新周期做一次（额度仍每 60s 刷新）
-    private let tokenEveryCycles = 5
+    // token 扫描每 N 个刷新周期做一次（主循环 30s × 10 = 5 分钟；额度每轮都刷）
+    private let tokenEveryCycles = 10
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
     // （与 GlmUsage 的静默保留旧数据不同，这是刻意改进：过期数据必须可见）
     private let quotaStaleAfter: TimeInterval = 600
@@ -956,7 +956,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
         renderBar()
         refresh(tokens: true, manual: true)
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.cycle += 1
             self.refresh(tokens: CodexRefreshSchedule.slowItemsDue(cycle: self.cycle,
