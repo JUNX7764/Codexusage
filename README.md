@@ -1,6 +1,6 @@
 # CodexUsage — Codex 订阅余量菜单栏小工具
 
-macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT Plus）订阅的 5 小时 / 7 天额度余量。原生 Swift 单文件实现，纯本地运行。
+macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时 / 7 天额度余量。原生 Swift 单文件实现，纯本地运行。
 
 与 [KimiUsage](https://github.com/JUNX7764/kimi-usage-menubar)、[GlmUsage](https://github.com/JUNX7764/Glmusage) 是同族三件套，分别盯 Kimi / GLM / Codex 的订阅余量。
 
