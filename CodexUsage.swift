@@ -1320,6 +1320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? FileManager.default.removeItem(atPath: launchAgentPath)
         } else {
             let exec = Bundle.main.executablePath ?? ""
+            // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
             let plist = """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1329,7 +1330,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 <key>ProgramArguments</key>
                 <array><string>\(exec)</string></array>
                 <key>RunAtLoad</key><true/>
-                <key>KeepAlive</key><true/>
+                <key>KeepAlive</key>
+                <dict><key>SuccessfulExit</key><false/></dict>
             </dict>
             </plist>
             """
