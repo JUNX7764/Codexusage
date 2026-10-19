@@ -664,12 +664,15 @@ enum TiboDisplay {
 
 // MARK: - 本地会话 token 统计（增量扫描 ~/.codex/sessions）
 //
-// 扫描 sessions/YYYY/MM/DD/rollout-*.jsonl，仅近 30 天的会话文件。
+// 扫描 sessions/YYYY/MM/DD/rollout-*.jsonl，仅近 30 天的会话文件；codex 会把超过
+// 保留期的会话就地压缩成 rollout-*.jsonl.zst（2026-10 实测 7 天前的文件全是 .zst），
+// 两种后缀都计入，.zst 经 zstd 解压后走同一条字节反查路径。
 // 每个文件取最后一条 type=="event_msg" 且 payload.type=="token_count" 事件的
 // payload.info.total_token_usage（会话累计值）：input_tokens / output_tokens / total_tokens。
 // 会话日期 = 文件名前缀 rollout-YYYY-MM-DDTHH-MM-SS-（本地时区）。
 // 增量策略：scan-state.json 记录每文件 {size, mtime, 当日聚合}；未变化文件只做一次 stat
-// 沿用上次结果，变化的文件重读（只取最后一条，字节级反查避免逐行 JSON 解析），
+// 沿用上次结果，变化的文件重读（只取最后一条，字节级反查避免逐行 JSON 解析；
+// .zst 以压缩后 size/mtime 为准，明文被压缩归档时视同删除+新增，自动迁移），
 // 已删除文件从索引剔除；31 天前的旧条目清理，保证状态文件不随历史无限增长。
 
 enum TokenScanner {
@@ -696,7 +699,7 @@ enum TokenScanner {
     }
 
     static let sessionsRoot = NSHomeDirectory() + "/.codex/sessions"
-    static let statePath = NSHomeDirectory()
+    static let defaultStatePath = NSHomeDirectory()
         + "/Library/Application Support/CodexUsage/scan-state.json"
     private static let lock = NSLock()
     private static var cache: State?
@@ -707,10 +710,11 @@ enum TokenScanner {
         return f
     }()
 
-    static func scan() -> Result {
+    static func scan(root: String = sessionsRoot,
+                     statePath: String = defaultStatePath,
+                     now: Date = Date()) -> Result {
         lock.lock(); defer { lock.unlock() }
-        var st = loadState()
-        let now = Date()
+        var st = loadState(at: statePath)
         let todayKey = dayFmt.string(from: now)
         let cutoff7 = dayFmt.string(from: now.addingTimeInterval(-7 * 86400))
         let cutoff30 = dayFmt.string(from: now.addingTimeInterval(-30 * 86400))
@@ -719,13 +723,14 @@ enum TokenScanner {
         var seen = Set<String>()
         var enumed = false
         if let enumm = FileManager.default.enumerator(
-            at: URL(fileURLWithPath: sessionsRoot),
+            at: URL(fileURLWithPath: root),
             includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
             options: [.skipsHiddenFiles]) {
             enumed = true
             for case let url as URL in enumm {
                 let name = url.lastPathComponent
-                guard name.hasPrefix("rollout-"), name.hasSuffix(".jsonl") else { continue }
+                guard name.hasPrefix("rollout-"),
+                      name.hasSuffix(".jsonl") || name.hasSuffix(".jsonl.zst") else { continue }
                 let path = url.path
                 seen.insert(path)
                 guard let day = dayFromFilename(name), day >= cutoff30 else { continue }
@@ -733,9 +738,12 @@ enum TokenScanner {
                         forKeys: [.fileSizeKey, .contentModificationDateKey]),
                       let size = vals.fileSize else { continue }
                 let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
-                // 文件未变化：沿用上次结果（绝大多数文件走这里）
+                // 文件未变化：沿用上次结果（绝大多数文件走这里；.zst 以压缩档的
+                // size/mtime 为准，稳定不变）
                 if let e = st.files[path], e.size == Int64(size), e.mtime == mtime { continue }
-                guard let data = FileManager.default.contents(atPath: path) else { continue }
+                guard let data = name.hasSuffix(".zst")
+                    ? zstdDecompress(path: path)
+                    : FileManager.default.contents(atPath: path) else { continue }
                 let u = lastTokenUsage(in: data) ?? (0.0, 0.0, 0.0)
                 st.files[path] = FileEntry(size: Int64(size), mtime: mtime, day: day,
                                            input: u.0, output: u.1, total: u.2)
@@ -750,10 +758,10 @@ enum TokenScanner {
                 st.files.removeValue(forKey: path)     // 31 天前旧条目：不再可能贡献窗口
             }
         }
-        cache = st
-        saveState(st)
+        if statePath == defaultStatePath { cache = st }
+        saveState(st, to: statePath)
 
-        guard enumed else { return Result(error: "无法枚举 \(sessionsRoot)") }
+        guard enumed else { return Result(error: "无法枚举 \(root)") }
         var r = Result()
         for e in st.files.values {
             if e.day == todayKey { add(&r.today, e) }
@@ -774,6 +782,32 @@ enum TokenScanner {
     private static func add(_ s: inout Stats, _ e: FileEntry) {
         guard e.total > 0 else { return }   // 无 token_count 记录的空会话不计文件数（数值本就为 0）
         s.input += e.input; s.output += e.output; s.total += e.total; s.files += 1
+    }
+
+    /// zstd 探测：GUI/LaunchAgent 进程不继承 shell PATH，按常见安装位置取绝对路径。
+    /// 找不到时 .zst 文件本轮不计入——不写状态条目，装好 zstd 后下轮扫描自动补齐。
+    static let zstdBin: String? = {
+        for p in ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd",
+                  "/opt/local/bin/zstd", "/usr/bin/zstd"]
+        where FileManager.default.isExecutableFile(atPath: p) { return p }
+        return nil
+    }()
+
+    /// 解压 .jsonl.zst 全量到内存（压缩档数百 KB、解压后 MB 级），复用 lastTokenUsage
+    /// 的字节反查；任何失败返回 nil，按「本文件本轮无法读取」处理。
+    private static func zstdDecompress(path: String) -> Data? {
+        guard let bin = zstdBin else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = ["-dc", "--", path]
+        p.standardError = FileHandle.nullDevice
+        let out = Pipe()
+        p.standardOutput = out
+        do { try p.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0, !data.isEmpty else { return nil }
+        return data
     }
 
     /// 取文件中最后一条 token_count 的 total_token_usage。
@@ -807,24 +841,21 @@ enum TokenScanner {
         return nil
     }
 
-    private static func loadState() -> State {
-        if let s = cache { return s }
-        if let data = FileManager.default.contents(atPath: statePath),
+    private static func loadState(at path: String) -> State {
+        if path == defaultStatePath, let s = cache { return s }
+        if let data = FileManager.default.contents(atPath: path),
            let s = try? JSONDecoder().decode(State.self, from: data) {
-            cache = s
             return s
         }
-        let s = State()
-        cache = s
-        return s
+        return State()
     }
 
-    private static func saveState(_ s: State) {
+    private static func saveState(_ s: State, to path: String) {
         guard let data = try? JSONEncoder().encode(s) else { return }
         try? FileManager.default.createDirectory(
-            atPath: (statePath as NSString).deletingLastPathComponent,
+            atPath: (path as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true)
-        try? data.write(to: URL(fileURLWithPath: statePath), options: [.atomic])
+        try? data.write(to: URL(fileURLWithPath: path), options: [.atomic])
     }
 }
 
@@ -1987,7 +2018,67 @@ enum CodexOfflineRegression {
             try expect(fs.days.count == 1 && fs.days[extDayKey] == [370, 70],
                        "external parse did not aggregate OpenAI usage only (got \(fs.days))")
 
-            // 增量扫描端到端（临时 roots + 临时状态文件，不碰真实 ~/.proma / ~/.claude）：
+            // 本地会话统计端到端（临时 sessions 根 + 临时状态文件，不碰真实 ~/.codex）：
+            // 窗口分桶 + codex 压缩归档 .jsonl.zst 必须计入 30 天窗口（2026-10 实况：
+            // 7 天外的会话全是 .zst，漏掉它们 30 天=7 天）；环境无 zstd 时降级为明文
+            // 文件仅覆盖窗口逻辑，并打印提示
+            let sesRoot = root.path + "/codex-sessions"
+            let sesState = root.path + "/ses-scan-state.json"
+            func sesStamp(_ d: Date) -> String {
+                let f = DateFormatter()
+                f.locale = Locale(identifier: "en_US_POSIX")
+                f.dateFormat = "yyyy-MM-dd'T'HH-mm-ss"
+                return f.string(from: d)
+            }
+            func sesDayDir(_ d: Date) -> String {
+                let f = DateFormatter()
+                f.locale = Locale(identifier: "en_US_POSIX")
+                f.dateFormat = "yyyy/MM/dd"
+                return f.string(from: d)
+            }
+            func sesUsage(_ input: Int) -> String {
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":"
+                    + "{\"total_token_usage\":{\"input_tokens\":\(input),\"output_tokens\":1,"
+                    + "\"total_tokens\":\(input + 1)}}}}\n"
+            }
+            func zstdCompress(src: String, dst: String) -> Bool {
+                guard let bin = TokenScanner.zstdBin else { return false }
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: bin)
+                p.arguments = ["-q", "-f", "-o", dst, "--", src]
+                p.standardError = FileHandle.nullDevice
+                do { try p.run(); p.waitUntilExit() } catch { return false }
+                return p.terminationStatus == 0
+            }
+            let sesOld = now.addingTimeInterval(-10 * 86400)   // 30 天内、7 天外
+            let sesNew = now.addingTimeInterval(-2 * 86400)    // 7 天内
+            for d in [sesOld, sesNew] {
+                try FileManager.default.createDirectory(
+                    atPath: sesRoot + "/" + sesDayDir(d), withIntermediateDirectories: true)
+            }
+            try sesUsage(499).write(toFile: sesRoot + "/" + sesDayDir(sesNew)
+                + "/rollout-\(sesStamp(sesNew))-aaaa.jsonl", atomically: true, encoding: .utf8)
+            let oldPlain = root.path + "/old-session.jsonl"
+            try sesUsage(2999).write(toFile: oldPlain, atomically: true, encoding: .utf8)
+            let zstOK = zstdCompress(src: oldPlain,
+                                     dst: sesRoot + "/" + sesDayDir(sesOld)
+                                         + "/rollout-\(sesStamp(sesOld))-bbbb.jsonl.zst")
+            if !zstOK {
+                print("CodexUsage --self-test: note: zstd not found, .zst path covered by plain file")
+                try sesUsage(2999).write(toFile: sesRoot + "/" + sesDayDir(sesOld)
+                    + "/rollout-\(sesStamp(sesOld))-bbbb.jsonl", atomically: true, encoding: .utf8)
+            }
+            let t1 = TokenScanner.scan(root: sesRoot, statePath: sesState, now: now)
+            try expect(t1.seven.total == 500 && t1.seven.files == 1,
+                       "tokens 7d window wrong (got \(t1.seven.total)/\(t1.seven.files))")
+            try expect(t1.thirty.total == 3500 && t1.thirty.files == 2,
+                       "tokens 30d window wrong — .zst archived sessions missed "
+                       + "(got \(t1.thirty.total)/\(t1.thirty.files))")
+            let t2 = TokenScanner.scan(root: sesRoot, statePath: sesState, now: now)
+            try expect(t2.thirty.total == 3500 && t2.thirty.files == 2,
+                       "tokens incremental rescan double-counted or dropped entries")
+
+            // 外部用量增量扫描端到端（临时 roots + 临时状态文件，不碰真实 ~/.proma / ~/.claude）：
             // 窗口分桶、嵌套枚举、首见旧文件跳过、追加增量、删除剔除、截断重扫
             let extRootA = root.path + "/proma-a"
             let extRootB = root.path + "/claude-b"
@@ -2148,7 +2239,7 @@ enum CodexOfflineRegression {
                 .filter { $0.hasSuffix(".tmp") }
             try expect(tempFiles.isEmpty, "failed write left a temporary credential file")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, external usage model/parse/scan/hermes-diff, refresh gate/schedule, temp auth merge/permissions/failure)")
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives, external usage model/parse/scan/hermes-diff, refresh gate/schedule, temp auth merge/permissions/failure)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
