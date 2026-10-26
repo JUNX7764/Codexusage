@@ -640,8 +640,9 @@ enum Fetcher {
 // MARK: - Tibo 重置动态菜单区块（AIHOT codex-resets）
 
 enum TiboDisplay {
-    /// 区块行（纯函数，离线回归覆盖）：预告中（announced）全部在前，按预估窗口开始时间
-    /// 倒序（缺窗口回退 occurredAt；不能按 occurredAt 排——AIHOT 编辑旧预告会刷新
+    /// 区块行（纯函数，离线回归覆盖）：预告中（announced）按预估窗口开始时间倒序最多
+    /// 展示 3 条（AIHOT 确认只发新事件不翻旧状态，旧预告会永久滞留，无上限会把区块
+    /// 越撑越长；缺窗口回退 occurredAt；不能按 occurredAt 排——AIHOT 编辑旧预告会刷新
     /// updatedAt，被编辑过的旧窗口会越到新窗口前面）——有预估窗口就只显示
     /// 「预估 <窗口文案>」（无预估时回退事件标题）；预估窗口已过但未确认 → 追加
     /// 「（窗口已过，待确认）」（schedule 不随时间自动完成）；已确认（confirmed）只展示
@@ -649,7 +650,7 @@ enum TiboDisplay {
     static func rows(_ events: [TiboEvent], now: Date) -> [(text: String, link: String)] {
         guard !events.isEmpty else { return [("暂无重置动态", "")] }
         var out: [(text: String, link: String)] = []
-        for e in events.filter({ $0.status == "announced" }).sorted(by: windowDesc) {
+        for e in events.filter({ $0.status == "announced" }).sorted(by: windowDesc).prefix(3) {
             var s = e.estimateLabel.map { "预估 \($0)" } ?? e.title
             if let through = e.estimateThrough, through < now { s += "（窗口已过，待确认）" }
             out.append((text: s, link: e.link))
@@ -1915,6 +1916,10 @@ enum CodexOfflineRegression {
                      "estimate": ["label": "北京时间 9月28日 03:00–9月29日 23:00",
                                   "from": "2026-09-28T03:00:00.000+08:00",
                                   "through": "2026-09-29T23:00:00.000+08:00"],
+                     "posts": [], "url": "https://aihot.news/codex-reset"],
+                    // 第 4 条预告：超出 3 条上限，记录时间也最早，展示时必须被截断
+                    ["id": "t6", "type": "direct_reset", "status": "announced",
+                     "title": "超出上限的预告", "createdAt": "2026-09-19T00:00:00.000+08:00",
                      "posts": [], "url": "https://aihot.news/codex-reset"]
                 ]
             ]
@@ -1922,7 +1927,7 @@ enum CodexOfflineRegression {
             guard let tiboEvents = tiboParsed.events else {
                 throw Failure(description: "valid tibo payload failed: \(tiboParsed.error ?? "unknown")")
             }
-            try expect(tiboEvents.count == 4, "malformed tibo event was not skipped")
+            try expect(tiboEvents.count == 5, "malformed tibo event was not skipped")
             try expect(tiboEvents[0].estimateLabel?.contains("9月29日") == true
                        && tiboEvents[0].estimateFrom != nil
                        && tiboEvents[0].estimateThrough != nil,
@@ -1944,8 +1949,8 @@ enum CodexOfflineRegression {
             try expect(emptyTibo.events?.isEmpty == true && emptyTibo.error == nil,
                        "valid empty tibo event list was rejected")
 
-            // 展示行：预告行只显示「预估 <窗口>」并按窗口开始时间倒序（无预估回退标题，
-            // 不带事件标题）；窗口未过不标「待确认」、已过必须标；已确认取最近一条
+            // 展示行：预告行只显示「预估 <窗口>」并按窗口开始时间倒序、最多 3 条（无预估
+            // 回退标题，不带事件标题）；窗口未过不标「待确认」、已过必须标；已确认取最近一条
             guard let duringWindow = Fmt.isoFrac.date(from: "2026-09-29T12:00:00.000+08:00"),
                   let afterWindow = Fmt.isoFrac.date(from: "2026-10-01T12:00:00.000+08:00") else {
                 throw Failure(description: "tibo display fixture dates failed to parse")
@@ -1964,6 +1969,8 @@ enum CodexOfflineRegression {
                        "pending marker shown while estimate window still open")
             try expect(rowsDuring[3].text.hasPrefix("✅") && rowsDuring[3].text.contains("重置卡已发放"),
                        "confirmed tibo row missing marker or title")
+            try expect(!rowsDuring.contains { $0.text.contains("超出上限的预告") },
+                       "announced rows beyond the 3-item cap were not dropped")
             let rowsAfter = TiboDisplay.rows(tiboEvents, now: afterWindow)
             try expect(rowsAfter[0].text.contains("窗口已过，待确认"),
                        "expired tibo estimate window was not marked pending")
@@ -1974,16 +1981,16 @@ enum CodexOfflineRegression {
             let tiboOldOK = now.addingTimeInterval(-1_000)
             let tiboFreshR = TiboFreshness.apply(outcome: .fresh(tiboEvents, checkedAt: tiboParsed.checkedAt),
                 old: nil, oldCheckedAt: nil, oldLastOK: nil, oldError: nil, now: now)
-            try expect(tiboFreshR.value?.count == 4 && tiboFreshR.lastOK == now && tiboFreshR.error == nil,
+            try expect(tiboFreshR.value?.count == 5 && tiboFreshR.lastOK == now && tiboFreshR.error == nil,
                        "fresh tibo outcome did not advance state")
             let tiboUnchangedR = TiboFreshness.apply(outcome: .unchanged,
                 old: tiboEvents, oldCheckedAt: tiboParsed.checkedAt, oldLastOK: tiboOldOK, oldError: nil, now: now)
-            try expect(tiboUnchangedR.value?.count == 4 && tiboUnchangedR.lastOK == now
+            try expect(tiboUnchangedR.value?.count == 5 && tiboUnchangedR.lastOK == now
                        && tiboUnchangedR.checkedAt == tiboParsed.checkedAt,
                        "304 tibo outcome cleared data or did not advance last-success")
             let tiboFailR = TiboFreshness.apply(outcome: .failure("HTTP 500"),
                 old: tiboEvents, oldCheckedAt: nil, oldLastOK: tiboOldOK, oldError: nil, now: now)
-            try expect(tiboFailR.value?.count == 4 && tiboFailR.lastOK == tiboOldOK && tiboFailR.error == "HTTP 500",
+            try expect(tiboFailR.value?.count == 5 && tiboFailR.lastOK == tiboOldOK && tiboFailR.error == "HTTP 500",
                        "failed tibo outcome cleared old events or advanced last-success")
 
             // 外部用量（OpenAI 模型 · 非 Codex CLI）：甄别谓词（正负例均取自本机外部工具实测模型名）
