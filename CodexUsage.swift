@@ -640,17 +640,17 @@ enum Fetcher {
 // MARK: - Tibo 重置动态菜单区块（AIHOT codex-resets）
 
 enum TiboDisplay {
-    /// 区块行（纯函数，离线回归覆盖）：预告中（announced）按预估窗口开始时间倒序最多
-    /// 展示 3 条（AIHOT 确认只发新事件不翻旧状态，旧预告会永久滞留，无上限会把区块
-    /// 越撑越长；缺窗口回退 occurredAt；不能按 occurredAt 排——AIHOT 编辑旧预告会刷新
-    /// updatedAt，被编辑过的旧窗口会越到新窗口前面）——有预估窗口就只显示
+    /// 区块行（纯函数，离线回归覆盖）：预告中（announced）按预估窗口开始时间倒序只
+    /// 展示最近 1 条（AIHOT 确认只发新事件不翻旧状态，旧预告会永久滞留「待确认」，
+    /// 多条并排只剩噪音；缺窗口回退 occurredAt；不能按 occurredAt 排——AIHOT 编辑旧
+    /// 预告会刷新 updatedAt，被编辑过的旧窗口会越到新窗口前面）——有预估窗口就只显示
     /// 「预估 <窗口文案>」（无预估时回退事件标题）；预估窗口已过但未确认 → 追加
     /// 「（窗口已过，待确认）」（schedule 不随时间自动完成）；已确认（confirmed）只展示
     /// 最近一条。空列表 → 占位行。
     static func rows(_ events: [TiboEvent], now: Date) -> [(text: String, link: String)] {
         guard !events.isEmpty else { return [("暂无重置动态", "")] }
         var out: [(text: String, link: String)] = []
-        for e in events.filter({ $0.status == "announced" }).sorted(by: windowDesc).prefix(3) {
+        for e in events.filter({ $0.status == "announced" }).sorted(by: windowDesc).prefix(1) {
             var s = e.estimateLabel.map { "预估 \($0)" } ?? e.title
             if let through = e.estimateThrough, through < now { s += "（窗口已过，待确认）" }
             out.append((text: s, link: e.link))
@@ -1949,28 +1949,34 @@ enum CodexOfflineRegression {
             try expect(emptyTibo.events?.isEmpty == true && emptyTibo.error == nil,
                        "valid empty tibo event list was rejected")
 
-            // 展示行：预告行只显示「预估 <窗口>」并按窗口开始时间倒序、最多 3 条（无预估
-            // 回退标题，不带事件标题）；窗口未过不标「待确认」、已过必须标；已确认取最近一条
+            // 展示行：预告行只显示「预估 <窗口>」，announced 按窗口开始时间倒序只取
+            // 最近 1 条（无预估回退标题，不带事件标题）；窗口未过不标「待确认」、已过
+            // 必须标；已确认取最近一条
             guard let duringWindow = Fmt.isoFrac.date(from: "2026-09-29T12:00:00.000+08:00"),
                   let afterWindow = Fmt.isoFrac.date(from: "2026-10-01T12:00:00.000+08:00") else {
                 throw Failure(description: "tibo display fixture dates failed to parse")
             }
             let rowsDuring = TiboDisplay.rows(tiboEvents, now: duringWindow)
-            try expect(rowsDuring.count == 4
+            try expect(rowsDuring.count == 2
                        && rowsDuring[0].text == "预估 北京时间 9月29日 03:00–9月30日 03:00",
-                       "announced tibo row with estimate did not render estimate-only text")
+                       "latest-window announced tibo row did not render estimate-only text")
             try expect(!rowsDuring[0].text.contains("Tibo 预告将重置额度"),
                        "announced tibo row still carried the event title")
-            try expect(rowsDuring[1].text == "预估 北京时间 9月28日 03:00–9月29日 23:00",
-                       "announced rows not sorted by estimate window start (t5 before t1)")
-            try expect(rowsDuring[2].text == "预告但未给窗口",
-                       "announced tibo row without estimate did not fall back to title")
             try expect(!rowsDuring[0].text.contains("待确认"),
                        "pending marker shown while estimate window still open")
-            try expect(rowsDuring[3].text.hasPrefix("✅") && rowsDuring[3].text.contains("重置卡已发放"),
+            try expect(rowsDuring[1].text.hasPrefix("✅") && rowsDuring[1].text.contains("重置卡已发放"),
                        "confirmed tibo row missing marker or title")
-            try expect(!rowsDuring.contains { $0.text.contains("超出上限的预告") },
-                       "announced rows beyond the 3-item cap were not dropped")
+            try expect(!rowsDuring.contains { $0.text.contains("9月28日")
+                                               || $0.text.contains("超出上限的预告")
+                                               || $0.text.contains("预告但未给窗口") },
+                       "non-latest announced rows were not dropped to a single row")
+            // 钉排序与回退：数组里 t5 在前也必须取窗口更晚的 t1；单独的无预估预告回退标题
+            let shuffledAnnounced = [tiboEvents[3], tiboEvents[0]]
+            try expect(TiboDisplay.rows(shuffledAnnounced, now: duringWindow)[0].text
+                           == "预估 北京时间 9月29日 03:00–9月30日 03:00",
+                       "announced pick not by latest estimate window")
+            try expect(TiboDisplay.rows([tiboEvents[2]], now: duringWindow)[0].text == "预告但未给窗口",
+                       "announced tibo row without estimate did not fall back to title")
             let rowsAfter = TiboDisplay.rows(tiboEvents, now: afterWindow)
             try expect(rowsAfter[0].text.contains("窗口已过，待确认"),
                        "expired tibo estimate window was not marked pending")
