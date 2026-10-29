@@ -188,7 +188,7 @@ GET https://aihot.news/api/v1/codex-resets/recent   // 最近 7 北京日事件 
 无参数、匿名只读、无需任何凭据；响应带 ETag（W/"v1-codex-resets-recent-…"），cache-control max-age=60
 ```
 
-关键字段（时间戳均为 +08:00 北京时间）：`events[]` 按 `updatedAt` 倒序；`type` = `direct_reset`（额度重置）/`reset_credit`（发重置卡）；`status` = `announced`（预告）/`confirmed`（已确认）；`title` 中文标题可直接展示；`estimate` 可空，`label` 是现成中文预估窗口文案（如 "北京时间 9月29日 03:00–9月30日 03:00"）、`through` 为窗口结束；`confirmedAt` 是确认帖时间**非精确执行时间**；`checkedAt` 是 AIHOT 核验水位（非请求时间）；`posts[]` 最新在前，首条 `url` 为原帖链接。
+关键字段（时间戳均为 +08:00 北京时间）：`events[]` 按 `updatedAt` 倒序；`type` = `direct_reset`（额度重置）/`reset_credit`（发重置卡）；`status` = `announced`（预告）/`confirmed`（已确认）；`presentation.status` = 页面层状态，窗口已过大概率生效为 `likely_completed`（AIHOT 页面即按「已生效」渲染）；`title` 中文标题可直接展示；`estimate` 可空，`label` 是现成中文预估窗口文案（如 "北京时间 9月29日 03:00–9月30日 03:00"）、`through` 为窗口结束；`confirmedAt` 是确认帖时间**非精确执行时间**；`checkedAt` 是 AIHOT 核验水位（非请求时间）；`posts[]` 最新在前，首条 `url` 为原帖链接。注意 `updatedAt` 是 AIHOT 每轮重建时批量刷新的时间戳，不代表事件时间，事件排序不可用。
 
 ### 口径红线（来自接口文档）
 
@@ -207,8 +207,10 @@ GET https://aihot.news/api/v1/codex-resets/recent   // 最近 7 北京日事件 
 ```
 Tibo 重置动态                            // 区块头；位置在重置卡区之后、Token 区之前
 预估 北京时间 9月29日 03:00–9月30日 03:00   // 预告行 = 预估窗口文案（无预估时回退事件标题），只展示窗口最新一条；可点击跳最新原帖
-✅ 09-27 Codex 额度重置已完成            // 已确认只展示最近一条
+✅ 09-27 Codex 额度重置已完成            // 已确认只展示最近一条（按 confirmedAt ?? createdAt）
 ```
+
+- `status` = `announced` 且 `presentation.status` = `likely_completed`（窗口已过、大概率已生效，AIHOT 页面按「已生效」渲染、横幅显示「当前没有等待生效的重置」）的事件不展示预告行，与页面口径一致；窗口已过但尚未标记的短暂窗口期仍追加「（窗口已过，待确认）」。
 
 - 刷新周期与重置卡同（每 5 分钟，`tokenEveryCycles`）；轮询带 `If-None-Match`（接口要求同端点 ≥60s，5 分钟满足）。请求绕开 URLCache（`reloadIgnoringLocalCacheData`），ETag 语义自管。
 - 失败三档降级同重置卡：有旧数据 → 旧行照显 +「Tibo 刷新失败」行；从未成功 → 「Tibo 重置动态获取失败：<截断60字>」；30 分钟未成功标 ⚠️ 过期。失败不影响额度/token 区块。
