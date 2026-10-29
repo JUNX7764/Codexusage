@@ -1306,11 +1306,93 @@ enum Fmt {
     }
 }
 
+// MARK: - 版本与更新检查（build.sh 打包时写 Info.plist 自定义键；不打包分发，就地更新见 scripts/update.sh）
+
+/// 构建指纹：build.sh 打包时写入产物 Info.plist（CUBuildVersion/Commit/SourceDir），运行时读 Bundle。
+/// 仓库模板没有这些键 → 非 build.sh 产物（直接 swiftc 的裸二进制）为 unknown，
+/// 此时更新检查自然禁用、菜单显示「版本 unknown」。不生成第二个 .swift：多文件编译下
+/// 只有 main.swift 允许 top-level 代码，本文件的命令行入口依赖 top-level。
+enum BuildInfo {
+    static let version = (Bundle.main.infoDictionary?["CUBuildVersion"] as? String) ?? "unknown"
+    static let commit = (Bundle.main.infoDictionary?["CUBuildCommit"] as? String) ?? "unknown"
+    static let sourceDir = (Bundle.main.infoDictionary?["CUBuildSourceDir"] as? String) ?? "unknown"
+}
+
+/// 就地更新的纯逻辑：hash 比对与 clone 目录判定（--self-test 覆盖）。
+/// 比对判据是 commit hash 不是版本号——tag 只负责区分「值得提示的版本」，
+/// 未打 tag 的日常构建同样能正确收到更新提示。
+enum UpdateCheck {
+    static let apiURL = URL(string: "https://api.github.com/repos/JUNX7764/Codexusage/commits/main")!
+    static let repoPage = URL(string: "https://github.com/JUNX7764/Codexusage")!
+    /// GitHub 匿名限额 60 次/小时/IP，2 小时一查绰绰有余
+    static let interval: TimeInterval = 2 * 3600
+
+    /// 本地 build 短 hash 是否落后于远端 main。相等（remote 以 local 开头）= 最新；
+    /// 任一侧 unknown（非 git 环境构建 / 请求失败）= 不提示。本地领先（dev 已提交未推送）
+    /// 也会提示——更新脚本 pull --ff-only 会原样退出，属 dev 自知的场景
+    static func isOutdated(local: String, remote: String) -> Bool {
+        guard local.count >= 7, remote.count >= 7,
+              local != "unknown", remote != "unknown" else { return false }
+        return !remote.lowercased().hasPrefix(local.lowercased())
+    }
+
+    /// clone 目录还能就地更新：存在且是 git 仓库（zip 下载的目录没有 .git，只能重新 clone）
+    static func sourceUsable(_ dir: String) -> Bool {
+        var isDir: ObjCBool = false
+        guard !dir.isEmpty, dir != "unknown" else { return false }
+        return FileManager.default.fileExists(atPath: dir + "/.git", isDirectory: &isDir)
+            && isDir.boolValue
+    }
+}
+
+/// 更新检查状态：低频匿名请求 GitHub，失败静默保留旧结论（不打扰主刷新，也不弹任何东西）。
+/// 状态只在主线程读写（回调统一 dispatch 回主线程），无需加锁。
+final class UpdateChecker {
+    static let shared = UpdateChecker()
+    private(set) var available = false
+    private var etag: String?
+    private var lastCheck: Date?
+    private var inFlight = false
+
+    /// force=false 时按 interval 节流；completion 固定主线程回调
+    func check(force: Bool = false, completion: @escaping () -> Void = {}) {
+        guard !inFlight else { return }
+        if !force, let last = lastCheck, Date().timeIntervalSince(last) < UpdateCheck.interval {
+            completion()
+            return
+        }
+        inFlight = true
+        var req = URLRequest(url: UpdateCheck.apiURL, timeoutInterval: 15)
+        req.cachePolicy = .reloadIgnoringLocalCacheData   // ETag/304 语义自己管，不用 URLCache
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("CodexUsage/1.0 (menubar; update check)", forHTTPHeaderField: "User-Agent")
+        if let etag = etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.inFlight = false
+                self.lastCheck = Date()
+                let http = resp as? HTTPURLResponse
+                if http?.statusCode == 304 {
+                    // 内容未变：结论保持
+                } else if err == nil, let data = data, http?.statusCode == 200,
+                          let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                          let sha = obj["sha"] as? String {
+                    self.available = UpdateCheck.isOutdated(local: BuildInfo.commit, remote: sha)
+                    if let e = http?.value(forHTTPHeaderField: "ETag"), !e.isEmpty { self.etag = e }
+                }
+                completion()
+            }
+        }.resume()
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+    private var updateTimer: Timer?
     private var usage = UsageData()
     private var cycle = 0
     private let refreshGate = RefreshGate()
@@ -1344,6 +1426,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 every: self.tokenEveryCycles, manual: false))
         }
         timer?.tolerance = 6
+        // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 2 小时
+        updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateCheck.interval, repeats: true) { [weak self] _ in
+            self?.checkForUpdate()
+        }
+        updateTimer?.tolerance = 60
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.checkForUpdate() }
     }
 
     // 拉取数据：额度走网络（回调内含 401 兜底刷新），token 扫描与重置卡明细走每 5 分钟周期
@@ -1553,7 +1641,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "sevenDayError": usage.sevenDayError ?? "",
             "quotaError": usage.quotaError ?? "",
             "tokensError": usage.tokensError ?? "",
-            "lastAttemptAt": iso(lastAttemptAt)
+            "lastAttemptAt": iso(lastAttemptAt),
+            "version": BuildInfo.version,
+            "updateAvailable": UpdateChecker.shared.available
         ]
         if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: URL(fileURLWithPath: dir + "/status.json"))
@@ -1563,6 +1653,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 下拉面板（PLAN §4 自上而下）
     private func rebuildMenu() {
         let menu = NSMenu()
+
+        // 更新横幅（最上方）：build 时注入的 commit 落后于 GitHub main 才出现；
+        // 点击唤起 Terminal 代跑就地更新，clone 目录不在时退化为打开仓库页
+        if UpdateChecker.shared.available {
+            let banner = NSMenuItem(title: "⬆ 新版本可用，点击更新", action: #selector(onUpdateApp), keyEquivalent: "")
+            banner.target = self
+            menu.addItem(banner)
+            menu.addItem(.separator())
+        }
 
         func info(_ title: String) -> NSMenuItem {
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
@@ -1720,6 +1819,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(loginItem)
 
         menu.addItem(.separator())
+        menu.addItem(info("版本 \(BuildInfo.version)"))
         let quit = NSMenuItem(title: "退出", action: #selector(onQuit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -1729,8 +1829,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func onRefresh() { refresh(tokens: true, manual: true) }
 
+    // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤30s 也会兜底重建）
+    private func checkForUpdate() {
+        UpdateChecker.shared.check { [weak self] in self?.rebuildMenu() }
+    }
+
     @objc private func openLink(_ sender: NSMenuItem) {
         if let url = sender.representedObject as? URL { NSWorkspace.shared.open(url) }
+    }
+
+    // 更新横幅点击：唤起 Terminal 代跑就地更新（git pull → build → 替换已安装 .app → 重启）；
+    // clone 目录已删/移走或 zip 安装（无 .git）时退化为打开仓库页重新 clone
+    @objc private func onUpdateApp() {
+        let src = BuildInfo.sourceDir
+        if UpdateCheck.sourceUsable(src) {
+            let script = src + "/scripts/update.sh"
+            if FileManager.default.fileExists(atPath: script),
+               let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
+                NSWorkspace.shared.open([URL(fileURLWithPath: script)], withApplicationAt: terminal,
+                    configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+                return
+            }
+        }
+        NSWorkspace.shared.open(UpdateCheck.repoPage)
     }
 
     // MARK: 开机自启（LaunchAgent，与 GlmUsage/KimiUsage 同款）
@@ -2297,7 +2418,19 @@ enum CodexOfflineRegression {
                 .filter { $0.hasSuffix(".tmp") }
             try expect(tempFiles.isEmpty, "failed write left a temporary credential file")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives, external usage model/parse/scan/hermes-diff, refresh gate/schedule, temp auth merge/permissions/failure)")
+            // 更新检查：hash 比对（短/长、大小写）与 unknown 防御；clone 目录判定看 .git 存在性
+            try expect(!UpdateCheck.isOutdated(local: "f10223b", remote: "f10223b" + String(repeating: "a", count: 33)), "identical commit flagged outdated")
+            try expect(UpdateCheck.isOutdated(local: "f10223b", remote: String(repeating: "a", count: 40)), "newer remote commit not flagged")
+            try expect(!UpdateCheck.isOutdated(local: "F10223B", remote: "f10223b" + String(repeating: "a", count: 33)), "hash comparison was case-sensitive")
+            try expect(!UpdateCheck.isOutdated(local: "unknown", remote: String(repeating: "a", count: 40)), "unknown local hash flagged outdated")
+            try expect(!UpdateCheck.isOutdated(local: "f10223b", remote: "unknown"), "unknown remote hash flagged outdated")
+            let nonGitDir = root.appendingPathComponent("not-a-repo")
+            try FileManager.default.createDirectory(atPath: nonGitDir.path, withIntermediateDirectories: false)
+            try expect(!UpdateCheck.sourceUsable(nonGitDir.path), "non-git directory accepted as update source")
+            try FileManager.default.createDirectory(atPath: nonGitDir.appendingPathComponent(".git").path, withIntermediateDirectories: false)
+            try expect(UpdateCheck.sourceUsable(nonGitDir.path), "git clone directory rejected as update source")
+
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives, external usage model/parse/scan/hermes-diff, refresh gate/schedule, temp auth merge/permissions/failure, update check hash/source)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)

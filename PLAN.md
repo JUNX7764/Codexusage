@@ -250,6 +250,28 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 - `--once` 打印 external 三行摘要（本地统计，不计入退出码）。
 - `--self-test`：甄别正负例（正负例均取本机外部工具实测模型名）、行解析（双时间格式/cache 计入/汇总行跳过/坏行跳过）、临时目录端到端（分桶/嵌套枚举/旧文件跳过/追加增量/删除剔除/截断重扫）、hermes sqlite 夹具（回填/差分入日/计数重置/行删除）。全部用临时 roots 与状态文件，不碰真实 `~/.proma` / `~/.claude` / `~/.hermes`。
 
+## 4.8 版本与就地更新 —— v1.4 增补
+
+不打包分发（无 Release / Actions）：用户 clone 仓库 + `./build.sh` 自行构建。版本号与更新提示全由 git 派生，零手工维护。
+
+### 版本注入（build.sh，每次构建自动）
+
+- 版本号 = `git describe --tags --always --dirty`：HEAD 在 tag 上 → `v1.0.0`；tag 后有新 commit → `v1.0.0-N-g<hash>`；无 tag → 短 hash；未提交改动追加 `-dirty`。**打 tag 即发版**。
+- 构建指纹（version / commit / sourceDir=clone 目录）由 PlistBuddy 写进产物 Info.plist 自定义键 `CUBuildVersion/CUBuildCommit/CUBuildSourceDir`，app 运行时读 Bundle；裸 swiftc 二进制无这些键 → unknown，更新检查自然禁用。不能生成第二个 .swift：多文件编译下只有 main.swift 允许 top-level 代码，本文件命令行入口依赖 top-level。仓库模板 Info.plist 里的 1.0.0 只是占位，不是事实来源。
+- 菜单底部显示「版本 <describe>」；status.json 增 `version` / `updateAvailable`。
+
+### 更新检查（app 内，低频）
+
+- 判据是 **commit hash 不是版本号**：build 时注入的短 hash vs `api.github.com/repos/JUNX7764/Codexusage/commits/main` 最新 commit（匿名只读、ETag/304、2 小时一查；GitHub 匿名限额 60 次/小时/IP）。失败静默保留旧结论。
+- hash 不同 → 菜单最上方横幅「⬆ 新版本可用，点击更新」；拿不到远端（断网等）→ 不出横幅。
+
+### 就地更新（scripts/update.sh，点击横幅唤起 Terminal 代跑）
+
+- 流程：`git pull --ff-only` → `./build.sh` → 替换已安装 .app（~/Applications 优先、/Applications 兜底）→ 重启。
+- LaunchAgent 托管（`com.local.codex-usage`）时先 bootout 再换包再 bootstrap（KeepAlive 会在换包中途拉起旧二进制；直接 kickstart 会 LaunchServices 拒启）；非托管 pkill 后 open。换包前杀干净全部实例（LaunchServices 可能另持 GUI 实例）。
+- clone 目录已删/移走（或 zip 下载无 .git）→ 点击横幅退化为打开 GitHub 仓库页重新 clone。
+- 关键约束：裸 `git pull && ./build.sh` 只在 clone 目录产出新 app，**必须换掉安装位置正在运行的那份并重启**，否则用户等于白更。
+
 ## 5. 工程与部署边界
 
 - 单文件 `CodexUsage.swift`；`build.sh` 与 `Info.plist` 已就绪，**不要改动**（部署目标 13.0 是刻意为之，本机 CLT 默认 macosx28 会被 LaunchServices 拒绝）。
