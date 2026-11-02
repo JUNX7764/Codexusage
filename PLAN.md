@@ -269,20 +269,20 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 
 ### 发布（scripts/release.sh）
 
-- 流程：校验工作区干净且 HEAD == origin/main → 打 tag 推送 → `build.sh`（此时 describe = tag，版本注入正确）→ 双格式打包 → `gh release create --generate-notes` 上传产物。
+- 流程：校验工作区干净、HEAD == origin/main、origin 与 updater 配置匹配 → 创建本地 tag → `build.sh`（describe = tag，版本注入正确）→ `--self-test` → 签名验证 → 双格式打包及资产校验 → 推送 tag → `gh release create --generate-notes` 上传产物。验证失败不推远端 tag，并清理本次新建的本地 tag；已推送 tag 后若 Release 创建失败，可用同 commit 的该 tag 续跑。
 - **双资产分工**（MonitorControl/Stats 发 DMG、Ice/AltTab 发 zip，成熟项目两派并存）：`CodexUsage.dmg` 给人从 Releases 页下载（内含 /Applications 符号链接做拖拽落点，`hdiutil create -format UDZO`）；`CodexUsage.zip` 给 update.sh 程序化替换（ditto 打包，Sparkle 官方支持的更新包格式）。zip 资产名固定，供 `releases/latest/download/CodexUsage.zip` 稳定下载 URL。
 - `releases/latest` 不含 draft / prerelease，所以只发正式版。
 
 ### 就地更新（.app 内置 update.sh，点击横幅唤起 Terminal 代跑）
 
-- 流程：下载 `releases/latest/download/CodexUsage.zip` → 校验包内有可执行文件 → 替换已安装 .app（~/Applications 优先、/Applications 兜底）→ 重启；找不到已装副本 → 在 Finder 显示新包供手动拖入；下载失败 → 打开 Releases 页手动下载。
+- 流程：下载 `releases/latest/download/CodexUsage.zip` → 校验可执行文件、构建版本、签名并运行 `--self-test` → 在安装目录旁完整暂存 → 停止本应用 LaunchAgent → 旧包移为备份并切换新包 → 启动后确认版本和进程稳定驻留 → 清理备份。暂存失败不停止服务；切换或启动失败恢复旧包并重启旧版本。找不到已装副本时，在 Finder 显示新包供手动拖入；下载失败时打开 Releases 页。
 - LaunchAgent 托管（`com.local.codex-usage`）时先 bootout 再换包再 bootstrap（KeepAlive 会在换包中途拉起旧二进制；直接 kickstart 会 LaunchServices 拒启）；非托管 pkill 后 open。换包前杀干净全部实例（LaunchServices 可能另持 GUI 实例）。
 - 脚本随包内置（.app Resources/update.sh），更新不再要求机器上有 clone、不依赖 swiftc。
 - 关键约束：下载产物替换的就是安装位置正在运行的那份并重启，不存在「clone 目录里构建了新 app 但没换装」的白更问题。
 
 ## 5. 工程与部署边界
 
-- 单文件 `CodexUsage.swift`；`build.sh` 与 `Info.plist` 已就绪，**不要改动**（部署目标 13.0 是刻意为之，本机 CLT 默认 macosx28 会被 LaunchServices 拒绝）。
+- 单文件 `CodexUsage.swift`；构建部署目标保持 macOS 13.0（本机 CLT 默认 macosx28 会被 LaunchServices 拒绝）。
 - 刷新节奏：额度 60s / token 扫描每 5 周期（照 GlmUsage 的 tokenEveryCycles 模式）。
 - 网络瞬断时保留上次成功数据但**必须**带 ⚠ 过期标注（与 GlmUsage 的静默保留不同，这是刻意改进）。
 - **本任务不做部署**：不动 LaunchAgents、不 kill CodexMeter、不拷贝到 ~/Applications（由主会话与用户确认后进行）。

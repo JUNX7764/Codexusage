@@ -34,7 +34,7 @@ macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时
 ./build.sh
 ```
 
-发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——打 tag → 构建 → 打包 zip → 创建 GitHub Release 并上传产物。
+发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——创建本地 tag → 构建与离线自测 → 签名及 DMG/zip 校验 → 推送 tag → 创建 GitHub Release。验证失败不会推送远端 tag。
 
 ## 原理
 
@@ -55,6 +55,9 @@ macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时
 # 离线自检：只用临时目录和假凭据，不读真实 Codex 凭据、不联网
 ./CodexUsage.app/Contents/MacOS/CodexUsage --self-test
 
+# 脚本回归：PATH mock 故障注入，不操作真实 app、LaunchAgent 或 GitHub
+python3 -m unittest discover -s tests -p '*_test.py'
+
 # 真实自检：读取本机凭据、联网拉一次数据后退出
 ./CodexUsage.app/Contents/MacOS/CodexUsage --once
 ```
@@ -68,7 +71,8 @@ macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时
 | `Info.plist` | App Bundle 配置（LSUIElement = 菜单栏常驻） |
 | `scripts/icon_gen.swift` | 图标生成脚本（缺 icns 时 build.sh 自动调用） |
 | `scripts/update.sh` | 就地更新脚本（从 Release 下载替换；build.sh 随包内置进 .app Resources） |
-| `scripts/release.sh` | 发布脚本（打 tag → 构建 → 打包 → 创建 GitHub Release 上传产物） |
+| `scripts/release.sh` | 发布脚本（本地 tag → 构建与测试 → 资产校验 → 推 tag → GitHub Release） |
+| `tests/script_test.py` | 更新、发布、签名故障的离线回归测试 |
 | `PLAN.md` | 开发规格（数据源已实测、解析规则、UI 规格、验收标准） |
 
 ## License

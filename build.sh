@@ -51,6 +51,7 @@ cp "$DIR/scripts/update.sh" "$APP/Contents/Resources/update.sh"
 chmod +x "$APP/Contents/Resources/update.sh"
 
 echo "== ad-hoc 签名 =="
-codesign --force --sign - "$APP" 2>/dev/null || true
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict "$APP"
 
 echo "== 完成: ${APP}（版本 ${VERSION_DESCRIBE}）=="
