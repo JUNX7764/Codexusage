@@ -22,15 +22,19 @@ macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时
   - 「最近尝试刷新」显示请求开始时间
   - Tibo 重置动态每 5 分钟刷新（ETag/304 轮询，内容未变也算有效成功），失败只降级该区块；预估窗口展示「预估/待确认」，不是倒计时（数据源：AIHOT 公开接口，匿名只读、不经凭据）
 
-## 安装与构建
+## 安装与更新
 
-需要 macOS 13+ 与 Xcode Command Line Tools（未装先执行 `xcode-select --install`）：
+需要 macOS 13+。安装：到 [Releases](https://github.com/JUNX7764/Codexusage/releases) 下载最新 `CodexUsage.zip`，解压后拖到 `/Applications`（或 `~/Applications`）双击运行。首次打开如遇 Gatekeeper 提示，右键 → 打开。
+
+**更新**：发布新 Release 后（每 2 小时检查一次），菜单最上方出现「⬆ 新版本可用，点击更新」，点击即自动下载替换并重启；也可以随时手动重跑安装步骤。日常代码提交不会触发更新提示——只有正式发版才会。
+
+从源码构建（开发者）：
 
 ```bash
 ./build.sh
 ```
 
-产物 `CodexUsage.app`，拖到 `/Applications`（或 `~/Applications`）双击运行。首次打开如遇 Gatekeeper 提示，右键 → 打开。
+发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——打 tag → 构建 → 打包 zip → 创建 GitHub Release 并上传产物。
 
 ## 原理
 
@@ -63,6 +67,8 @@ macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时
 | `build.sh` | 编译 + 打包 + ad-hoc 签名脚本 |
 | `Info.plist` | App Bundle 配置（LSUIElement = 菜单栏常驻） |
 | `scripts/icon_gen.swift` | 图标生成脚本（缺 icns 时 build.sh 自动调用） |
+| `scripts/update.sh` | 就地更新脚本（从 Release 下载替换；build.sh 随包内置进 .app Resources） |
+| `scripts/release.sh` | 发布脚本（打 tag → 构建 → 打包 → 创建 GitHub Release 上传产物） |
 | `PLAN.md` | 开发规格（数据源已实测、解析规则、UI 规格、验收标准） |
 
 ## License

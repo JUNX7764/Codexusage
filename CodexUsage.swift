@@ -1306,42 +1306,53 @@ enum Fmt {
     }
 }
 
-// MARK: - 版本与更新检查（build.sh 打包时写 Info.plist 自定义键；不打包分发，就地更新见 scripts/update.sh）
+// MARK: - 版本与更新检查（成熟项目惯例，Sparkle 生态同款语义：只认 GitHub Release，
+// 不认 main 分支 commit——日常 push 与用户无关，发布了更高版本才提示。
+// build.sh 打包时写 Info.plist 自定义键；就地更新脚本随包内置，见 Resources/update.sh）
 
-/// 构建指纹：build.sh 打包时写入产物 Info.plist（CUBuildVersion/Commit/SourceDir），运行时读 Bundle。
-/// 仓库模板没有这些键 → 非 build.sh 产物（直接 swiftc 的裸二进制）为 unknown，
+/// 构建版本：build.sh 打包时写入产物 Info.plist 自定义键（CUBuildVersion，git describe），
+/// 运行时读 Bundle。仓库模板没有该键 → 非 build.sh 产物（直接 swiftc 的裸二进制）为 unknown，
 /// 此时更新检查自然禁用、菜单显示「版本 unknown」。不生成第二个 .swift：多文件编译下
 /// 只有 main.swift 允许 top-level 代码，本文件的命令行入口依赖 top-level。
 enum BuildInfo {
     static let version = (Bundle.main.infoDictionary?["CUBuildVersion"] as? String) ?? "unknown"
-    static let commit = (Bundle.main.infoDictionary?["CUBuildCommit"] as? String) ?? "unknown"
-    static let sourceDir = (Bundle.main.infoDictionary?["CUBuildSourceDir"] as? String) ?? "unknown"
 }
 
-/// 就地更新的纯逻辑：hash 比对与 clone 目录判定（--self-test 覆盖）。
-/// 比对判据是 commit hash 不是版本号——tag 只负责区分「值得提示的版本」，
-/// 未打 tag 的日常构建同样能正确收到更新提示。
+/// 更新判定的纯逻辑：Release 版本号比较（--self-test 覆盖）。
+/// 提示的唯一触发条件是「GitHub 发布了更高版本的 Release」；commit hash 回答的是
+/// 「分支动没动」，不代表存在可安装的新版本。
 enum UpdateCheck {
-    static let apiURL = URL(string: "https://api.github.com/repos/JUNX7764/Codexusage/commits/main")!
-    static let repoPage = URL(string: "https://github.com/JUNX7764/Codexusage")!
+    static let apiURL = URL(string: "https://api.github.com/repos/JUNX7764/Codexusage/releases/latest")!
+    static let releasesPage = URL(string: "https://github.com/JUNX7764/Codexusage/releases")!
     /// GitHub 匿名限额 60 次/小时/IP，2 小时一查绰绰有余
     static let interval: TimeInterval = 2 * 3600
 
-    /// 本地 build 短 hash 是否落后于远端 main。相等（remote 以 local 开头）= 最新；
-    /// 任一侧 unknown（非 git 环境构建 / 请求失败）= 不提示。本地领先（dev 已提交未推送）
-    /// 也会提示——更新脚本 pull --ff-only 会原样退出，属 dev 自知的场景
-    static func isOutdated(local: String, remote: String) -> Bool {
-        guard local.count >= 7, remote.count >= 7,
-              local != "unknown", remote != "unknown" else { return false }
-        return !remote.lowercased().hasPrefix(local.lowercased())
+    /// 版本号归一化：v1.0.1 / v1.0.1-3-gabc / v1.0.1-dirty → [1, 0, 1]；
+    /// 破折号后缀（预发布/dirty/git describe 尾巴）丢弃，任一段非数字视为无法比较
+    static func normalized(_ v: String) -> [Int]? {
+        var core = v.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !core.isEmpty else { return nil }
+        if core.hasPrefix("v") { core.removeFirst() }
+        if let dash = core.firstIndex(of: "-") { core = String(core[..<dash]) }
+        guard !core.isEmpty else { return nil }
+        var parts: [Int] = []
+        for seg in core.split(separator: ".") {
+            guard let n = Int(seg), n >= 0 else { return nil }
+            parts.append(n)
+        }
+        return parts.isEmpty ? nil : parts
     }
 
-    /// clone 目录还能就地更新：存在且是 git 仓库（zip 下载的目录没有 .git，只能重新 clone）
-    static func sourceUsable(_ dir: String) -> Bool {
-        var isDir: ObjCBool = false
-        guard !dir.isEmpty, dir != "unknown" else { return false }
-        return FileManager.default.fileExists(atPath: dir + "/.git", isDirectory: &isDir)
-            && isDir.boolValue
+    /// 已装版本是否低于远端 Release 版本。任一侧无法解析（unknown / 裸二进制 / 非法 tag）
+    /// = 不提示；逐段数值比较（1.10 > 1.9），短侧补 0（1.2 == 1.2.0）
+    static func isOutdated(local: String, remote: String) -> Bool {
+        guard var l = normalized(local), var r = normalized(remote) else { return false }
+        if l.count < r.count { l.append(contentsOf: repeatElement(0, count: r.count - l.count)) }
+        if r.count < l.count { r.append(contentsOf: repeatElement(0, count: l.count - r.count)) }
+        for i in 0..<l.count where l[i] != r[i] {
+            return l[i] < r[i]
+        }
+        return false
     }
 }
 
@@ -1377,8 +1388,8 @@ final class UpdateChecker {
                     // 内容未变：结论保持
                 } else if err == nil, let data = data, http?.statusCode == 200,
                           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                          let sha = obj["sha"] as? String {
-                    self.available = UpdateCheck.isOutdated(local: BuildInfo.commit, remote: sha)
+                          let tag = obj["tag_name"] as? String {
+                    self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
                     if let e = http?.value(forHTTPHeaderField: "ETag"), !e.isEmpty { self.etag = e }
                 }
                 completion()
@@ -1654,8 +1665,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rebuildMenu() {
         let menu = NSMenu()
 
-        // 更新横幅（最上方）：build 时注入的 commit 落后于 GitHub main 才出现；
-        // 点击唤起 Terminal 代跑就地更新，clone 目录不在时退化为打开仓库页
+        // 更新横幅（最上方）：GitHub 发布了更高版本的 Release 才出现（与 commit 动态无关）；
+        // 点击运行 .app 内置 update.sh 从 Release 下载替换，内置脚本缺失时退化为打开 Releases 页
         if UpdateChecker.shared.available {
             let banner = NSMenuItem(title: "⬆ 新版本可用，点击更新", action: #selector(onUpdateApp), keyEquivalent: "")
             banner.target = self
@@ -1838,20 +1849,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let url = sender.representedObject as? URL { NSWorkspace.shared.open(url) }
     }
 
-    // 更新横幅点击：唤起 Terminal 代跑就地更新（git pull → build → 替换已安装 .app → 重启）；
-    // clone 目录已删/移走或 zip 安装（无 .git）时退化为打开仓库页重新 clone
+    // 更新横幅点击：唤起 Terminal 代跑 .app 内置 update.sh（从 GitHub Releases 下载最新
+    // 发布包 → 替换本 app → 重启）；脚本随包携带，不依赖 clone 目录。
+    // 内置脚本缺失（手工换包破坏 bundle）时退化为打开 Releases 页手动下载
     @objc private func onUpdateApp() {
-        let src = BuildInfo.sourceDir
-        if UpdateCheck.sourceUsable(src) {
-            let script = src + "/scripts/update.sh"
-            if FileManager.default.fileExists(atPath: script),
-               let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
-                NSWorkspace.shared.open([URL(fileURLWithPath: script)], withApplicationAt: terminal,
-                    configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
-                return
-            }
+        if let script = Bundle.main.path(forResource: "update", ofType: "sh"),
+           let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
+            NSWorkspace.shared.open([URL(fileURLWithPath: script)], withApplicationAt: terminal,
+                configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+            return
         }
-        NSWorkspace.shared.open(UpdateCheck.repoPage)
+        NSWorkspace.shared.open(UpdateCheck.releasesPage)
     }
 
     // MARK: 开机自启（LaunchAgent，与 GlmUsage/KimiUsage 同款）
@@ -2418,19 +2426,21 @@ enum CodexOfflineRegression {
                 .filter { $0.hasSuffix(".tmp") }
             try expect(tempFiles.isEmpty, "failed write left a temporary credential file")
 
-            // 更新检查：hash 比对（短/长、大小写）与 unknown 防御；clone 目录判定看 .git 存在性
-            try expect(!UpdateCheck.isOutdated(local: "f10223b", remote: "f10223b" + String(repeating: "a", count: 33)), "identical commit flagged outdated")
-            try expect(UpdateCheck.isOutdated(local: "f10223b", remote: String(repeating: "a", count: 40)), "newer remote commit not flagged")
-            try expect(!UpdateCheck.isOutdated(local: "F10223B", remote: "f10223b" + String(repeating: "a", count: 33)), "hash comparison was case-sensitive")
-            try expect(!UpdateCheck.isOutdated(local: "unknown", remote: String(repeating: "a", count: 40)), "unknown local hash flagged outdated")
-            try expect(!UpdateCheck.isOutdated(local: "f10223b", remote: "unknown"), "unknown remote hash flagged outdated")
-            let nonGitDir = root.appendingPathComponent("not-a-repo")
-            try FileManager.default.createDirectory(atPath: nonGitDir.path, withIntermediateDirectories: false)
-            try expect(!UpdateCheck.sourceUsable(nonGitDir.path), "non-git directory accepted as update source")
-            try FileManager.default.createDirectory(atPath: nonGitDir.appendingPathComponent(".git").path, withIntermediateDirectories: false)
-            try expect(UpdateCheck.sourceUsable(nonGitDir.path), "git clone directory rejected as update source")
+            // 更新检查：Release 版本号比较（v 前缀与 describe/dirty 尾巴剥离、逐段数值、短侧补 0、无法解析不提示）
+            try expect(!UpdateCheck.isOutdated(local: "v1.0.1", remote: "v1.0.1"), "same release flagged outdated")
+            try expect(UpdateCheck.isOutdated(local: "v1.0.0-1-g95952a1", remote: "v1.0.1"), "newer release not detected")
+            try expect(!UpdateCheck.isOutdated(local: "v1.0.1", remote: "v1.0.0"), "older release flagged outdated")
+            try expect(UpdateCheck.isOutdated(local: "v1.9", remote: "v1.10"), "segments compared as numbers, not strings")
+            try expect(!UpdateCheck.isOutdated(local: "v1.10", remote: "v1.9"), "segments compared as numbers, not strings")
+            try expect(!UpdateCheck.isOutdated(local: "v1.2", remote: "v1.2.0"), "shorter version not zero-padded")
+            try expect(!UpdateCheck.isOutdated(local: "v1.0.0-dirty", remote: "v1.0.0"), "dirty suffix not stripped")
+            try expect(UpdateCheck.isOutdated(local: "v1.0.0", remote: "v1.0.1-beta"), "prerelease suffix not stripped")
+            try expect(!UpdateCheck.isOutdated(local: "unknown", remote: "v9.9.9"), "unknown local version flagged outdated")
+            try expect(!UpdateCheck.isOutdated(local: "v1.0.0", remote: "unknown"), "unknown remote version flagged outdated")
+            try expect(!UpdateCheck.isOutdated(local: "", remote: "v1.0.0"), "empty local version flagged outdated")
+            try expect(!UpdateCheck.isOutdated(local: "abc", remote: "1.2"), "non-numeric local version flagged outdated")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives, external usage model/parse/scan/hermes-diff, refresh gate/schedule, temp auth merge/permissions/failure, update check hash/source)")
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives, external usage model/parse/scan/hermes-diff, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)

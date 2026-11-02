@@ -6,7 +6,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="$DIR/CodexUsage.app"
 
 # 版本注入：tag 即版本（git describe），无 tag 退化短 hash，未提交改动追加 -dirty。
-# 打包时写进产物 Info.plist 自定义键（CU*），app 运行时读 Bundle——不能生成第二个 .swift：
+# 打包时写进产物 Info.plist 自定义键（CUBuildVersion），app 运行时读 Bundle——不能生成第二个 .swift：
 # 多文件编译下只有 main.swift 允许 top-level 代码，CodexUsage.swift 的命令行入口依赖 top-level
 VERSION_DESCRIBE="$(git -C "$DIR" describe --tags --always --dirty 2>/dev/null || echo unknown)"
 COMMIT="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -44,8 +44,11 @@ esac
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $PLIST_VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $PLIST_VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CUBuildVersion string ${VERSION_DESCRIBE}" "$APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :CUBuildCommit string ${COMMIT}" "$APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :CUBuildSourceDir string ${DIR}" "$APP/Contents/Info.plist"
+
+# 就地更新脚本随包内置：app 菜单点击更新时由 Terminal 代跑（从 GitHub Releases 下载
+# 发布包替换，不依赖 clone 目录），见 CodexUsage.swift onUpdateApp
+cp "$DIR/scripts/update.sh" "$APP/Contents/Resources/update.sh"
+chmod +x "$APP/Contents/Resources/update.sh"
 
 echo "== ad-hoc 签名 =="
 codesign --force --sign - "$APP" 2>/dev/null || true

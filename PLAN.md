@@ -250,27 +250,34 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 - `--once` 打印 external 三行摘要（本地统计，不计入退出码）。
 - `--self-test`：甄别正负例（正负例均取本机外部工具实测模型名）、行解析（双时间格式/cache 计入/汇总行跳过/坏行跳过）、临时目录端到端（分桶/嵌套枚举/旧文件跳过/追加增量/删除剔除/截断重扫）、hermes sqlite 夹具（回填/差分入日/计数重置/行删除）。全部用临时 roots 与状态文件，不碰真实 `~/.proma` / `~/.claude` / `~/.hermes`。
 
-## 4.8 版本与就地更新 —— v1.4 增补
+## 4.8 版本与发布更新 —— v1.4 增补，v1.5 对齐成熟项目惯例
 
-不打包分发（无 Release / Actions）：用户 clone 仓库 + `./build.sh` 自行构建。版本号与更新提示全由 git 派生，零手工维护。
+更新机制对齐 Sparkle 生态（MonitorControl / Ice / AltTab 等开源 mac app 同款语义）：**提示的唯一触发条件是「GitHub 发布了更高版本的 Release」，与 main 分支 commit 动态完全无关**；更新 = 下载发布产物替换，不在用户机器上重新编译。
 
 ### 版本注入（build.sh，每次构建自动）
 
-- 版本号 = `git describe --tags --always --dirty`：HEAD 在 tag 上 → `v1.0.0`；tag 后有新 commit → `v1.0.0-N-g<hash>`；无 tag → 短 hash；未提交改动追加 `-dirty`。**打 tag 即发版**。
-- 构建指纹（version / commit / sourceDir=clone 目录）由 PlistBuddy 写进产物 Info.plist 自定义键 `CUBuildVersion/CUBuildCommit/CUBuildSourceDir`，app 运行时读 Bundle；裸 swiftc 二进制无这些键 → unknown，更新检查自然禁用。不能生成第二个 .swift：多文件编译下只有 main.swift 允许 top-level 代码，本文件命令行入口依赖 top-level。仓库模板 Info.plist 里的 1.0.0 只是占位，不是事实来源。
+- 版本号 = `git describe --tags --always --dirty`：HEAD 在 tag 上 → `v1.0.0`；tag 后有新 commit → `v1.0.0-N-g<hash>`；无 tag → 短 hash；未提交改动追加 `-dirty`。**打 tag 即发版**（`scripts/release.sh` 一键完成）。
+- 版本由 PlistBuddy 写进产物 Info.plist 自定义键 `CUBuildVersion`，app 运行时读 Bundle；裸 swiftc 二进制无该键 → unknown，更新检查自然禁用。不能生成第二个 .swift：多文件编译下只有 main.swift 允许 top-level 代码，本文件命令行入口依赖 top-level。仓库模板 Info.plist 里的 1.0.0 只是占位，不是事实来源。
+- 就地更新脚本随包内置：build.sh 把 `scripts/update.sh` 拷进 .app Resources，点击横幅不依赖 clone 目录。
 - 菜单底部显示「版本 <describe>」；status.json 增 `version` / `updateAvailable`。
 
 ### 更新检查（app 内，低频）
 
-- 判据是 **commit hash 不是版本号**：build 时注入的短 hash vs `api.github.com/repos/JUNX7764/Codexusage/commits/main` 最新 commit（匿名只读、ETag/304、2 小时一查；GitHub 匿名限额 60 次/小时/IP）。失败静默保留旧结论。
-- hash 不同 → 菜单最上方横幅「⬆ 新版本可用，点击更新」；拿不到远端（断网等）→ 不出横幅。
+- 判据是 **Release 版本号不是 commit hash**：已装 `CUBuildVersion` vs `api.github.com/repos/JUNX7764/Codexusage/releases/latest` 的 `tag_name`（匿名只读、ETag/304、2 小时一查；GitHub 匿名限额 60 次/小时/IP）。失败或从未发过版（404）静默不提示、保留旧结论。
+- 版本比较：`v` 前缀与 `-dirty`/`-g<hash>` 等破折号尾巴剥离，逐段数值比较（1.10 > 1.9），短侧补 0（1.2 == 1.2.0）；任一侧无法解析 = 不提示。日常 commit / push 不触发横幅，发版才触发。
+- 最新 Release 版本更高 → 菜单最上方横幅「⬆ 新版本可用，点击更新」；拿不到远端（断网等）→ 不出横幅。
 
-### 就地更新（scripts/update.sh，点击横幅唤起 Terminal 代跑）
+### 发布（scripts/release.sh）
 
-- 流程：`git pull --ff-only` → `./build.sh` → 替换已安装 .app（~/Applications 优先、/Applications 兜底）→ 重启。
+- 流程：校验工作区干净且 HEAD == origin/main → 打 tag 推送 → `build.sh`（此时 describe = tag，版本注入正确）→ `ditto -c -k --sequesterRsrc --keepParent` 打包（Sparkle 官方推荐；资产名固定 `CodexUsage.zip`）→ `gh release create --generate-notes` 上传产物。
+- `releases/latest` 不含 draft / prerelease，所以只发正式版；GitHub 提供 `releases/latest/download/CodexUsage.zip` 稳定下载 URL。
+
+### 就地更新（.app 内置 update.sh，点击横幅唤起 Terminal 代跑）
+
+- 流程：下载 `releases/latest/download/CodexUsage.zip` → 校验包内有可执行文件 → 替换已安装 .app（~/Applications 优先、/Applications 兜底）→ 重启；找不到已装副本 → 在 Finder 显示新包供手动拖入；下载失败 → 打开 Releases 页手动下载。
 - LaunchAgent 托管（`com.local.codex-usage`）时先 bootout 再换包再 bootstrap（KeepAlive 会在换包中途拉起旧二进制；直接 kickstart 会 LaunchServices 拒启）；非托管 pkill 后 open。换包前杀干净全部实例（LaunchServices 可能另持 GUI 实例）。
-- clone 目录已删/移走（或 zip 下载无 .git）→ 点击横幅退化为打开 GitHub 仓库页重新 clone。
-- 关键约束：裸 `git pull && ./build.sh` 只在 clone 目录产出新 app，**必须换掉安装位置正在运行的那份并重启**，否则用户等于白更。
+- 脚本随包内置（.app Resources/update.sh），更新不再要求机器上有 clone、不依赖 swiftc。
+- 关键约束：下载产物替换的就是安装位置正在运行的那份并重启，不存在「clone 目录里构建了新 app 但没换装」的白更问题。
 
 ## 5. 工程与部署边界
 
