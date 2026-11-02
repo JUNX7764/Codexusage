@@ -114,10 +114,10 @@ Codex 用量（plus 套餐）        // plan_type 大写展示；第二行可显
 7 天窗口：剩余 37%（重置 09-28 13:54）
 重置卡：×3                     // available_count > 0 时显示
 ─
-Token 今天 12.3 万 · 7 天 87 万 · 30 天 210 万   // 格式化见 Fmt
+Codex用量 今天 12.3 万 · 7 天 87 万 · 30 天 210 万   // 格式化见 Fmt
   ├ 今日：input 9.8 万 / output 2.5 万
   └ 近 7 天：input 71 万 / output 16 万
-（⚠ tokens 过期行，过期时）
+（⚠ Codex用量已过期行，过期时）
 （错误行：quota/tokens 最后一条错误，有才显示）
 ─
 立即刷新

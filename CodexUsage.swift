@@ -1761,9 +1761,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if usage.tokensToday == nil && usage.tokens7d == nil && usage.tokens30d == nil {
-            menu.addItem(info("Token 用量：暂无数据"))
+            menu.addItem(info("Codex用量：暂无数据"))
         } else {
-            menu.addItem(info("Token 今天 \(Fmt.tokensAbbr(usage.tokensToday?.total))"
+            menu.addItem(info("Codex用量 今天 \(Fmt.tokensAbbr(usage.tokensToday?.total))"
                 + " · 7 天 \(Fmt.tokensAbbr(usage.tokens7d?.total))"
                 + " · 30 天 \(Fmt.tokensAbbr(usage.tokens30d?.total))"))
             var tokenDetails: [(label: String, s: TokenScanner.Stats)] = []
@@ -1778,9 +1778,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if tokensStale {
-            menu.addItem(info("⚠ tokens 过期（最后成功 \(tokensLastOK.map { Fmt.dayTime($0) } ?? "--")）"))
+            menu.addItem(info("⚠ Codex用量已过期（最后成功 \(tokensLastOK.map { Fmt.dayTime($0) } ?? "--")）"))
         }
-        if let e = usage.tokensError { menu.addItem(info("Token 统计失败：\(e)")) }
+        if let e = usage.tokensError { menu.addItem(info("Codex用量统计失败：\(e)")) }
 
         // 外部用量（OpenAI 模型 · 非 Codex CLI）：Proma / Claude Code / hermes 里的
         // gpt* 等 OpenAI 系模型 token，与上方 Codex CLI 本机会话口径互补、不混算
