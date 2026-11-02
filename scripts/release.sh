@@ -35,13 +35,19 @@ git push origin "$TAG"
 echo "==> 构建（此时 git describe = ${TAG}，产物版本注入正确）"
 ./build.sh
 
-echo "==> 打包 zip（ditto，Sparkle 官方推荐；资产名固定 CodexUsage.zip，
-     供 releases/latest/download/CodexUsage.zip 稳定下载）"
+echo "==> 打包发布资产（双格式）"
+# DMG 给人下载：打开拖进 Applications 安装（MonitorControl/Stats 同款，DMG 内含
+# /Applications 符号链接做拖拽落点）；zip 给 update.sh 程序化替换（Sparkle 官方支持的
+# 更新包格式，资产名固定 CodexUsage.zip，供 releases/latest/download/ 稳定下载）
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+STAGING="$(mktemp -d)"
+trap 'rm -rf "$TMP" "$STAGING"' EXIT
+cp -R "$DIR/CodexUsage.app" "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
+hdiutil create -volname "CodexUsage ${TAG}" -srcfolder "$STAGING" -ov -format UDZO "${TMP}/CodexUsage.dmg" >/dev/null
 ditto -c -k --sequesterRsrc --keepParent "$DIR/CodexUsage.app" "${TMP}/CodexUsage.zip"
 
 echo "==> 创建 GitHub Release 并上传产物"
-gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes "${TMP}/CodexUsage.zip"
+gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes "${TMP}/CodexUsage.dmg" "${TMP}/CodexUsage.zip"
 
 echo "✅ 已发布 ${TAG}（产物 CodexUsage.zip）；已装旧版本将在下轮检查（≤2 小时）提示更新"

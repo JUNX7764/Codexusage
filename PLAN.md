@@ -269,8 +269,9 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 
 ### 发布（scripts/release.sh）
 
-- 流程：校验工作区干净且 HEAD == origin/main → 打 tag 推送 → `build.sh`（此时 describe = tag，版本注入正确）→ `ditto -c -k --sequesterRsrc --keepParent` 打包（Sparkle 官方推荐；资产名固定 `CodexUsage.zip`）→ `gh release create --generate-notes` 上传产物。
-- `releases/latest` 不含 draft / prerelease，所以只发正式版；GitHub 提供 `releases/latest/download/CodexUsage.zip` 稳定下载 URL。
+- 流程：校验工作区干净且 HEAD == origin/main → 打 tag 推送 → `build.sh`（此时 describe = tag，版本注入正确）→ 双格式打包 → `gh release create --generate-notes` 上传产物。
+- **双资产分工**（MonitorControl/Stats 发 DMG、Ice/AltTab 发 zip，成熟项目两派并存）：`CodexUsage.dmg` 给人从 Releases 页下载（内含 /Applications 符号链接做拖拽落点，`hdiutil create -format UDZO`）；`CodexUsage.zip` 给 update.sh 程序化替换（ditto 打包，Sparkle 官方支持的更新包格式）。zip 资产名固定，供 `releases/latest/download/CodexUsage.zip` 稳定下载 URL。
+- `releases/latest` 不含 draft / prerelease，所以只发正式版。
 
 ### 就地更新（.app 内置 update.sh，点击横幅唤起 Terminal 代跑）
 
