@@ -116,7 +116,8 @@ Codex 用量（plus 套餐）        // plan_type 大写展示；第二行可显
 7 天窗口：剩余 37%（重置 09-28 13:54）
 重置卡：×3                     // available_count > 0 时显示
 ─
-Codex用量 今天 12.3 万 · 7 天 87 万 · 30 天 210 万   // 格式化见 Fmt
+Codex用量
+今天 12.3 万 · 7 天 87 万 · 30 天 210 万   // 格式化见 Fmt
   ├ 今日：input 9.8 万 / output 2.5 万
   └ 近 7 天：input 71 万 / output 16 万
 （⚠ Codex用量已过期行，过期时）
@@ -126,7 +127,7 @@ Codex用量 今天 12.3 万 · 7 天 87 万 · 30 天 210 万   // 格式化见 
 退出
 ```
 
-**面板视觉与交互**：`NSPanel + NSVisualEffectView`（`.popover / behindWindow / active`），叠加 90% 不透明 `windowBackgroundColor` 底层与 16px 圆角；系统“减少透明度”开启时改为完全纯色。信息行使用 `labelColor / secondaryLabelColor`，失败与过期使用明确语义色，不再借助禁用菜单项灰字。支持状态栏图标开关、点击外部关闭、Esc 关闭与原按钮动作/快捷键；长内容进入 `NSScrollView`。
+**面板视觉与交互**：`NSPanel + NSVisualEffectView`（`.popover / behindWindow / active`），叠加 90% 不透明 `windowBackgroundColor` 底层与 16px 圆角，最大宽度 460px；系统“减少透明度”开启时改为完全纯色。信息行使用 `labelColor / secondaryLabelColor`，失败与过期使用明确语义色，不再借助禁用菜单项灰字。Codex / 外部用量均以「区块标题一行、今天/7天/30天总结一行」展示。支持状态栏图标开关、点击外部关闭、Esc 关闭与原按钮动作/快捷键；长内容进入 `NSScrollView`。
 
 **视觉预览**：`--visual-preview`（绿/红）、`--visual-preview-normal`（当前色/橙）、`--visual-preview-dark`（深色面板）、`--visual-preview-long`（长内容滚动）使用固定假数据，不联网、不写真实 `status.json`；追加 `--visual-preview-events` 自动经 `NSEvent` 验证 Esc、外部点击与 R 刷新后退出。
 

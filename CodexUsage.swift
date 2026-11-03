@@ -1572,8 +1572,8 @@ final class UsagePanelController: NSObject {
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private weak var anchorButton: NSStatusBarButton?
-    private var panelWidth: CGFloat = 540
-    private var contentWidth: CGFloat = 508
+    private var panelWidth: CGFloat = 460
+    private var contentWidth: CGFloat = 428
 
     override init() {
         panel = UsagePanel(contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 320),
@@ -1676,7 +1676,8 @@ final class UsagePanelController: NSObject {
     private func infoRow(_ item: NSMenuItem) -> NSView {
         let title = item.title
         let label = NSTextField(wrappingLabelWithString: title)
-        let isHeader = title.hasPrefix("Codex 用量") || title == "Tibo 重置动态"
+        let isHeader = title.hasPrefix("Codex 用量") || title == "Codex用量"
+            || title == "外部用量（非Codex）" || title == "Tibo 重置动态"
         let isSecondary = title.hasPrefix("  ") || title.hasPrefix("最近尝试刷新")
             || title.hasPrefix("版本 ") || (title.contains("@") && !title.contains(" "))
         label.font = .systemFont(ofSize: isHeader ? 13 : (isSecondary ? 11 : 12),
@@ -1768,7 +1769,7 @@ final class UsagePanelController: NSObject {
     private func layoutPanel(anchoredTo button: NSStatusBarButton, buttonWindow: NSWindow) {
         let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
         let visible = screen.visibleFrame
-        let desiredWidth = min(540, visible.width - 24)
+        let desiredWidth = min(460, visible.width - 24)
         if desiredWidth != panelWidth {
             panelWidth = desiredWidth
             contentWidth = desiredWidth - 32
@@ -2333,7 +2334,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if usage.tokensToday == nil && usage.tokens7d == nil && usage.tokens30d == nil {
             menu.addItem(info("Codex用量：暂无数据"))
         } else {
-            menu.addItem(info("Codex用量 今天 \(Fmt.tokensAbbr(usage.tokensToday?.total))"
+            menu.addItem(info("Codex用量"))
+            menu.addItem(info("今天 \(Fmt.tokensAbbr(usage.tokensToday?.total))"
                 + " · 7 天 \(Fmt.tokensAbbr(usage.tokens7d?.total))"
                 + " · 30 天 \(Fmt.tokensAbbr(usage.tokens30d?.total))"))
             var tokenDetails: [(label: String, s: TokenScanner.Stats)] = []
@@ -2359,7 +2361,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 外部用量（OpenAI 模型 · 非 Codex CLI）：Proma / Claude Code / hermes 里的
         // gpt* 等 OpenAI 系模型 token，与上方 Codex CLI 本机会话口径互补、不混算
         if usage.extToday != nil || usage.ext7d != nil || usage.ext30d != nil {
-            menu.addItem(info("外部用量（非Codex）今天 \(Fmt.tokensAbbr(usage.extToday?.total))"
+            menu.addItem(info("外部用量（非Codex）"))
+            menu.addItem(info("今天 \(Fmt.tokensAbbr(usage.extToday?.total))"
                 + " · 7 天 \(Fmt.tokensAbbr(usage.ext7d?.total))"
                 + " · 30 天 \(Fmt.tokensAbbr(usage.ext30d?.total))"))
             var extDetails: [(label: String, s: ExternalTokenScanner.Stats)] = []
