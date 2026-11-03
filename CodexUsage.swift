@@ -1377,7 +1377,7 @@ enum Fmt {
         guard let v = v else { return "--" }
         if v >= 1_000_000_000 { return trim(v / 1_000_000_000, 2) + "B" }
         if v >= 1_000_000 { return trim(v / 1_000_000, 2) + "M" }
-        if v >= 10_000 { return trim(v / 10_000, 1) + "K" }
+        if v >= 10_000 { return trim(v / 1_000, 1) + "K" }
         return String(format: "%.0f", v)
     }
     private static func trim(_ x: Double, _ digits: Int) -> String {
@@ -1471,22 +1471,25 @@ enum UpdateCheck {
 /// 更新检查状态：低频匿名请求 GitHub，失败静默保留旧结论（不打扰主刷新，也不弹任何东西）。
 /// 状态只在主线程读写（回调统一 dispatch 回主线程），无需加锁。
 final class UpdateChecker {
+    enum Result { case current, available, failed, unknownVersion }
     static let shared = UpdateChecker()
     private(set) var available = false
     private var etag: String?
     private var lastCheck: Date?
     private var inFlight = false
+    private var lastResult: Result = .failed
+    private var completions: [(Result) -> Void] = []
 
-    /// force=false 时按 interval 节流；completion 固定主线程回调
-    func check(force: Bool = false, completion: @escaping () -> Void = {}) {
-        guard !inFlight else { return }
+    func check(force: Bool = false, completion: @escaping (Result) -> Void = { _ in }) {
+        if inFlight { completions.append(completion); return }
         if !force, let last = lastCheck, Date().timeIntervalSince(last) < UpdateCheck.interval {
-            completion()
+            completion(lastResult)
             return
         }
+        completions.append(completion)
         inFlight = true
         var req = URLRequest(url: UpdateCheck.apiURL, timeoutInterval: 15)
-        req.cachePolicy = .reloadIgnoringLocalCacheData   // ETag/304 语义自己管，不用 URLCache
+        req.cachePolicy = .reloadIgnoringLocalCacheData
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("CodexUsage/1.0 (menubar; update check)", forHTTPHeaderField: "User-Agent")
         if let etag = etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
@@ -1496,21 +1499,205 @@ final class UpdateChecker {
                 self.inFlight = false
                 self.lastCheck = Date()
                 let http = resp as? HTTPURLResponse
-                if http?.statusCode == 304 {
-                    // 内容未变：结论保持
+                var result: Result = .failed
+                if err == nil, http?.statusCode == 304, self.etag != nil {
+                    result = UpdateCheck.normalized(BuildInfo.version) == nil ? .unknownVersion : (self.available ? .available : .current)
                 } else if err == nil, let data = data, http?.statusCode == 200,
                           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                          let tag = obj["tag_name"] as? String {
-                    self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
-                    if let e = http?.value(forHTTPHeaderField: "ETag"), !e.isEmpty { self.etag = e }
+                          let tag = obj["tag_name"] as? String,
+                          UpdateCheck.normalized(tag) != nil {
+                    if UpdateCheck.normalized(BuildInfo.version) == nil {
+                        result = .unknownVersion
+                    } else {
+                        self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
+                        result = self.available ? .available : .current
+                    }
+                    self.etag = http?.value(forHTTPHeaderField: "ETag")
                 }
-                completion()
+                self.lastResult = result
+                let callbacks = self.completions
+                self.completions.removeAll()
+                callbacks.forEach { $0(result) }
             }
         }.resume()
     }
 }
 
-// MARK: - 自定义下拉面板（NSMenuItem 仅作内容模型，不使用系统菜单材质）
+// MARK: - 自定义下拉面板（typed model + 原生 AppKit 组件）
+
+struct UsagePanelModel {
+    enum NoticeLevel {
+        case info, warning, error
+    }
+    struct Notice {
+        var text: String
+        var level: NoticeLevel
+    }
+    struct Quota {
+        var title: String
+        var resetText: String
+        var remaining: Int?
+        var notices: [Notice]
+    }
+    struct ResetRow {
+        var name: String
+        var expires: String
+        var warning: Bool
+    }
+    struct ResetSection {
+        var count: Int?
+        var emptyText: String?
+        var rows: [ResetRow]
+        var notices: [Notice]
+    }
+    struct TiboRow {
+        var text: String
+        var item: NSMenuItem?
+    }
+    struct TiboSection {
+        var rows: [TiboRow]
+        var notices: [Notice]
+    }
+    struct TokenBucket {
+        var summaryLabel: String
+        var detailLabel: String
+        var total: String
+        var input: String
+        var output: String
+    }
+    struct TokenSection {
+        var title: String
+        var accent: PanelAccent
+        var buckets: [TokenBucket]
+        var notices: [Notice]
+    }
+
+    var updateItem: NSMenuItem?
+    var title: String
+    var email: String?
+    var quotas: [Quota]
+    var resetCards: ResetSection?
+    var tibo: TiboSection?
+    var codexTokens: TokenSection
+    var externalTokens: TokenSection?
+    var notices: [Notice]
+    var lastAttempt: String
+    var version: String
+    var refreshItem: NSMenuItem
+    var loginItem: NSMenuItem
+    var quitItem: NSMenuItem
+}
+
+enum PanelAccent {
+    case codex, external
+
+    private static func rgb(_ hex: UInt32) -> NSColor {
+        NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255,
+                green: CGFloat((hex >> 8) & 0xff) / 255,
+                blue: CGFloat(hex & 0xff) / 255,
+                alpha: 1)
+    }
+
+    var color: NSColor {
+        NSColor(name: nil) { appearance in
+            let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            switch self {
+            case .codex: return Self.rgb(dark ? 0xE5A37D : 0xB46539)
+            case .external: return Self.rgb(dark ? 0x86BDE8 : 0x2B6F9E)
+            }
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .codex: return "square.stack.3d.up.fill"
+        case .external: return "square.stack.3d.up"
+        }
+    }
+}
+
+private enum PanelUI {
+    static func stack(orientation: NSUserInterfaceLayoutOrientation = .vertical,
+                      alignment: NSLayoutConstraint.Attribute = .width,
+                      spacing: CGFloat = 8) -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = orientation
+        stack.alignment = alignment
+        stack.spacing = spacing
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        return stack
+    }
+
+    static func addFullWidth(_ view: NSView, to stack: NSStackView) {
+        stack.addArrangedSubview(view)
+        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    }
+
+    static func pin(_ view: NSView, to container: NSView) {
+        NSLayoutConstraint.activate([
+            view.topAnchor.constraint(equalTo: container.topAnchor),
+            view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            view.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+    }
+
+    static func label(_ text: String, size: CGFloat = 12,
+                      weight: NSFont.Weight = .regular,
+                      color: NSColor = .labelColor,
+                      wrapping: Bool = true,
+                      monospacedDigits: Bool = false) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = monospacedDigits
+            ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
+            : NSFont.systemFont(ofSize: size, weight: weight)
+        label.textColor = color
+        label.maximumNumberOfLines = wrapping ? 0 : 1
+        label.cell?.lineBreakMode = wrapping ? .byWordWrapping : .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }
+
+    static func symbol(_ name: String, size: CGFloat = 16,
+                       color: NSColor = .secondaryLabelColor) -> NSImageView {
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+        let view = NSImageView(image: image ?? NSImage())
+        view.contentTintColor = color
+        view.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: size, weight: .regular)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.setContentHuggingPriority(.required, for: .horizontal)
+        return view
+    }
+
+    static func spacer() -> NSView {
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.setContentHuggingPriority(.init(1), for: .horizontal)
+        view.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+        return view
+    }
+
+    static func separator() -> NSBox {
+        let line = NSBox()
+        line.boxType = .separator
+        line.translatesAutoresizingMaskIntoConstraints = false
+        line.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return line
+    }
+
+    static func notices(_ notices: [UsagePanelModel.Notice]) -> [NSView] {
+        notices.map { notice in
+            let color: NSColor
+            switch notice.level {
+            case .info: color = .secondaryLabelColor
+            case .warning: color = PanelAccent.codex.color
+            case .error: color = .systemRed
+            }
+            return label(notice.text, size: 11, color: color)
+        }
+    }
+}
 
 final class PanelSolidBackgroundView: NSView {
     var opacity: CGFloat = 0.9 { didSet { needsDisplay = true } }
@@ -1527,15 +1714,28 @@ final class PanelSolidBackgroundView: NSView {
 }
 
 final class PanelActionButton: NSButton {
+    enum Style {
+        case plain, prominent, checkbox
+    }
+
     var menuItem: NSMenuItem?
+    var style: Style = .plain { didSet { needsDisplay = true } }
     private var hovered = false { didSet { needsDisplay = true } }
     override var wantsUpdateLayer: Bool { true }
 
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = (hovered
-                ? NSColor.unemphasizedSelectedContentBackgroundColor
-                : NSColor.clear).cgColor
+            switch style {
+            case .prominent:
+                let color = PanelAccent.codex.color
+                layer?.backgroundColor = color.withAlphaComponent(hovered ? 0.78 : 1).cgColor
+            case .plain:
+                layer?.backgroundColor = (hovered
+                    ? NSColor.labelColor.withAlphaComponent(0.08)
+                    : NSColor.clear).cgColor
+            case .checkbox:
+                layer?.backgroundColor = NSColor.clear.cgColor
+            }
         }
     }
     override func viewDidChangeEffectiveAppearance() {
@@ -1552,6 +1752,181 @@ final class PanelActionButton: NSButton {
     override func mouseExited(with event: NSEvent) { hovered = false }
 }
 
+class PanelCardView: NSView {
+    let contentStack = PanelUI.stack(spacing: 4)
+
+    init(padding: CGFloat = 12) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.borderWidth = 0.5
+        addSubview(contentStack)
+        NSLayoutConstraint.activate([
+            contentStack.topAnchor.constraint(equalTo: topAnchor, constant: padding),
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: padding),
+            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -padding),
+            contentStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -padding)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.09).cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+final class PanelHeaderView: NSView {
+    init(model: UsagePanelModel) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 12)
+        let icon = NSImageView(image: NSApp.applicationIconImage)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 32),
+            icon.heightAnchor.constraint(equalToConstant: 32)
+        ])
+        row.addArrangedSubview(icon)
+        let titles = PanelUI.stack(spacing: 2)
+        titles.alignment = .leading
+        let title = PanelUI.label(model.title, size: 15, weight: .semibold, wrapping: false)
+        PanelUI.addFullWidth(title, to: titles)
+        if let email = model.email, !email.isEmpty {
+            let emailLabel = PanelUI.label(email, size: 11, color: .secondaryLabelColor)
+            PanelUI.addFullWidth(emailLabel, to: titles)
+        }
+        row.addArrangedSubview(titles)
+        addSubview(row)
+        PanelUI.pin(row, to: self)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+final class QuotaProgressView: NSView {
+    var remaining: Int? { didSet { needsLayout = true; needsDisplay = true } }
+    private let fill = CALayer()
+
+    init(remaining: Int?) {
+        self.remaining = remaining
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 4
+        layer?.masksToBounds = true
+        fill.cornerRadius = 4
+        layer?.addSublayer(fill)
+        heightAnchor.constraint(equalToConstant: 8).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
+            fill.backgroundColor = RemainingColorTier(remaining: remaining).color(for: effectiveAppearance).cgColor
+        }
+    }
+    override func layout() {
+        super.layout()
+        let value = CGFloat(max(0, min(100, remaining ?? 0))) / 100
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        fill.frame = CGRect(x: 0, y: 0, width: bounds.width * value, height: bounds.height)
+        CATransaction.commit()
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+final class QuotaWindowView: NSView {
+    init(model: UsagePanelModel.Quota, compact: Bool = false) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let root = PanelUI.stack(spacing: 4)
+        let main = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+        let shortTitle = model.title.replacingOccurrences(of: "窗口", with: "")
+        let title = PanelUI.label(shortTitle, size: 12, weight: .semibold, wrapping: false)
+        title.setContentCompressionResistancePriority(.required, for: .horizontal)
+        title.widthAnchor.constraint(equalToConstant: 43).isActive = true
+        main.addArrangedSubview(title)
+        let remainingColor = NSColor(name: nil) { appearance in
+            RemainingColorTier(remaining: model.remaining).color(for: appearance)
+        }
+        let remaining = PanelUI.label(model.remaining.map { "\($0)%" } ?? "--",
+            size: 14, weight: .semibold, color: remainingColor,
+            wrapping: false, monospacedDigits: true)
+        remaining.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        remaining.setContentCompressionResistancePriority(.required, for: .horizontal)
+        main.addArrangedSubview(remaining)
+        let progress = QuotaProgressView(remaining: model.remaining)
+        progress.widthAnchor.constraint(greaterThanOrEqualToConstant: 32).isActive = true
+        progress.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        main.addArrangedSubview(progress)
+        let reset = PanelUI.label(model.resetText, size: 12, weight: .semibold,
+            wrapping: false, monospacedDigits: true)
+        reset.alignment = .right
+        reset.setContentHuggingPriority(.required, for: .horizontal)
+        reset.setContentCompressionResistancePriority(.required, for: .horizontal)
+        main.addArrangedSubview(reset)
+        PanelUI.addFullWidth(main, to: root)
+        for notice in PanelUI.notices(model.notices) {
+            PanelUI.addFullWidth(notice, to: root)
+        }
+        addSubview(root)
+        PanelUI.pin(root, to: self)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+final class ResetCardSectionView: PanelCardView {
+    init(model: UsagePanelModel.ResetSection) {
+        super.init(padding: 8)
+        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+        header.addArrangedSubview(PanelUI.symbol("calendar", size: 15, color: PanelAccent.codex.color))
+        header.addArrangedSubview(PanelUI.label("重置卡", size: 13, weight: .semibold, wrapping: false))
+        header.addArrangedSubview(PanelUI.spacer())
+        if let count = model.count {
+            header.addArrangedSubview(PanelUI.label("×\(count)", size: 12, weight: .semibold,
+                color: PanelAccent.codex.color, wrapping: false, monospacedDigits: true))
+        } else if let empty = model.emptyText {
+            header.addArrangedSubview(PanelUI.label(empty, size: 11, color: .secondaryLabelColor, wrapping: false))
+        }
+        contentStack.addArrangedSubview(header)
+        for (index, rowModel) in model.rows.enumerated() {
+            _ = index
+            let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+            let color: NSColor = rowModel.warning ? PanelAccent.codex.color : .labelColor
+            let name = PanelUI.label((rowModel.warning ? "⚠ " : "") + rowModel.name,
+                size: 12, color: color)
+            row.addArrangedSubview(name)
+            row.addArrangedSubview(PanelUI.spacer())
+            let expires = PanelUI.label(rowModel.expires, size: 11,
+                color: rowModel.warning ? PanelAccent.codex.color : .secondaryLabelColor,
+                wrapping: false, monospacedDigits: true)
+            expires.setContentHuggingPriority(.required, for: .horizontal)
+            expires.setContentCompressionResistancePriority(.required, for: .horizontal)
+            row.addArrangedSubview(expires)
+            contentStack.addArrangedSubview(row)
+        }
+        for notice in PanelUI.notices(model.notices) {
+            PanelUI.addFullWidth(notice, to: contentStack)
+        }
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 final class UsagePanel: NSPanel {
     var onCancel: (() -> Void)?
     override var canBecomeKey: Bool { true }
@@ -1561,20 +1936,26 @@ final class UsagePanel: NSPanel {
 
 final class UsagePanelController: NSObject {
     var onClose: (() -> Void)?
+    var onCheckUpdate: (() -> Void)?
+    private var codexExpanded = true
+    private var externalExpanded = true
+    private var updateMessage: String?
+    var previewWidth: CGFloat?
     var isOpen: Bool { panel.isVisible }
 
     private let panel: UsagePanel
     private let effect = NSVisualEffectView()
     private let solid = PanelSolidBackgroundView()
+    private let headerContainer = NSView()
+    private let footerContainer = NSView()
     private let scrollView = NSScrollView()
-    private let stack = NSStackView()
-    private var items: [NSMenuItem] = []
+    private let stack = PanelUI.stack(spacing: 8)
+    private var model: UsagePanelModel?
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private weak var anchorButton: NSStatusBarButton?
-    private static let maximumWidth: CGFloat = 460
+    private static let maximumWidth: CGFloat = 330
     private var panelWidth = UsagePanelController.maximumWidth
-    private var contentWidth: CGFloat { panelWidth - 32 }
 
     override init() {
         panel = UsagePanel(contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 320),
@@ -1620,20 +2001,36 @@ final class UsagePanelController: NSObject {
         solid.layer?.masksToBounds = true
         container.addSubview(solid)
 
-        scrollView.frame = container.bounds.insetBy(dx: 16, dy: 12)
-        scrollView.autoresizingMask = [.width, .height]
+        for view in [headerContainer, footerContainer] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+        }
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.scrollerStyle = .overlay
         scrollView.verticalScrollElasticity = .allowed
-        container.addSubview(scrollView)
+        scrollView.horizontalScrollElasticity = .none
 
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 4
-        stack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(headerContainer)
+        container.addSubview(scrollView)
+        container.addSubview(footerContainer)
+        NSLayoutConstraint.activate([
+            headerContainer.topAnchor.constraint(equalTo: container.topAnchor),
+            headerContainer.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            headerContainer.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: headerContainer.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: footerContainer.topAnchor),
+            footerContainer.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            footerContainer.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            footerContainer.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+
+        stack.alignment = .centerX
+        stack.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
         scrollView.documentView = stack
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
@@ -1642,91 +2039,155 @@ final class UsagePanelController: NSObject {
         ])
     }
 
-    func update(items: [NSMenuItem]) {
-        self.items = items
-        rebuildRows()
+    func update(model: UsagePanelModel) {
+        self.model = model
+        if isOpen { refreshPanelLayout() } else { rebuildContent() }
     }
 
-    private func rebuildRows() {
+    private func clear(container: NSView) {
+        for view in container.subviews { view.removeFromSuperview() }
+    }
+
+    private func installChrome(model: UsagePanelModel) {
+        clear(container: headerContainer)
+        clear(container: footerContainer)
+
+        let header = PanelHeaderView(model: model)
+        let headerLine = PanelUI.separator()
+        headerContainer.addSubview(header)
+        headerContainer.addSubview(headerLine)
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: headerContainer.topAnchor, constant: 12),
+            header.leadingAnchor.constraint(equalTo: headerContainer.leadingAnchor, constant: 16),
+            header.trailingAnchor.constraint(equalTo: headerContainer.trailingAnchor, constant: -16),
+            headerLine.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
+            headerLine.leadingAnchor.constraint(equalTo: headerContainer.leadingAnchor, constant: 16),
+            headerLine.trailingAnchor.constraint(equalTo: headerContainer.trailingAnchor, constant: -16),
+            headerLine.bottomAnchor.constraint(equalTo: headerContainer.bottomAnchor)
+        ])
+
+        let footerLine = PanelUI.separator()
+        let footer = PanelFooterView(model: model, updateMessage: updateMessage, target: self, buttonFactory: makeActionButton)
+        footerContainer.addSubview(footerLine)
+        footerContainer.addSubview(footer)
+        NSLayoutConstraint.activate([
+            footerLine.topAnchor.constraint(equalTo: footerContainer.topAnchor),
+            footerLine.leadingAnchor.constraint(equalTo: footerContainer.leadingAnchor, constant: 16),
+            footerLine.trailingAnchor.constraint(equalTo: footerContainer.trailingAnchor, constant: -16),
+            footer.topAnchor.constraint(equalTo: footerLine.bottomAnchor, constant: 8),
+            footer.leadingAnchor.constraint(equalTo: footerContainer.leadingAnchor, constant: 16),
+            footer.trailingAnchor.constraint(equalTo: footerContainer.trailingAnchor, constant: -16),
+            footer.bottomAnchor.constraint(equalTo: footerContainer.bottomAnchor, constant: -12)
+        ])
+    }
+
+    private func addContentRow(_ view: NSView) {
+        stack.addArrangedSubview(view)
+        view.widthAnchor.constraint(equalToConstant: panelWidth - 32).isActive = true
+    }
+
+    private func rebuildContent() {
+        guard let model = model else { return }
+        installChrome(model: model)
         for row in stack.arrangedSubviews {
             stack.removeArrangedSubview(row)
             row.removeFromSuperview()
         }
-        for item in items {
-            if item.isSeparatorItem {
-                let separator = NSBox()
-                separator.boxType = .separator
-                separator.translatesAutoresizingMaskIntoConstraints = false
-                separator.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
-                separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
-                stack.addArrangedSubview(separator)
-                stack.setCustomSpacing(8, after: separator)
-                continue
-            }
-            if item.isEnabled, item.action != nil {
-                stack.addArrangedSubview(actionRow(item))
-            } else {
-                let row = infoRow(item)
-                stack.addArrangedSubview(row)
-                if item.title == "Tibo 重置动态" { stack.setCustomSpacing(8, after: row) }
-            }
+        if let update = model.updateItem {
+            let button = makeActionButton(update, .prominent)
+            button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+            addContentRow(button)
         }
+        let quotaHeading = PanelUI.label("重置时间", size: 10, color: .secondaryLabelColor, wrapping: false)
+        quotaHeading.alignment = .right
+        addContentRow(quotaHeading)
+        for quota in model.quotas { addContentRow(QuotaWindowView(model: quota, compact: panelWidth < 400)) }
+        if let reset = model.resetCards {
+            addContentRow(ResetCardSectionView(model: reset))
+        }
+        if let tibo = model.tibo {
+            addContentRow(makeTiboSection(tibo))
+        }
+        addContentRow(TokenSectionView(model: model.codexTokens, expanded: codexExpanded, target: self, action: #selector(toggleCodex)))
+        if let external = model.externalTokens {
+            addContentRow(TokenSectionView(model: external, expanded: externalExpanded, target: self, action: #selector(toggleExternal)))
+        }
+        for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
     }
 
-    private func infoRow(_ item: NSMenuItem) -> NSView {
-        let title = item.title
-        let label = NSTextField(wrappingLabelWithString: title)
-        let isHeader = title.hasPrefix("Codex 用量") || title == "Codex用量"
-            || title == "外部用量（非Codex）" || title == "Tibo 重置动态"
-        let isSecondary = title.hasPrefix("  ") || title.hasPrefix("最近尝试刷新")
-            || title.hasPrefix("版本 ") || (title.contains("@") && !title.contains(" "))
-        label.font = .systemFont(ofSize: isHeader ? 13 : (isSecondary ? 11 : 12),
-                                 weight: isHeader ? .semibold : .regular)
-        if title.contains("失败") || title.hasPrefix("额度错误") {
-            label.textColor = .systemRed
-        } else if title.hasPrefix("⚠") || title.contains("已过期") {
-            label.textColor = .systemOrange
-        } else {
-            label.textColor = isSecondary ? .secondaryLabelColor : .labelColor
+    private func refreshPanelLayout() {
+        rebuildContent()
+        if let button = anchorButton, let window = button.window, isOpen {
+            layoutPanel(anchoredTo: button, buttonWindow: window)
         }
-        label.preferredMaxLayoutWidth = contentWidth
-        label.maximumNumberOfLines = 0
-        label.cell?.lineBreakMode = .byWordWrapping
-        label.toolTip = title
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return label
+    }
+    @objc private func toggleCodex() { codexExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleExternal() { externalExpanded.toggle(); refreshPanelLayout() }
+    @objc fileprivate func requestUpdateCheck() { onCheckUpdate?() }
+    func setUpdateMessage(_ message: String?) { updateMessage = message; refreshPanelLayout() }
+
+    private func makeTiboSection(_ model: UsagePanelModel.TiboSection) -> NSView {
+        let card = PanelCardView(padding: 8)
+        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+        header.addArrangedSubview(PanelUI.symbol("checkmark.circle.fill", size: 16, color: .systemGreen))
+        header.addArrangedSubview(PanelUI.label("Tibo 重置动态", size: 13, weight: .semibold, wrapping: false))
+        header.addArrangedSubview(PanelUI.spacer())
+        PanelUI.addFullWidth(header, to: card.contentStack)
+        for row in model.rows {
+            let view: NSView
+            if let item = row.item {
+                view = makeActionButton(item, .plain, title: row.text)
+            } else {
+                view = PanelUI.label(row.text, size: 12)
+            }
+            PanelUI.addFullWidth(view, to: card.contentStack)
+        }
+        for notice in PanelUI.notices(model.notices) {
+            PanelUI.addFullWidth(notice, to: card.contentStack)
+        }
+        return card
     }
 
-    private func actionRow(_ item: NSMenuItem) -> NSView {
+    private func makeActionButton(_ item: NSMenuItem, _ style: PanelActionButton.Style,
+                                  title overrideTitle: String? = nil) -> PanelActionButton {
         let button = PanelActionButton()
         button.menuItem = item
+        button.style = style
         button.target = self
         button.action = #selector(performAction(_:))
-        button.setButtonType(.momentaryChange)
-        button.isBordered = false
+        button.translatesAutoresizingMaskIntoConstraints = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 5
-        button.alignment = .left
-        let font = NSFont.systemFont(ofSize: 12, weight: item.title.hasPrefix("⬆") ? .semibold : .regular)
-        button.attributedTitle = NSAttributedString(string: item.title, attributes: [
-            .font: font, .foregroundColor: NSColor.labelColor
-        ])
-        button.cell?.wraps = true
-        button.cell?.lineBreakMode = .byWordWrapping
+        button.layer?.cornerRadius = 6
+        button.alignment = style == .prominent ? .center : .left
         button.keyEquivalent = item.keyEquivalent
         button.keyEquivalentModifierMask = []
         button.toolTip = item.toolTip
-        if item.state == .on {
-            button.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "已开启")
-            button.imagePosition = .imageLeading
-            button.contentTintColor = .labelColor
+        button.focusRingType = .none
+        let title = overrideTitle ?? item.title
+        let prominent = style == .prominent
+        let textColor: NSColor = prominent
+            ? NSColor(name: nil) { appearance in
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .black : .white
+            }
+            : .labelColor
+        button.attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular),
+            .foregroundColor: textColor
+        ])
+        if style == .checkbox {
+            button.setButtonType(.switch)
+            button.isBordered = false
+            button.state = item.state
+            button.contentTintColor = PanelAccent.codex.color
+        } else {
+            button.setButtonType(.momentaryChange)
+            button.isBordered = false
+            (button.cell as? NSButtonCell)?.highlightsBy = []
+            button.cell?.wraps = true
+            button.cell?.lineBreakMode = .byWordWrapping
+            button.heightAnchor.constraint(greaterThanOrEqualToConstant: style == .plain ? 26 : 30).isActive = true
         }
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
-        button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return button
     }
 
@@ -1740,14 +2201,27 @@ final class UsagePanelController: NSObject {
 
     /// 视觉回归专用：真实滚动到底部并确认 clip view 位置发生变化。
     func scrollToEndForPreview() -> Bool {
+        panel.contentView?.layoutSubtreeIfNeeded()
+        scrollView.layoutSubtreeIfNeeded()
         stack.layoutSubtreeIfNeeded()
         guard let document = scrollView.documentView else { return false }
         let clip = scrollView.contentView
         let maxY = max(0, document.frame.height - clip.bounds.height)
         guard maxY > 0 else { return false }
-        clip.scroll(to: NSPoint(x: 0, y: maxY))
+        let targetY = -maxY
+        clip.scroll(to: NSPoint(x: 0, y: targetY))
         scrollView.reflectScrolledClipView(clip)
-        return clip.documentVisibleRect.origin.y > 0
+        return abs(clip.bounds.origin.y - targetY) < 1
+    }
+
+    /// 固定假数据预览的本地截图，只包含面板，不读取或捕捉其他窗口。
+    func savePreviewImage(to path: String) -> Bool {
+        guard let view = panel.contentView else { return false }
+        view.layoutSubtreeIfNeeded()
+        guard let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return false }
+        view.cacheDisplay(in: view.bounds, to: image)
+        guard let data = image.representation(using: .png, properties: [:]) else { return false }
+        return (try? data.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil
     }
 
     func toggle(anchoredTo button: NSStatusBarButton) {
@@ -1770,24 +2244,37 @@ final class UsagePanelController: NSObject {
     private func layoutPanel(anchoredTo button: NSStatusBarButton, buttonWindow: NSWindow) {
         let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
         let visible = screen.visibleFrame
-        let desiredWidth = min(Self.maximumWidth, visible.width - 24)
+        let desiredWidth = min(previewWidth ?? Self.maximumWidth, visible.width - 24)
+        var frame = panel.frame
+        frame.size.width = desiredWidth
+        panel.setFrame(frame, display: false)
         if desiredWidth != panelWidth {
             panelWidth = desiredWidth
-            rebuildRows()
+            rebuildContent()
         }
+        panel.contentView?.layoutSubtreeIfNeeded()
         stack.layoutSubtreeIfNeeded()
-        let fittingHeight = max(stack.fittingSize.height, 40)
-        let height = min(fittingHeight + 24, min(720, visible.height * 0.72))
+        let chromeHeight = headerContainer.fittingSize.height + footerContainer.fittingSize.height
+        let fittingHeight = max(chromeHeight + stack.fittingSize.height, 240)
+        let maximumHeight = max(240, visible.height * 0.85)
+        let height = min(fittingHeight, maximumHeight)
         let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
         let x = max(visible.minX + 8, min(buttonRect.midX - panelWidth / 2, visible.maxX - panelWidth - 8))
         let y = max(visible.minY + 8, buttonRect.minY - height - 4)
         panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: height), display: false)
+        panel.contentView?.layoutSubtreeIfNeeded()
     }
 
     private func installMonitors() {
         removeMonitors()
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            DispatchQueue.main.async { self?.close() }
+            let location = NSEvent.mouseLocation
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let button = self.anchorButton, let window = button.window,
+                   window.convertToScreen(button.convert(button.bounds, to: nil)).contains(location) { return }
+                self.close()
+            }
         }
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in
             guard let self = self else { return event }
@@ -1814,6 +2301,103 @@ final class UsagePanelController: NSObject {
         onClose?()
     }
 }
+
+private final class TokenDetailRow: NSView {
+    init(values: [String], header: Bool, accent: PanelAccent) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
+        row.distribution = .fillEqually
+        for (index, value) in values.enumerated() {
+            let label = PanelUI.label(value, size: header ? 10 : 11,
+                weight: header ? .regular : (index == 0 ? .regular : .semibold),
+                color: header ? .secondaryLabelColor : (index == 1 ? accent.color : .labelColor),
+                wrapping: false, monospacedDigits: !header && index > 0)
+            label.alignment = index == 0 ? .left : .right
+            row.addArrangedSubview(label)
+        }
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            row.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+private final class TokenSectionView: NSView {
+    init(model: UsagePanelModel.TokenSection, expanded: Bool, target: AnyObject, action: Selector) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let root = PanelUI.stack(spacing: 3)
+        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+        header.addArrangedSubview(PanelUI.symbol(model.accent.symbol, size: 14, color: model.accent.color))
+        header.addArrangedSubview(PanelUI.label(model.title, size: 12, weight: .semibold, wrapping: false))
+        header.addArrangedSubview(PanelUI.spacer())
+        let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: expanded ? "折叠用量" : "展开用量")!, target: target, action: action)
+        toggle.isBordered = false
+        toggle.contentTintColor = .secondaryLabelColor
+        toggle.toolTip = expanded ? "折叠" : "展开"
+        toggle.setAccessibilityLabel(expanded ? "折叠\(model.title)" : "展开\(model.title)")
+        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        header.addArrangedSubview(toggle)
+        PanelUI.addFullWidth(header, to: root)
+        if expanded {
+        let tableHeader = TokenDetailRow(values: ["周期", "总量", "输入", "输出"], header: true, accent: model.accent)
+        PanelUI.addFullWidth(tableHeader, to: root)
+        for bucket in model.buckets {
+            let row = TokenDetailRow(values: [bucket.summaryLabel, bucket.total, bucket.input, bucket.output], header: false, accent: model.accent)
+            PanelUI.addFullWidth(row, to: root)
+        }
+        }
+        for notice in PanelUI.notices(model.notices) { PanelUI.addFullWidth(notice, to: root) }
+        addSubview(root)
+        PanelUI.pin(root, to: self)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+private final class PanelFooterView: NSView {
+    init(model: UsagePanelModel, updateMessage: String?, target: UsagePanelController,
+         buttonFactory: (NSMenuItem, PanelActionButton.Style, String?) -> PanelActionButton) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let root = PanelUI.stack(spacing: 8)
+        let meta = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+        meta.addArrangedSubview(PanelUI.label(model.lastAttempt, size: 11, color: .secondaryLabelColor, wrapping: false))
+        meta.addArrangedSubview(PanelUI.spacer())
+        let version = NSButton(title: model.version, target: target, action: #selector(UsagePanelController.requestUpdateCheck))
+        version.isBordered = false
+        version.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        version.contentTintColor = .secondaryLabelColor
+        version.toolTip = "点击检查更新"
+        version.setAccessibilityLabel("\(model.version)，点击检查更新")
+        meta.addArrangedSubview(version)
+        root.addArrangedSubview(meta)
+        if let message = updateMessage {
+            let label = PanelUI.label(message, size: 11, color: .secondaryLabelColor)
+            root.addArrangedSubview(label)
+        }
+
+        let actions = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+        let refresh = buttonFactory(model.refreshItem, .prominent, nil)
+        refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true
+        actions.addArrangedSubview(refresh)
+        actions.addArrangedSubview(buttonFactory(model.loginItem, .checkbox, nil))
+        actions.addArrangedSubview(PanelUI.spacer())
+        let quit = buttonFactory(model.quitItem, .plain, nil)
+        quit.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        actions.addArrangedSubview(quit)
+        root.addArrangedSubview(actions)
+        addSubview(root)
+        PanelUI.pin(root, to: self)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 
 // MARK: - App
 
@@ -1854,6 +2438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
         panelController.onClose = { [weak self] in self?.panelDidClose() }
+        panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
         if visualPreview {
             configureVisualPreview()
             return
@@ -1878,37 +2463,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 本地视觉验收：固定数据、无网络/定时器，也不覆盖真实 status.json。
-    /// 默认展示绿/红；--visual-preview-normal 展示当前色/橙。
+    /// 默认展示绿/红；normal 展示当前色/橙；states / empty 覆盖异常与空数据。
     private func configureVisualPreview() {
-        let normal = CommandLine.arguments.contains("--visual-preview-normal")
+        let arguments = CommandLine.arguments
+        let normal = arguments.contains("--visual-preview-normal")
+        if arguments.contains("--visual-preview-narrow") {
+            panelController.previewWidth = 320
+        }
         let now = Date()
         usage.fiveHour = QuotaWindow(usedPercent: normal ? 40 : 10, reset: now + 18_000)
         usage.sevenDay = QuotaWindow(usedPercent: normal ? 80 : 90, reset: now + 604_800)
         usage.planType = "plus"
         usage.email = "preview@example.com"
-        usage.resetCards = [ResetCard(expires: now + 172_800, name: "全额重置卡")]
-        if CommandLine.arguments.contains("--visual-preview-long") {
+        usage.resetCards = [
+            ResetCard(expires: now + 172_800, name: "全额重置卡"),
+            ResetCard(expires: now + 28 * 86_400, name: "全额重置卡"),
+            ResetCard(expires: now + 29 * 86_400, name: "全额重置卡")
+        ]
+        if arguments.contains("--visual-preview-long") {
             usage.resetCards = (0..<30).map {
                 ResetCard(expires: now + TimeInterval($0 + 3) * 86_400, name: "全额重置卡 \($0 + 1)")
             }
         }
+        usage.tiboEvents = [
+            TiboEvent(id: "preview-announced", type: "direct_reset", status: "announced",
+                title: "Codex 额度重置预告", estimateLabel: "北京时间 11月4日 15:00–20:00",
+                estimateFrom: now + 86_400, estimateThrough: now + 90_000,
+                presentationStatus: nil, occurredAt: nil, link: "https://aihot.news/codex-reset"),
+            TiboEvent(id: "preview-confirmed", type: "reset_credit", status: "confirmed",
+                title: "重置卡已发放", estimateLabel: nil, estimateFrom: nil, estimateThrough: nil,
+                presentationStatus: nil, occurredAt: now - 86_400, link: "https://aihot.news/codex-reset")
+        ]
         usage.tokensToday = TokenScanner.Stats(input: 1_200_000, output: 300_000, total: 1_500_000, files: 3)
         usage.tokens7d = TokenScanner.Stats(input: 8_000_000, output: 2_000_000, total: 10_000_000, files: 20)
         usage.tokens30d = TokenScanner.Stats(input: 24_000_000, output: 6_000_000, total: 30_000_000, files: 60)
-        usage.extToday = ExternalTokenScanner.Stats(input: 500_000, output: 100_000)
-        usage.ext7d = ExternalTokenScanner.Stats(input: 3_000_000, output: 600_000)
-        usage.ext30d = ExternalTokenScanner.Stats(input: 9_000_000, output: 1_800_000)
+        usage.extToday = ExternalTokenScanner.Stats(input: 3_350_000, output: 20_000)
+        usage.ext7d = ExternalTokenScanner.Stats(input: 64_710_000, output: 230_000)
+        usage.ext30d = ExternalTokenScanner.Stats(input: 653_870_000, output: 3_480_000)
         fiveHourLastOK = now
         sevenDayLastOK = now
         tokensLastOK = now
         resetCardsLastOK = now
+        tiboLastOK = now
         extLastOK = now
+        lastAttemptAt = now
+
+        if arguments.contains("--visual-preview-empty") {
+            usage.fiveHour = nil
+            usage.sevenDay = nil
+            usage.resetCards = []
+            usage.tiboEvents = []
+            usage.tokensToday = nil
+            usage.tokens7d = nil
+            usage.tokens30d = nil
+            usage.extToday = nil
+            usage.ext7d = nil
+            usage.ext30d = nil
+        } else if arguments.contains("--visual-preview-states") {
+            usage.fiveHour = QuotaWindow(usedPercent: 65, reset: now + 18_000)
+            usage.sevenDay = nil
+            usage.fiveHourError = "网络请求超时"
+            usage.sevenDayError = "凭证已过期"
+            usage.quotaError = "额度服务暂不可用"
+            usage.resetCardsError = "明细接口暂不可用"
+            usage.tiboError = "AIHOT 暂不可用"
+            usage.tokensError = "会话目录读取失败"
+            usage.extError = "外部会话来源不可读"
+            usage.tokensZstdMissing = true
+            fiveHourLastOK = now - 3_600
+            sevenDayLastOK = nil
+            tokensLastOK = now - 3_600
+            resetCardsLastOK = now - 3_600
+            tiboLastOK = now - 3_600
+            extLastOK = now - 3_600
+        }
+
         rebuildMenu()
         renderBar()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             guard let self = self, let button = self.statusItem.button else { return }
             self.panelController.toggle(anchoredTo: button)
-            if CommandLine.arguments.contains("--visual-preview-events") {
+            let outputPrefix = "--visual-preview-output="
+            if let argument = arguments.first(where: { $0.hasPrefix(outputPrefix) }) {
+                let path = String(argument.dropFirst(outputPrefix.count))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    if arguments.contains("--visual-preview-scroll-end") {
+                        _ = self.panelController.scrollToEndForPreview()
+                    }
+                    guard self.panelController.savePreviewImage(to: path) else {
+                        fputs("CodexUsage visual preview: failed to save image\n", stderr)
+                        exit(1)
+                    }
+                    print("CodexUsage visual preview image: \(path)")
+                    exit(0)
+                }
+            } else if arguments.contains("--visual-preview-events") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     self.runVisualPanelEventTest()
                 }
@@ -1926,6 +2575,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panelController.toggle(anchoredTo: button)
         }
         guard panelController.isOpen else { return fail("preview panel did not open") }
+        guard let statusButton = statusItem.button else { return fail("status button missing") }
+        statusButton.performClick(nil)
+        guard !panelController.isOpen else { return fail("status button did not close panel") }
+        statusButton.performClick(nil)
+        guard panelController.isOpen else { return fail("status button did not reopen panel") }
         if CommandLine.arguments.contains("--visual-preview-long")
             && !panelController.scrollToEndForPreview() {
             return fail("long content did not scroll")
@@ -1959,7 +2613,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.postEvent(refresh, atStart: false)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     guard !self.panelController.isOpen else { return fail("refresh action did not close panel") }
-                    print("CodexUsage visual event test: PASS (Escape, outside click, refresh action)")
+                    print("CodexUsage visual event test: PASS (status button toggle, Escape, outside click, refresh action)")
                     exit(0)
                 }
             }
@@ -2220,187 +2874,191 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // 下拉面板（PLAN §4 自上而下）
+    // 下拉面板（PLAN §4 自上而下）：typed model 与网络/扫描数据在同一渲染入口组装
     private func rebuildMenu() {
-        let menu = NSMenu()
-
-        // 更新横幅（最上方）：GitHub 发布了更高版本的 Release 才出现（与 commit 动态无关）；
-        // 点击运行 .app 内置 update.sh 从 Release 下载替换，内置脚本缺失时退化为打开 Releases 页
-        if UpdateChecker.shared.available {
-            let banner = NSMenuItem(title: "⬆ 新版本可用，点击更新", action: #selector(onUpdateApp), keyEquivalent: "")
-            banner.target = self
-            menu.addItem(banner)
-            menu.addItem(.separator())
+        func notice(_ text: String, _ level: UsagePanelModel.NoticeLevel = .info) -> UsagePanelModel.Notice {
+            UsagePanelModel.Notice(text: text, level: level)
         }
 
-        func info(_ title: String) -> NSMenuItem {
-            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            return item
+        var updateItem: NSMenuItem?
+        let showPreviewUpdate = visualPreview && CommandLine.arguments.contains("--visual-preview-update")
+        if UpdateChecker.shared.available || showPreviewUpdate {
+            let item = NSMenuItem(title: "⬆ 新版本可用，点击更新", action: #selector(onUpdateApp), keyEquivalent: "")
+            item.target = self
+            updateItem = item
         }
 
-        menu.addItem(info("Codex 用量"
-            + (usage.planType.map { "（\($0.uppercased()) 套餐）" } ?? "")))
-        if let email = usage.email, !email.isEmpty {
-            menu.addItem(info(email))
-        }
-        menu.addItem(.separator())
-
-        func windowLine(_ label: String, _ w: QuotaWindow?, isFive: Bool) -> String {
+        func quota(_ label: String, _ window: QuotaWindow?, isFive: Bool) -> UsagePanelModel.Quota {
             let last = isFive ? fiveHourLastOK : sevenDayLastOK
             let stale = isFive ? fiveHourStale : sevenDayStale
             let error = isFive ? usage.fiveHourError : usage.sevenDayError
-            var s = "\(label)："
-            if let w = w {
-                s += "剩余 \(Fmt.remainingPct(w.usedPercent))"
-                if let r = w.reset { s += "（重置 \(Fmt.dayTime(r))）" }
-            } else { s += "暂无数据" }
-            if stale { s += " · ⚠️ 已过期" }
-            if let error = error { s += " · 刷新失败：\(error)" }
-            if let last = last, stale || error != nil { s += " · 最后成功 \(Fmt.dayTime(last))" }
-            return s
+            var resetText = "暂无数据"
+            if let window = window {
+                resetText = window.reset.map { Fmt.dayTime($0) } ?? "时间未知"
+            }
+            var notices: [UsagePanelModel.Notice] = []
+            if stale {
+                var text = "⚠ 已过期"
+                if let last = last { text += " · 最后成功 \(Fmt.dayTime(last))" }
+                notices.append(notice(text, .warning))
+            }
+            if let error = error {
+                var text = "刷新失败：\(error)"
+                if !stale, let last = last { text += " · 最后成功 \(Fmt.dayTime(last))" }
+                notices.append(notice(text, .error))
+            }
+            return UsagePanelModel.Quota(title: label, resetText: resetText,
+                remaining: Fmt.remaining(window?.usedPercent), notices: notices)
         }
-        menu.addItem(info(windowLine("5 小时窗口", usage.fiveHour, isFive: true)))
-        menu.addItem(info(windowLine("7 天窗口", usage.sevenDay, isFive: false)))
+        let quotas = [
+            quota("5 小时窗口", usage.fiveHour, isFive: true),
+            quota("7 天窗口", usage.sevenDay, isFive: false)
+        ]
 
-        // 重置卡（额度重置卡）：独立成区两侧加横条（沿用原"重置卡：×N"的分区）；
-        // 有效卡按过期时间升序，≤72 小时临期加 ⚠️ 前缀（展示格式与 GlmUsage 逐行对齐）
-        func cardLine(_ name: String, _ d: Date) -> String {
-            let warn = d.timeIntervalSinceNow <= 72 * 3600
-            return (warn ? "⚠️ " : "  ") + "\(name) · \(Fmt.expires(d)) 过期"
-        }
-        var cardLines: [String] = []
+        var resetSection: UsagePanelModel.ResetSection?
         if let storedCards = usage.resetCards {
             let cards = CodexFreshness.availableCards(storedCards, now: Date())
-            if cards.isEmpty {
-                cardLines = ["重置卡：暂无可用"]
-            } else {
-                cardLines = ["重置卡：×\(cards.count)"]
-                cardLines += cards.map { cardLine($0.name, $0.expires) }
+            let rows = cards.map { card in
+                UsagePanelModel.ResetRow(name: card.name,
+                    expires: "\(Fmt.expires(card.expires)) 过期",
+                    warning: card.expires.timeIntervalSinceNow <= 72 * 3600)
             }
-        } else if let e = usage.resetCardsError {
-            // 明细失败：wham/usage 的 available_count > 0 时兜底显示数量，否则整区报错
-            if let n = usage.resetCredits, n > 0 {
-                cardLines = ["重置卡：×\(n)（明细获取失败）"]
+            resetSection = UsagePanelModel.ResetSection(
+                count: cards.isEmpty ? nil : cards.count,
+                emptyText: cards.isEmpty ? "暂无可用" : nil,
+                rows: rows, notices: [])
+        } else if let error = usage.resetCardsError {
+            if let count = usage.resetCredits, count > 0 {
+                resetSection = UsagePanelModel.ResetSection(count: count, emptyText: nil,
+                    rows: [], notices: [notice("明细获取失败：\(error)", .error)])
             } else {
-                let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
-                cardLines = ["重置卡获取失败：\(short)（Codex 登录态可能过期，运行 codex login 后重试）"]
+                let short = error.count > 60 ? String(error.prefix(60)) + "…" : error
+                resetSection = UsagePanelModel.ResetSection(count: nil, emptyText: nil, rows: [],
+                    notices: [notice("重置卡获取失败：\(short)（Codex 登录态可能过期，运行 codex login 后重试）", .error)])
             }
         }
-        if resetCardsStale {
-            cardLines.append("⚠️ 重置卡数据已过期 · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")")
+        if resetSection != nil {
+            if resetCardsStale {
+                resetSection?.notices.append(notice(
+                    "⚠️ 重置卡数据已过期 · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")", .warning))
+            }
+            if let error = usage.resetCardsError, usage.resetCards != nil {
+                resetSection?.notices.append(notice(
+                    "重置卡刷新失败：\(error) · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")", .error))
+            }
         }
-        if let e = usage.resetCardsError, usage.resetCards != nil {
-            cardLines.append("重置卡刷新失败：\(e) · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")")
-        }
-        if !cardLines.isEmpty {
-            menu.addItem(.separator())
-            for l in cardLines { menu.addItem(info(l)) }
-        }
-        menu.addItem(.separator())
 
-        // Tibo 重置动态（数据源 AIHOT）：事件行点击跳最新原帖；预估窗口文案来自接口，
-        // 语义是原帖预告的估计（时间经过不自动完成），因此呈现为「预估/待确认」而非倒计时
-        var tiboItems: [NSMenuItem] = []
+        var tiboSection: UsagePanelModel.TiboSection?
         if let events = usage.tiboEvents {
-            tiboItems.append(info("Tibo 重置动态"))
-            for row in TiboDisplay.rows(events, now: Date()) {
-                let item = NSMenuItem(title: row.text, action: nil, keyEquivalent: "")
-                if let url = Fmt.webURL(row.link) {   // 第三方链接仅放行 http/https
-                    item.action = #selector(openLink(_:))
-                    item.target = self
-                    item.representedObject = url
-                } else {
-                    item.isEnabled = false
+            let rows = TiboDisplay.rows(events, now: Date()).map { row -> UsagePanelModel.TiboRow in
+                guard let url = Fmt.webURL(row.link) else {
+                    return UsagePanelModel.TiboRow(text: row.text, item: nil)
                 }
-                tiboItems.append(item)
+                let item = NSMenuItem(title: row.text, action: #selector(openLink(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = url
+                return UsagePanelModel.TiboRow(text: row.text, item: item)
             }
+            tiboSection = UsagePanelModel.TiboSection(rows: rows, notices: [])
+        } else if let error = usage.tiboError {
+            let short = error.count > 60 ? String(error.prefix(60)) + "…" : error
+            tiboSection = UsagePanelModel.TiboSection(rows: [],
+                notices: [notice("Tibo 重置动态获取失败：\(short)", .error)])
+        }
+        if tiboSection != nil {
             if tiboStale {
-                tiboItems.append(info("⚠️ Tibo 动态已过期 · 最后成功 \(tiboLastOK.map { Fmt.dayTime($0) } ?? "--")"))
+                tiboSection?.notices.append(notice(
+                    "⚠️ Tibo 动态已过期 · 最后成功 \(tiboLastOK.map { Fmt.dayTime($0) } ?? "--")", .warning))
             }
-            if let e = usage.tiboError {
-                tiboItems.append(info("Tibo 刷新失败：\(e) · 最后成功 \(tiboLastOK.map { Fmt.dayTime($0) } ?? "--")"))
+            if let error = usage.tiboError, usage.tiboEvents != nil {
+                tiboSection?.notices.append(notice(
+                    "Tibo 刷新失败：\(error) · 最后成功 \(tiboLastOK.map { Fmt.dayTime($0) } ?? "--")", .error))
             }
-        } else if let e = usage.tiboError {
-            let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
-            tiboItems.append(info("Tibo 重置动态获取失败：\(short)"))
-        }
-        if !tiboItems.isEmpty {
-            for i in tiboItems { menu.addItem(i) }
-            menu.addItem(.separator())
         }
 
+        func bucket(_ summary: String, _ detail: String,
+                    total: Double?, input: Double?, output: Double?) -> UsagePanelModel.TokenBucket {
+            UsagePanelModel.TokenBucket(summaryLabel: summary, detailLabel: detail,
+                total: Fmt.tokensAbbr(total), input: Fmt.tokensAbbr(input), output: Fmt.tokensAbbr(output))
+        }
+        let codexBuckets = [
+            bucket("今天", "今天", total: usage.tokensToday?.total,
+                input: usage.tokensToday?.input, output: usage.tokensToday?.output),
+            bucket("7 天", "近 7 天", total: usage.tokens7d?.total,
+                input: usage.tokens7d?.input, output: usage.tokens7d?.output),
+            bucket("30 天", "近 30 天", total: usage.tokens30d?.total,
+                input: usage.tokens30d?.input, output: usage.tokens30d?.output)
+        ]
+        var codexNotices: [UsagePanelModel.Notice] = []
         if usage.tokensToday == nil && usage.tokens7d == nil && usage.tokens30d == nil {
-            menu.addItem(info("Codex用量：暂无数据"))
-        } else {
-            menu.addItem(info("Codex用量"))
-            menu.addItem(info("今天 \(Fmt.tokensAbbr(usage.tokensToday?.total))"
-                + " · 7 天 \(Fmt.tokensAbbr(usage.tokens7d?.total))"
-                + " · 30 天 \(Fmt.tokensAbbr(usage.tokens30d?.total))"))
-            var tokenDetails: [(label: String, s: TokenScanner.Stats)] = []
-            if let s = usage.tokensToday { tokenDetails.append(("今日", s)) }
-            if let s = usage.tokens7d { tokenDetails.append(("近 7 天", s)) }
-            if let s = usage.tokens30d { tokenDetails.append(("近 30 天", s)) }
-            for (i, d) in tokenDetails.enumerated() {
-                let branch = i < tokenDetails.count - 1 ? "├" : "└"
-                menu.addItem(info("  \(branch) \(d.label)：input \(Fmt.tokensAbbr(d.s.input))"
-                    + " / output \(Fmt.tokensAbbr(d.s.output))"))
-            }
+            codexNotices.append(notice("暂无数据"))
         }
-
         if tokensStale {
-            menu.addItem(info("⚠ Codex用量已过期（最后成功 \(tokensLastOK.map { Fmt.dayTime($0) } ?? "--")）"))
+            codexNotices.append(notice(
+                "⚠ Codex用量已过期（最后成功 \(tokensLastOK.map { Fmt.dayTime($0) } ?? "--")）", .warning))
         }
-        if let e = usage.tokensError { menu.addItem(info("Codex用量统计失败：\(e)")) }
+        if let error = usage.tokensError {
+            codexNotices.append(notice("Codex用量统计失败：\(error)", .error))
+        }
         if usage.tokensZstdMissing {
-            menu.addItem(info("⚠ 未安装 zstd，压缩归档会话未计入（brew install zstd）"))
+            codexNotices.append(notice("⚠ 未安装 zstd，压缩归档会话未计入（brew install zstd）", .warning))
         }
-        if let e = usage.extError { menu.addItem(info("外部用量统计失败：\(e)")) }
+        let codexSection = UsagePanelModel.TokenSection(title: "Codex用量", accent: .codex,
+            buckets: codexBuckets, notices: codexNotices)
 
-        // 外部用量（OpenAI 模型 · 非 Codex CLI）：Proma / Claude Code / hermes 里的
-        // gpt* 等 OpenAI 系模型 token，与上方 Codex CLI 本机会话口径互补、不混算
-        if usage.extToday != nil || usage.ext7d != nil || usage.ext30d != nil {
-            menu.addItem(info("外部用量（非Codex）"))
-            menu.addItem(info("今天 \(Fmt.tokensAbbr(usage.extToday?.total))"
-                + " · 7 天 \(Fmt.tokensAbbr(usage.ext7d?.total))"
-                + " · 30 天 \(Fmt.tokensAbbr(usage.ext30d?.total))"))
-            var extDetails: [(label: String, s: ExternalTokenScanner.Stats)] = []
-            if let s = usage.extToday { extDetails.append(("今日", s)) }
-            if let s = usage.ext7d { extDetails.append(("近 7 天", s)) }
-            if let s = usage.ext30d { extDetails.append(("近 30 天", s)) }
-            for (i, d) in extDetails.enumerated() {
-                let branch = i < extDetails.count - 1 ? "├" : "└"
-                menu.addItem(info("  \(branch) \(d.label)：input \(Fmt.tokensAbbr(d.s.input))"
-                    + " / output \(Fmt.tokensAbbr(d.s.output))"))
+        var externalSection: UsagePanelModel.TokenSection?
+        if usage.extToday != nil || usage.ext7d != nil || usage.ext30d != nil || usage.extError != nil {
+            let buckets = [
+                bucket("今天", "今天", total: usage.extToday?.total,
+                    input: usage.extToday?.input, output: usage.extToday?.output),
+                bucket("7 天", "近 7 天", total: usage.ext7d?.total,
+                    input: usage.ext7d?.input, output: usage.ext7d?.output),
+                bucket("30 天", "近 30 天", total: usage.ext30d?.total,
+                    input: usage.ext30d?.input, output: usage.ext30d?.output)
+            ]
+            var notices: [UsagePanelModel.Notice] = []
+            if let error = usage.extError {
+                notices.append(notice("外部用量统计失败：\(error)", .error))
             }
             if extStale {
-                menu.addItem(info("⚠ 外部用量已过期（最后成功 \(extLastOK.map { Fmt.dayTime($0) } ?? "--")）"))
+                notices.append(notice(
+                    "⚠ 外部用量已过期（最后成功 \(extLastOK.map { Fmt.dayTime($0) } ?? "--")）", .warning))
             }
+            externalSection = UsagePanelModel.TokenSection(title: "外部用量（非Codex）", accent: .external,
+                buckets: buckets, notices: notices)
         }
 
-        if let e = usage.quotaError {
-            menu.addItem(info("额度错误：\(e)"))
+        var globalNotices: [UsagePanelModel.Notice] = []
+        if let error = usage.quotaError {
+            globalNotices.append(notice("额度错误：\(error)", .error))
         }
 
-        menu.addItem(.separator())
-        menu.addItem(info("最近尝试刷新 \(Fmt.time(lastAttemptAt))"))
-        menu.addItem(.separator())
         let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(onRefresh), keyEquivalent: "r")
         refreshItem.target = self
-        menu.addItem(refreshItem)
-
         let loginItem = NSMenuItem(title: "开机自启", action: #selector(onToggleLogin), keyEquivalent: "")
         loginItem.target = self
         loginItem.state = isLoginItemEnabled() ? .on : .off
-        menu.addItem(loginItem)
+        let quitItem = NSMenuItem(title: "退出", action: #selector(onQuit), keyEquivalent: "q")
+        quitItem.target = self
 
-        menu.addItem(.separator())
-        menu.addItem(info("版本 \(BuildInfo.version)"))
-        let quit = NSMenuItem(title: "退出", action: #selector(onQuit), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
-
-        panelController.update(items: menu.items)
+        let displayVersion = visualPreview && CommandLine.arguments.contains("--visual-preview-narrow")
+            ? "v1.0.4-12-g1234567" : BuildInfo.version
+        let model = UsagePanelModel(
+            updateItem: updateItem,
+            title: "Codex 用量" + (usage.planType.map { "（\($0.uppercased()) 套餐）" } ?? ""),
+            email: usage.email,
+            quotas: quotas,
+            resetCards: resetSection,
+            tibo: tiboSection,
+            codexTokens: codexSection,
+            externalTokens: externalSection,
+            notices: globalNotices,
+            lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))",
+            version: "版本 \(displayVersion)",
+            refreshItem: refreshItem,
+            loginItem: loginItem,
+            quitItem: quitItem)
+        panelController.update(model: model)
     }
 
     @objc private func onRefresh() { refresh(tokens: true, manual: true) }
@@ -2408,7 +3066,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤30s 也会兜底重建）
     private func checkForUpdate() {
         guard !visualPreview else { return }
-        UpdateChecker.shared.check { [weak self] in self?.updateUI() }
+        UpdateChecker.shared.check { [weak self] _ in self?.updateUI() }
+    }
+
+    private func manualUpdateCheck() {
+        panelController.setUpdateMessage("正在检查更新…")
+        guard !visualPreview else {
+            panelController.setUpdateMessage("预览模式：未联网检查更新")
+            return
+        }
+        UpdateChecker.shared.check(force: true) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .current: self.panelController.setUpdateMessage("当前已是最新版本")
+            case .available: self.panelController.setUpdateMessage("发现新版本，请点击上方更新提示")
+            case .failed: self.panelController.setUpdateMessage("检查失败，请稍后重试")
+            case .unknownVersion: self.panelController.setUpdateMessage("当前版本未知，无法比较")
+            }
+            self.rebuildMenu()
+        }
     }
 
     @objc private func openLink(_ sender: NSMenuItem) {
@@ -2487,6 +3163,9 @@ enum CodexOfflineRegression {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
             let now = Date(timeIntervalSince1970: 1_800_000_000)
+            try expect(Fmt.tokensAbbr(20_000) == "20K" && Fmt.tokensAbbr(300_000) == "300K"
+                       && Fmt.tokensAbbr(1_500_000) == "1.5M" && Fmt.tokensAbbr(nil) == "--",
+                       "token abbreviation scale or missing value is incorrect")
 
             try expect(CodexNumber.finite(Double.nan) == nil, "NaN accepted as a quota value")
             try expect(CodexNumber.finite(Double.infinity) == nil, "infinity accepted as a quota value")

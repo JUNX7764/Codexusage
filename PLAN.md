@@ -107,29 +107,16 @@ body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_to
 
 **数据新鲜度标注（v1 内置，重要）**：5H、7D、token 统计、重置卡分别记录**最后成功时间**。每个项目失败时保留旧值、保留原成功时间，并显示当前错误；5H/7D 超过 10 分钟、tokens 超过 30 分钟、重置卡超过 15 分钟未成功即标 ⚠。菜单栏 5H/7D 行分别标注各自状态。菜单“最近尝试刷新”显示请求开始时间，状态文件使用同一口径的 `lastAttemptAt`。
 
-**下拉面板**（自上而下；`NSMenuItem` 仅作内容模型，实际由自定义 `NSPanel` 呈现）：
+**下拉面板**：`UsagePanelModel` 统一承载展示数据与状态，`NSMenuItem` 仅承载可执行 action；`UsagePanelController` 使用原生 AppKit 组件渲染。信息顺序为更新横幅、标题/套餐/账户、5H/7D 额度、重置卡、Tibo 重置动态、Codex 用量、外部用量、刷新与版本、操作区。
 
-```
-Codex 用量（plus 套餐）        // plan_type 大写展示；第二行可显示 email（解析到时）
-─
-5 小时窗口：剩余 86%（重置 09-27 03:31）
-7 天窗口：剩余 37%（重置 09-28 13:54）
-重置卡：×3                     // available_count > 0 时显示
-─
-Codex用量
-今天 12.3 万 · 7 天 87 万 · 30 天 210 万   // 格式化见 Fmt
-  ├ 今日：input 9.8 万 / output 2.5 万
-  └ 近 7 天：input 71 万 / output 16 万
-（⚠ Codex用量已过期行，过期时）
-（错误行：quota/tokens 最后一条错误，有才显示）
-─
-立即刷新
-退出
-```
+- 额度窗口显示剩余百分比、重置时间与剩余量进度条；进度按 `100 - usedPercent` 绘制，百分比和进度条共用 `RemainingColorTier` 四档语义色。未知值显示「暂无数据」与空轨道。
+- 重置卡与 Tibo 使用独立分组卡片；卡名、到期时间、事件链接、临期/失败/过期状态均保留在所属区块。
+- Codex 用量与外部用量使用同款组件：今天 / 7 天 / 30 天三行表格，每行包含总量、输入和输出。数字使用等宽数字字形；Codex 橙色与外部蓝色只承担区块识别。
+- 空数据、失败、数据过期、最后成功时间与 `zstd` 缺失提示归入对应区块，不使用禁用菜单项灰字。
 
-**面板视觉与交互**：`NSPanel + NSVisualEffectView`（`.popover / behindWindow / active`），叠加 90% 不透明 `windowBackgroundColor` 底层与 16px 圆角，最大宽度 460px；系统“减少透明度”开启时改为完全纯色。信息行使用 `labelColor / secondaryLabelColor`，失败与过期使用明确语义色，不再借助禁用菜单项灰字。Codex / 外部用量均以「区块标题一行、今天/7天/30天总结一行」展示。支持状态栏图标开关、点击外部关闭、Esc 关闭与原按钮动作/快捷键；长内容进入 `NSScrollView`。
+**面板视觉与交互**：`NSPanel + NSVisualEffectView`（`.popover / behindWindow / active`），叠加 90% 不透明 `windowBackgroundColor` 底层与 16px 圆角，目标宽度 330pt（窄屏自适应）；系统“减少透明度”开启时改为完全纯色。卡片使用中性 surface 与 hairline separator，布局采用 4px 网格。最大高度为可用屏幕的 85%；标题与两行底部操作区固定，中间内容进入 `NSScrollView`；底部第一行显示最近尝试刷新与版本，第二行显示立即刷新、开机自启和退出。支持状态栏图标开关、点击外部关闭、Esc 关闭、`R` 刷新、`Q` 退出与 Tibo 链接。两个用量区可分别折叠，启动默认展开，折叠后错误提示仍显示。点击版本号强制检查 Release，面板内反馈检查中、最新、可更新、失败或版本未知。
 
-**视觉预览**：`--visual-preview`（绿/红）、`--visual-preview-normal`（当前色/橙）、`--visual-preview-dark`（深色面板）、`--visual-preview-long`（长内容滚动）使用固定假数据，不联网、不写真实 `status.json`；追加 `--visual-preview-events` 自动经 `NSEvent` 验证 Esc、外部点击与 R 刷新后退出。
+**视觉预览**：`--visual-preview`（绿/红）、`--visual-preview-normal`（当前色/橙）、`--visual-preview-dark`（深色）、`--visual-preview-long`（长内容）、`--visual-preview-states`（失败/过期）、`--visual-preview-empty`（空数据）、`--visual-preview-update`（更新横幅）、`--visual-preview-narrow`（320px 与长版本号）使用固定假数据，不联网、不写真实 `status.json`。`--visual-preview-output=<path>` 仅捕捉面板并保存 PNG，可搭配 `--visual-preview-scroll-end` 检查底部；追加 `--visual-preview-events` 自动经 `NSEvent` 验证 Esc、外部点击与 R 刷新后退出。
 
 **--once 自检模式**：拉一次额度 + 全量扫一次 token，打印摘要后退出（照 GlmUsage 的 --once 风格）。**输出严禁包含任何 token/密钥值。**
 
@@ -163,19 +150,15 @@ Headers: 与 §1 的 wham/usage 完全相同（Bearer access_token + OpenAI-Beta
 - 有效卡：`status` 为空或不在 `["redeemed","used","consumed","expired","unavailable"]`，且 `expires_at > now`。按 `expires_at` 升序展示。
 - 卡名：`title` 含 "Full reset" → 展示为 `全额重置卡`；否则用 title 原文。
 
-### 展示格式（对齐 GlmUsage rebuildMenu，替换现有"重置卡：×N"单行）
+### 展示格式
 
-```
-重置卡（额度重置）：×3                          // 汇总行；位置在 7 天窗口行之后、Token 区之前
-  ⚠️ 全额重置卡 · 2026-10-04 13:13 过期        // ≤72 小时临期 → "⚠️ " 前缀；非临期 → 两空格缩进
-  全额重置卡 · 2026-10-04 13:13 过期
-```
+重置卡使用独立分组卡片：标题行显示「重置卡」与 `×N`，有效卡逐行展示名称与到期时间，≤72 小时临期使用 ⚠ 与橙色语义提示。
 
-- 空列表 → `重置卡（额度重置）：暂无可用`
+- 空列表 → 标题行右侧显示「暂无可用」。
 - 缺少列表容器、列表类型错误或卡记录字段损坏均算明细失败，保留旧卡和原成功时间；仅合法空数组表示暂无可用卡。
-- 明细端点失败但 wham/usage 的 available_count > 0 → `重置卡（额度重置）：×N（明细获取失败）`
-- 两者都失败 → `重置卡获取失败：<截断60字>`（GlmUsage 同款句式；提示语用 Codex 语境，不要提 ZCode）
-- 时间格式照搬 GlmUsage 的 `Fmt.expires`：今天 → `今天 HH:mm`；明天 → `明天 HH:mm`；否则 `yyyy-MM-dd HH:mm`（本地时区）。
+- 明细端点失败但 wham/usage 的 available_count > 0 → 保留 `×N` 汇总并在区块内显示明细失败。
+- 两者都失败 → 区块内显示截断后的错误与 Codex 登录提示。
+- 时间格式使用 `Fmt.expires`：今天 → `今天 HH:mm`；明天 → `明天 HH:mm`；否则 `yyyy-MM-dd HH:mm`（本地时区）。
 
 ### 行为细节
 
@@ -251,7 +234,7 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 
 ### 展示与行为
 
-- Token 区块之后新增：`外部用量（非Codex）今天 X · 7 天 Y · 30 天 Z` + 今日/近 7 天/近 30 天 input/output 树状明细（与 Token 区块同款式）。
+- Token 区块之后使用「外部用量（非Codex）」独立区块：今天 / 7 天 / 30 天总量、输入、输出表格，组件和数字口径同 Codex 用量；失败与过期提示归入本区块。
 - 刷新周期与 token 统计同（每 5 分钟，同一 utility 块串行执行）；纯本地扫描、无失败面，每次推进最后成功时间。
 - status.json 增 `externalTokensToday/7d/30d`（缩写展示值）、`externalTokensLastSuccess`、`externalTokensStale`；菜单栏 tooltip 增「外部最后成功」。
 - `--once` 打印 external 三行摘要（本地统计，不计入退出码）。

@@ -8,11 +8,12 @@ macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时
 
 - **菜单栏**：两行常驻，5H / 7D 剩余百分比；≥80% 绿色、40–79% 系统文本色、20–39% 橙色、<20% 红色，浅色/深色分别配色
 - **下拉面板**
-  - `.popover` 材质 + 90% 不透明窗口底色、16px 圆角、最大宽度 460px；系统开启“减少透明度”时使用纯色背景
-  - 信息文字使用正常主/次文本色，不再显示为禁用菜单项灰字
-  - 额度：套餐等级、5H / 7D 重置时间、重置卡
+  - 原生 AppKit 分区面板：`.popover` 材质 + 90% 不透明窗口底色、16px 圆角、目标宽度 330pt；系统开启“减少透明度”时使用纯色背景
+  - 标题与底部操作区固定，中间内容滚动；信息使用系统主/次文本色与明确的语义色
+  - 额度：套餐等级、5H / 7D 剩余百分比与进度条、重置时间、重置卡分组；百分比与进度条共用四档语义色
   - Tibo 重置动态：预告中的重置带预估窗口、最近一条已确认动态，点击行跳最新原帖
-  - Token 统计：今天 / 近 7 天 / 近 30 天
+  - Token 统计：今天 / 近 7 天 / 近 30 天的总量、输入和输出表格；两个用量区可分别折叠，默认展开
+  - 点击版本号可手动检查更新并显示结果
   - 外部用量（Codex 之外，独立区块）：统计本机其他 AI 工具消耗的 token，与 Codex 用量分开显示、不合并计算
     - 覆盖来源：Proma、Claude Code 本机会话、Hermes Agent 中走 OpenAI 系模型（gpt* / codex* / chatgpt* / o 系列）的会话
     - 没装对应工具时该来源自然为 0；input 含 cache read
@@ -71,6 +72,14 @@ python3 -m unittest discover -s tests -p '*_test.py'
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-normal
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-dark
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-long
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-states
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-empty
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-update
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-narrow
+
+# 面板本地截图：只捕捉面板；scroll-end 可先滚动到底部
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-output=/tmp/codex-panel.png
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-dark --visual-preview-scroll-end --visual-preview-output=/tmp/codex-panel-bottom.png
 
 # 面板事件回归：Esc / 外部点击 / R 刷新，自动验证并退出
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-events
