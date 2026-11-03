@@ -1914,8 +1914,8 @@ final class ResetCardSectionView: PanelCardView {
             _ = index
             let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
             let color: NSColor = rowModel.warning ? PanelAccent.codex.color : .labelColor
-            let name = PanelUI.label((rowModel.warning ? "⚠ " : "") + rowModel.name,
-                size: 12, color: color)
+            // 即将到期只用语义色区分，不加 ⚠ 前缀：长卡名（如"完全重置（每周 + 5 小时）"）会因此换行
+            let name = PanelUI.label(rowModel.name, size: 12, color: color)
             row.addArrangedSubview(name)
             row.addArrangedSubview(PanelUI.spacer())
             let expires = PanelUI.label(rowModel.expires, size: 11,
