@@ -12,5 +12,6 @@ unsigned long long cu_zstd_content_size(const unsigned char *src, size_t srcLen)
 size_t cu_zstd_decompress(const unsigned char *src, size_t srcLen,
                           unsigned char *dst, size_t dstCap) {
     size_t rc = ZSTD_decompress(dst, dstCap, src, srcLen);
-    return ZSTD_isError(rc) ? 0 : rc;
+    if (!ZSTD_isError(rc)) return rc;
+    return ZSTD_getErrorCode(rc) == ZSTD_error_dstSize_tooSmall ? SIZE_MAX : 0;
 }

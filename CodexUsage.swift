@@ -811,27 +811,31 @@ enum TokenScanner {
     /// 解码走 vendor/zstddeclib.c（上游 zstd v1.5.7 单文件解码源，BSD-3-Clause）
     /// 进程内完成——系统 Compression 框架不含 zstd 算法，依赖外部 zstd 命令则把
     /// 环境负担转嫁给用户；内置解码对任何用户环境都成立。输出缓冲优先用帧头声明
-    /// 的内容大小精确分配（上限防御：正常压缩比远低于 64 倍，异常声明转倍增路径）；
-    /// 声明未知时按压缩体 8 倍起步、不足 4 倍扩容。ZSTD_decompress 对空间不足与
-    /// 数据损坏都报错，桥接层统一返回 0 无法区分，倍增穷尽才判失败。
+    /// 的内容大小精确分配；
+    /// 声明未知时按压缩体 8 倍起步，空间不足时扩容；损坏数据立即退出，
+    /// 单文件解码上限 256 MiB，防止异常归档造成过大的内存占用。
     static func zstdDecompress(path: String) -> Data? {
         guard let raw = FileManager.default.contents(atPath: path), !raw.isEmpty else { return nil }
         return raw.withUnsafeBytes { src in
             guard let srcPtr = src.bindMemory(to: UInt8.self).baseAddress else { return nil }
+            let limit = 256 << 20
             let declared = cu_zstd_content_size(srcPtr, raw.count)
-            var capacity = declared > 0 && declared <= UInt64(raw.count) * 64 + (64 << 20)
-                ? Int(declared) : max(raw.count * 8, 1 << 20)
-            for _ in 0..<6 {
+            if declared > UInt64(limit) { return nil }
+            var capacity = declared > 0 ? Int(declared) : min(max(raw.count, 1 << 17), limit / 8) * 8
+            while capacity <= limit {
                 var out = Data(count: capacity)
                 let written = out.withUnsafeMutableBytes { dst in
                     cu_zstd_decompress(srcPtr, raw.count,
                                        dst.bindMemory(to: UInt8.self).baseAddress!, capacity)
                 }
-                if written > 0, written <= capacity {
-                    out.count = written
-                    return out
+                if written == Int(bitPattern: UInt.max) {
+                    if capacity == limit { return nil }
+                    capacity = min(capacity * 4, limit)
+                    continue
                 }
-                capacity *= 4
+                guard written > 0, written <= capacity else { return nil }
+                out.count = written
+                return out
             }
             return nil
         }

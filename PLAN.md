@@ -310,8 +310,8 @@ Codex 把超过保留期的会话就地压缩成 `rollout-*.jsonl.zst`（2026-10
 
 **变更点**：
 - **vendor + 桥接**：`vendor/zstddeclib.c`（上游源码）、`vendor/zstd_bridge.c/.h`（`cu_zstd_content_size` / `cu_zstd_decompress` 最小桥接）。`build.sh` 先 `cc -O2 -target arm64-apple-macos13.0` 编出 .o，再随 Swift 一起链接（目标版本一致，避免链接期版本告警）。
-- **解码实现**：`TokenScanner.zstdDecompress(path:)` 改为进程内解码。输出缓冲优先按帧头声明的内容大小精确分配（上限防御：声明 > 压缩体 64 倍 + 64MB 视为异常，转倍增路径）；声明未知时按压缩体 8 倍起步、不足 4 倍扩容，穷尽 6 次判失败。`ZSTD_decompress` 对空间不足与数据损坏都报错、桥接统一返回 0，无法区分，靠倍增收敛区分。
-- **提示链退役**：`.zst` 恒可读，不再有「缺 zstd」场景——菜单 ⚠ 行、`UsageData.tokensZstdMissing`、`status.json` 的 `tokensZstdMissing`、`TokenScanner.Result.zstdMissing` 与 `scan(zstdPath:)` 注入参数一并删除。
+- **解码实现**：`TokenScanner.zstdDecompress(path:)` 改为进程内解码。输出缓冲优先按帧头声明大小分配；声明未知时按压缩体大小起步，空间不足再扩容。桥接区分空间不足与损坏数据，损坏立即退出；单文件解码上限 256 MiB，超限归档跳过。
+- **提示链退役**：不再有「缺 zstd」场景——菜单 ⚠ 行、`UsageData.tokensZstdMissing`、`status.json` 的 `tokensZstdMissing`、`TokenScanner.Result.zstdMissing` 与 `scan(zstdPath:)` 注入参数一并删除。
 - **确定性回归**：`--self-test` 内嵌一段真实 zstd CLI 生成的 .zst 帧（112 字节 base64，与 Codex 归档同源 zstandard 格式），进程内解码必须还原已知 token 值——不依赖环境任何 zstd，任何机器可复现；另加损坏 .zst 夹具：解不开的归档跳过且不写状态条目，不阻塞其余会话统计。
 
 
