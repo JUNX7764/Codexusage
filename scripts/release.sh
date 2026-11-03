@@ -108,4 +108,4 @@ TAG_PUSHED=1
 gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes \
     "$TMP/$EXECUTABLE.dmg" "$TMP/$EXECUTABLE.zip" "$TMP/$EXECUTABLE.zip.sha256"
 
-echo "✅ 已发布 ${TAG}；已装旧版本将在下轮检查（≤2 小时）提示更新"
+echo "✅ 已发布 ${TAG}；已装旧版本将在下轮检查（≤30 分钟，打开菜单也会触发）提示更新"

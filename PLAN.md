@@ -263,7 +263,7 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 
 ### 更新检查（app 内，低频）
 
-- 判据是 **Release 版本号不是 commit hash**：已装 `CUBuildVersion` vs `api.github.com/repos/JUNX7764/Codexusage/releases/latest` 的 `tag_name`（匿名只读、ETag/304、2 小时一查；GitHub 匿名限额 60 次/小时/IP）。失败或从未发过版（404）静默不提示、保留旧结论。
+- 判据是 **Release 版本号不是 commit hash**：已装 `CUBuildVersion` vs `api.github.com/repos/JUNX7764/Codexusage/releases/latest` 的 `tag_name`（匿名只读、ETag/304、30 分钟一查，打开菜单也触发一次同 interval 节流检查；GitHub 匿名限额 60 次/小时/IP，实际 2 次/小时且 304 不耗配额）。失败或从未发过版（404）静默不提示、保留旧结论。
 - 版本比较：`v` 前缀与 `-dirty`/`-g<hash>` 等破折号尾巴剥离，逐段数值比较（1.10 > 1.9），短侧补 0（1.2 == 1.2.0）；任一侧无法解析 = 不提示。日常 commit / push 不触发横幅，发版才触发。
 - 最新 Release 版本更高 → 菜单最上方横幅「⬆ 新版本可用，点击更新」；拿不到远端（断网等）→ 不出横幅。
 

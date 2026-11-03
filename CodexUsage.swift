@@ -1380,8 +1380,8 @@ enum BuildInfo {
 enum UpdateCheck {
     static let apiURL = URL(string: "https://api.github.com/repos/JUNX7764/Codexusage/releases/latest")!
     static let releasesPage = URL(string: "https://github.com/JUNX7764/Codexusage/releases")!
-    /// GitHub 匿名限额 60 次/小时/IP，2 小时一查绰绰有余
-    static let interval: TimeInterval = 2 * 3600
+    /// GitHub 匿名限额 60 次/小时/IP，30 分钟一查仅 2 次/小时；ETag/304 条件请求不耗配额
+    static let interval: TimeInterval = 30 * 60
 
     /// 版本号归一化：v1.0.1 / v1.0.1-3-gabc / v1.0.1-dirty → [1, 0, 1]；
     /// 破折号后缀（预发布/dirty/git describe 尾巴）丢弃，任一段非数字视为无法比较
@@ -1496,7 +1496,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 every: self.tokenEveryCycles, manual: false))
         }
         timer?.tolerance = 6
-        // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 2 小时
+        // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 30 分钟；
+        // 打开菜单也会触发一次（同一 interval 节流，不增加请求频率）
         updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateCheck.interval, repeats: true) { [weak self] _ in
             self?.checkForUpdate()
         }
@@ -1571,6 +1572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
         refresh(tokens: false, manual: true)
+        checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
     }
 
     func menuDidClose(_ menu: NSMenu) {
