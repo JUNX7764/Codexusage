@@ -1572,8 +1572,9 @@ final class UsagePanelController: NSObject {
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private weak var anchorButton: NSStatusBarButton?
-    private var panelWidth: CGFloat = 460
-    private var contentWidth: CGFloat = 428
+    private static let maximumWidth: CGFloat = 460
+    private var panelWidth = UsagePanelController.maximumWidth
+    private var contentWidth: CGFloat { panelWidth - 32 }
 
     override init() {
         panel = UsagePanel(contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 320),
@@ -1769,10 +1770,9 @@ final class UsagePanelController: NSObject {
     private func layoutPanel(anchoredTo button: NSStatusBarButton, buttonWindow: NSWindow) {
         let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
         let visible = screen.visibleFrame
-        let desiredWidth = min(460, visible.width - 24)
+        let desiredWidth = min(Self.maximumWidth, visible.width - 24)
         if desiredWidth != panelWidth {
             panelWidth = desiredWidth
-            contentWidth = desiredWidth - 32
             rebuildRows()
         }
         stack.layoutSubtreeIfNeeded()
@@ -1827,7 +1827,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let refreshGate = RefreshGate()
     // 面板打开期间不重建内容（避免闪断），关闭时补一次
     private var pendingMenuRebuild = false
-    private var visualPreview = false
+    private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
     // token 扫描每 N 个刷新周期做一次（主循环 30s × 10 = 5 分钟；额度每轮都刷）
     private let tokenEveryCycles = 10
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
@@ -1854,13 +1854,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
         panelController.onClose = { [weak self] in self?.panelDidClose() }
-        visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
-        rebuildMenu()
-        renderBar()
         if visualPreview {
             configureVisualPreview()
             return
         }
+        rebuildMenu()
+        renderBar()
         refresh(tokens: true, manual: true)
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             guard let self = self else { return }
