@@ -1941,7 +1941,6 @@ final class UsagePanel: NSPanel {
 }
 
 final class UsagePanelController: NSObject {
-    var onClose: (() -> Void)?
     var onCheckUpdate: (() -> Void)?
     private var codexExpanded = true
     private var externalExpanded = true
@@ -2124,10 +2123,19 @@ final class UsagePanelController: NSObject {
     }
 
     private func refreshPanelLayout() {
+        // 就地重建时保持滚动位置并禁用隐式动画：每 30s 后台刷新重建面板内容不打扰阅读（KimiUsage 同款）
+        let previousOrigin = scrollView.contentView.bounds.origin
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         rebuildContent()
         if let button = anchorButton, let window = button.window, isOpen {
             layoutPanel(anchoredTo: button, buttonWindow: window)
+            let clip = scrollView.contentView
+            let desired = NSRect(origin: previousOrigin, size: clip.bounds.size)
+            clip.scroll(to: clip.constrainBoundsRect(desired).origin)
+            scrollView.reflectScrolledClipView(clip)
         }
+        CATransaction.commit()
     }
     @objc private func toggleCodex() { codexExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleExternal() { externalExpanded.toggle(); refreshPanelLayout() }
@@ -2209,7 +2217,8 @@ final class UsagePanelController: NSObject {
 
     @objc private func performAction(_ sender: PanelActionButton) {
         guard let item = sender.menuItem, let action = item.action else { return }
-        close()
+        // 只有「退出」先收起面板；刷新/开机自启等保持面板打开，动作结果就地可见
+        if action == #selector(AppDelegate.onQuit) { close() }
         DispatchQueue.main.async {
             _ = NSApp.sendAction(action, to: item.target, from: item)
         }
@@ -2314,7 +2323,6 @@ final class UsagePanelController: NSObject {
         panel.orderOut(nil)
         removeMonitors()
         anchorButton = nil
-        onClose?()
     }
 }
 
@@ -2425,8 +2433,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var usage = UsageData()
     private var cycle = 0
     private let refreshGate = RefreshGate()
-    // 面板打开期间不重建内容（避免闪断），关闭时补一次
-    private var pendingMenuRebuild = false
     private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
     // token 扫描每 N 个刷新周期做一次（主循环 30s × 10 = 5 分钟；额度每轮都刷）
     private let tokenEveryCycles = 10
@@ -2453,7 +2459,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.isVisible = true
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
-        panelController.onClose = { [weak self] in self?.panelDidClose() }
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
         if visualPreview {
             configureVisualPreview()
@@ -2627,8 +2632,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 NSApp.postEvent(refresh, atStart: false)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    guard !self.panelController.isOpen else { return fail("refresh action did not close panel") }
-                    print("CodexUsage visual event test: PASS (status button toggle, Escape, outside click, refresh action)")
+                    guard self.panelController.isOpen else { return fail("refresh action closed the panel") }
+                    print("CodexUsage visual event test: PASS (status button toggle, Escape, outside click, refresh keeps panel open)")
                     exit(0)
                 }
             }
@@ -2692,29 +2697,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 菜单栏图标 + 下拉菜单的统一渲染入口；菜单打开期间延迟重建到关闭时
+    /// 菜单栏图标 + 下拉菜单的统一渲染入口；面板打开时也就地重建（refreshPanelLayout 保持滚动位置、无动画闪断）
     private func updateUI() {
         renderBar()
-        if panelController.isOpen { pendingMenuRebuild = true } else { rebuildMenu() }
+        rebuildMenu()
     }
 
     @objc private func togglePanel() {
         guard let button = statusItem.button else { return }
-        if !panelController.isOpen && pendingMenuRebuild {
-            pendingMenuRebuild = false
-            rebuildMenu()
-        }
         panelController.toggle(anchoredTo: button)
         if panelController.isOpen {
             refresh(tokens: false, manual: true)
             checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
-        }
-    }
-
-    private func panelDidClose() {
-        if pendingMenuRebuild {
-            pendingMenuRebuild = false
-            rebuildMenu()
         }
     }
 
@@ -3152,7 +3146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateUI()
     }
 
-    @objc private func onQuit() { NSApp.terminate(nil) }
+    @objc func onQuit() { NSApp.terminate(nil) }
 }
 
 // MARK: - 入口（支持 --once 命令行自检）
