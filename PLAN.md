@@ -112,7 +112,7 @@ body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_to
 - 额度窗口显示剩余百分比、重置时间与剩余量进度条；进度按 `100 - usedPercent` 绘制，百分比和进度条共用 `RemainingColorTier` 四档语义色。未知值显示「暂无数据」与空轨道。
 - 重置卡与 Tibo 使用独立分组卡片；卡名、到期时间、事件链接、临期/失败/过期状态均保留在所属区块。
 - Codex 用量与外部用量使用同款组件：今天 / 7 天 / 30 天三行表格，每行包含总量、输入和输出。数字使用等宽数字字形；Codex 橙色与外部蓝色只承担区块识别。
-- 空数据、失败、数据过期、最后成功时间与 `zstd` 缺失提示归入对应区块，不使用禁用菜单项灰字。
+- 空数据、失败、数据过期与最后成功时间归入对应区块，不使用禁用菜单项灰字。
 
 **面板视觉与交互**：`NSPanel + NSVisualEffectView`（`.popover / behindWindow / active`），叠加 90% 不透明 `windowBackgroundColor` 底层与 16px 圆角，目标宽度 330pt（窄屏自适应）；系统“减少透明度”开启时改为完全纯色。卡片使用中性 surface 与 hairline separator，布局采用 4px 网格。最大高度为可用屏幕的 85%；标题与两行底部操作区固定，中间内容进入 `NSScrollView`；底部第一行显示最近尝试刷新与版本，第二行显示立即刷新、开机自启和退出。支持状态栏图标开关、点击外部关闭、Esc 关闭、`R` 刷新、`Q` 退出与 Tibo 链接。两个用量区可分别折叠，启动默认展开，折叠后错误提示仍显示。点击版本号强制检查 Release，面板内反馈检查中、最新、可更新、失败或版本未知。
 
@@ -282,9 +282,25 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 - **SHA256 校验链**：release.sh 生成并上传 `CodexUsage.zip.sha256`；update.sh 下载后 `shasum -a 256 -c`，校验文件缺失或不匹配即中止，在解压/替换之前。
 - **其他**：`--once` tiboVar 与其余变量统一在锁内取快照（修数据竞争）；Fmt 展示用 DateFormatter 全部静态缓存；Tibo 第三方链接仅放行 http/https（菜单建项与 openLink 双保险）。
 
+## 4.10 压缩归档内置解码 —— 2026-11-03（zstd-inprocess）
+
+Codex 把超过保留期的会话就地压缩成 `rollout-*.jsonl.zst`（2026-10 实测 7 天前的文件全是 .zst），解压此前依赖用户机器自装 zstd，缺失时 30 天口径缺失并提示「brew install zstd」——环境负担落在用户侧。目标：解压能力进产物，用户零依赖、提示消失。
+
+**方案选型（实测排除）**：
+- macOS 系统 Compression 框架**不含 zstd 算法**（macOS 27 SDK `compression.h` 仅 LZ4/ZLIB/LZMA/BROTLI/LZFSE，无 `COMPRESSION_ZSTD`）——「用系统框架进程内解压」不成立。
+- 随包拷贝 zstd **可执行文件**到 Resources：Homebrew 的 zstd 是动态链接（`@rpath/libzstd.1.dylib`），单独拷进 .app 后 dyld 加载失败，dyld 路径修补脆弱，不采纳。
+- **采纳**：vendor 上游 zstd **单文件解码源** `zstddeclib.c`（v1.5.7，BSD-3-Clause，许可全文随附），编译进主二进制，进程内解码——与 Electron 侧 `zlib.zstdDecompressSync` 同一思路，且无任何运行时依赖。
+
+**变更点**：
+- **vendor + 桥接**：`vendor/zstddeclib.c`（上游源码）、`vendor/zstd_bridge.c/.h`（`cu_zstd_content_size` / `cu_zstd_decompress` 最小桥接）。`build.sh` 先 `cc -O2 -target arm64-apple-macos13.0` 编出 .o，再随 Swift 一起链接（目标版本一致，避免链接期版本告警）。
+- **解码实现**：`TokenScanner.zstdDecompress(path:)` 改为进程内解码。输出缓冲优先按帧头声明大小分配；声明未知时按压缩体大小起步，空间不足再扩容。桥接区分空间不足与损坏数据，损坏立即退出；单文件解码上限 256 MiB，超限归档跳过。
+- **提示链退役**：不再有「缺 zstd」场景——菜单 ⚠ 行、`UsageData.tokensZstdMissing`、`status.json` 的 `tokensZstdMissing`、`TokenScanner.Result.zstdMissing` 与 `scan(zstdPath:)` 注入参数一并删除。
+- **确定性回归**：`--self-test` 内嵌一段真实 zstd CLI 生成的 .zst 帧（112 字节 base64，与 Codex 归档同源 zstandard 格式），进程内解码必须还原已知 token 值——不依赖环境任何 zstd，任何机器可复现；另加损坏 .zst 夹具：解不开的归档跳过且不写状态条目，不阻塞其余会话统计。
+
+
 ## 5. 工程与部署边界
 
-- 单文件 `CodexUsage.swift`；构建部署目标保持 macOS 13.0（本机 CLT 默认 macosx28 会被 LaunchServices 拒绝）。
+- 单文件 `CodexUsage.swift` + `vendor/` 下的 zstd 解码源（C 桥接，不改变「单 Swift 文件」架构约束）；构建部署目标保持 macOS 13.0（本机 CLT 默认 macosx28 会被 LaunchServices 拒绝）。
 - 刷新节奏：额度 30s / token 扫描每 10 周期（照 GlmUsage 的 tokenEveryCycles 模式）。
 - 网络瞬断时保留上次成功数据但**必须**带 ⚠ 过期标注（与 GlmUsage 的静默保留不同，这是刻意改进）。
 - **本任务不做部署**：不动 LaunchAgents、不 kill CodexMeter、不拷贝到 ~/Applications（由主会话与用户确认后进行）。

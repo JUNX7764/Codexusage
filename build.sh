@@ -19,10 +19,20 @@ if [ ! -f "$DIR/AppIcon.icns" ]; then
     (cd "$DIR" && swift scripts/icon_gen.swift)
 fi
 
+echo "== 编译内置 zstd 解码（vendor/zstddeclib.c，上游 v1.5.7，BSD-3-Clause）=="
+# 单文件解码源进程内解压 .zst 归档：系统 Compression 框架不含 zstd，外部 zstd 命令
+# 会把环境负担转嫁给用户（缺失时 30 天口径缺失并提示 brew install）；内置后任何
+# 用户环境都完整计入压缩会话
+ZSTD_OBJ="$DIR/zstd_bridge.o"
+# cc 目标与 swiftc 保持一致（macos13.0），否则链接时版本不匹配告警
+/usr/bin/cc -O2 -target arm64-apple-macos13.0 -I "$DIR/vendor" -c "$DIR/vendor/zstd_bridge.c" -o "$ZSTD_OBJ"
+
 echo "== 编译 Swift 源码 =="
 # 必须显式指定部署目标：本机 CLT 默认 target 是 macosx28.0（比当前系统 macOS 27 新），
 # 缺省编译出的二进制 minos=28.0 会被 LaunchServices 拒绝（"不能与此版本 macOS 配合使用"）。
-swiftc -O -target arm64-apple-macos13.0 -o "$DIR/CodexUsage-bin" "$DIR/CodexUsage.swift"
+swiftc -O -target arm64-apple-macos13.0 -import-objc-header "$DIR/vendor/zstd_bridge.h" \
+    -o "$DIR/CodexUsage-bin" "$DIR/CodexUsage.swift" "$ZSTD_OBJ"
+rm -f "$ZSTD_OBJ"
 
 echo "== 打包 .app =="
 rm -rf "$APP"
@@ -49,6 +59,8 @@ esac
 # 发布包替换，不依赖 clone 目录），见 CodexUsage.swift onUpdateApp
 cp "$DIR/scripts/update.sh" "$APP/Contents/Resources/update.sh"
 chmod +x "$APP/Contents/Resources/update.sh"
+
+# zstd 解码已编译进主二进制（见上方 cc 步骤），无额外运行时依赖
 
 echo "== ad-hoc 签名 =="
 codesign --force --deep --sign - "$APP"

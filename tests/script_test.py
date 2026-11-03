@@ -363,6 +363,7 @@ echo "build" >> "$MOCK_LOG"
         shutil.copy2(ROOT / "Info.plist", project / "Info.plist")
         shutil.copy2(ROOT / "AppIcon.icns", project / "AppIcon.icns")
         shutil.copy2(UPDATE, project / "scripts" / "update.sh")
+        shutil.copytree(ROOT / "vendor", project / "vendor")
         (project / f"{EXECUTABLE}.swift").write_text("// swiftc is mocked\n")
         result = subprocess.run(
             ["bash", str(project / "build.sh")], cwd=project,

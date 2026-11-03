@@ -308,7 +308,6 @@ struct UsageData {
     var ext30d: ExternalTokenScanner.Stats?
     var quotaError: String?
     var tokensError: String?
-    var tokensZstdMissing = false   // 发现 .zst 归档但本机无 zstd（30 天口径缺失提示）
     var extError: String?           // 外部用量已安装来源全部不可读
     var fiveHourError: String?
     var sevenDayError: String?
@@ -682,7 +681,8 @@ enum TiboDisplay {
 //
 // 扫描 sessions/YYYY/MM/DD/rollout-*.jsonl，仅近 30 天的会话文件；codex 会把超过
 // 保留期的会话就地压缩成 rollout-*.jsonl.zst（2026-10 实测 7 天前的文件全是 .zst），
-// 两种后缀都计入，.zst 经 zstd 解压后走同一条字节反查路径。
+// 两种后缀都计入，.zst 经 vendor 的上游 zstd 解码源（zstddeclib.c v1.5.7）在 App
+// 内解压后走同一条字节反查路径，不依赖用户机器安装任何工具。
 // 每个文件取最后一条 type=="event_msg" 且 payload.type=="token_count" 事件的
 // payload.info.total_token_usage（会话累计值）：input_tokens / output_tokens / total_tokens。
 // 会话日期 = 文件名前缀 rollout-YYYY-MM-DDTHH-MM-SS-（本地时区）。
@@ -706,8 +706,6 @@ enum TokenScanner {
         var seven = Stats()
         var thirty = Stats()
         var error: String?
-        /// 本轮发现 .zst 归档但本机无 zstd：归档会话未计入，30 天口径缺失需提示
-        var zstdMissing = false
     }
     struct Stats {
         var input = 0.0
@@ -730,8 +728,7 @@ enum TokenScanner {
 
     static func scan(root: String = sessionsRoot,
                      statePath: String = defaultStatePath,
-                     now: Date = Date(),
-                     zstdPath: String? = TokenScanner.zstdBin) -> Result {
+                     now: Date = Date()) -> Result {
         lock.lock(); defer { lock.unlock() }
         var st = loadState(at: statePath)
         // 窗口口径：含今天共 7 / 30 个日历日（起算日 = 今天 −6 / −29 天）
@@ -739,7 +736,6 @@ enum TokenScanner {
         let cutoff7 = dayFmt.string(from: now.addingTimeInterval(-6 * 86400))
         let cutoff30 = dayFmt.string(from: now.addingTimeInterval(-29 * 86400))
         let cutoff31 = dayFmt.string(from: now.addingTimeInterval(-31 * 86400))
-        var zstdMissing = false
 
         var seen = Set<String>()
         var enumed = false
@@ -763,10 +759,10 @@ enum TokenScanner {
                 // size/mtime 为准，稳定不变）
                 if let e = st.files[path], e.size == Int64(size), e.mtime == mtime { continue }
                 let isZst = name.hasSuffix(".zst")
-                if isZst && zstdPath == nil { zstdMissing = true; continue }
-                // 活跃 .jsonl 只需最后一条 token_count：尾部 1MB 反查，未命中才全量读
+                // .zst 在 App 内解压；活跃 .jsonl 只需最后一条 token_count：
+                // 尾部 1MB 反查，未命中才全量读
                 guard let data = isZst
-                    ? zstdDecompress(path: path, bin: zstdPath)
+                    ? zstdDecompress(path: path)
                     : plainDataWithTailFallback(at: path) else { continue }
                 let u = lastTokenUsage(in: data) ?? (0.0, 0.0, 0.0)
                 st.files[path] = FileEntry(size: Int64(size), mtime: mtime, day: day,
@@ -787,7 +783,6 @@ enum TokenScanner {
 
         guard enumed else { return Result(error: "无法枚举 \(root)") }
         var r = Result()
-        r.zstdMissing = zstdMissing
         for e in st.files.values {
             if e.day == todayKey { add(&r.today, e) }
             if e.day >= cutoff7 { add(&r.seven, e) }
@@ -809,30 +804,41 @@ enum TokenScanner {
         s.input += e.input; s.output += e.output; s.total += e.total; s.files += 1
     }
 
-    /// zstd 探测：GUI/LaunchAgent 进程不继承 shell PATH，按常见安装位置取绝对路径。
-    /// 找不到时 .zst 文件本轮不计入——不写状态条目，装好 zstd 后下轮扫描自动补齐。
-    static let zstdBin: String? = {
-        for p in ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd",
-                  "/opt/local/bin/zstd", "/usr/bin/zstd"]
-        where FileManager.default.isExecutableFile(atPath: p) { return p }
-        return nil
-    }()
-
     /// 解压 .jsonl.zst 全量到内存（压缩档数百 KB、解压后 MB 级），复用 lastTokenUsage
-    /// 的字节反查；任何失败返回 nil，按「本文件本轮无法读取」处理。
-    private static func zstdDecompress(path: String, bin: String?) -> Data? {
-        guard let bin = bin else { return nil }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: bin)
-        p.arguments = ["-dc", "--", path]
-        p.standardError = FileHandle.nullDevice
-        let out = Pipe()
-        p.standardOutput = out
-        do { try p.run() } catch { return nil }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0, !data.isEmpty else { return nil }
-        return data
+    /// 的字节反查；任何失败返回 nil，按「本文件本轮无法读取」处理（不写状态条目，
+    /// 修复或删除该归档后下轮扫描自动收敛）。
+    ///
+    /// 解码走 vendor/zstddeclib.c（上游 zstd v1.5.7 单文件解码源，BSD-3-Clause）
+    /// 进程内完成——系统 Compression 框架不含 zstd 算法，依赖外部 zstd 命令则把
+    /// 环境负担转嫁给用户；内置解码对任何用户环境都成立。输出缓冲优先用帧头声明
+    /// 的内容大小精确分配；
+    /// 声明未知时按压缩体 8 倍起步，空间不足时扩容；损坏数据立即退出，
+    /// 单文件解码上限 256 MiB，防止异常归档造成过大的内存占用。
+    static func zstdDecompress(path: String) -> Data? {
+        guard let raw = FileManager.default.contents(atPath: path), !raw.isEmpty else { return nil }
+        return raw.withUnsafeBytes { src in
+            guard let srcPtr = src.bindMemory(to: UInt8.self).baseAddress else { return nil }
+            let limit = 256 << 20
+            let declared = cu_zstd_content_size(srcPtr, raw.count)
+            if declared > UInt64(limit) { return nil }
+            var capacity = declared > 0 ? Int(declared) : min(max(raw.count, 1 << 17), limit / 8) * 8
+            while capacity <= limit {
+                var out = Data(count: capacity)
+                let written = out.withUnsafeMutableBytes { dst in
+                    cu_zstd_decompress(srcPtr, raw.count,
+                                       dst.bindMemory(to: UInt8.self).baseAddress!, capacity)
+                }
+                if written == Int(bitPattern: UInt.max) {
+                    if capacity == limit { return nil }
+                    capacity = min(capacity * 4, limit)
+                    continue
+                }
+                guard written > 0, written <= capacity else { return nil }
+                out.count = written
+                return out
+            }
+            return nil
+        }
     }
 
     /// 活跃 .jsonl 的读取：只要最后一条 token_count（通常在文件末尾附近），先读尾部
@@ -2529,7 +2535,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.tiboError = "AIHOT 暂不可用"
             usage.tokensError = "会话目录读取失败"
             usage.extError = "外部会话来源不可读"
-            usage.tokensZstdMissing = true
             fiveHourLastOK = now - 3_600
             sevenDayLastOK = nil
             tokensLastOK = now - 3_600
@@ -2729,7 +2734,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.tokens7d = r.seven
             usage.tokens30d = r.thirty
             usage.tokensError = nil
-            usage.tokensZstdMissing = r.zstdMissing
         }
         usage.updatedAt = Date()
     }
@@ -2849,7 +2853,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "tiboError": usage.tiboError ?? "",
             "quotaLastSuccess": ["fiveHour": iso(fiveHourLastOK), "sevenDay": iso(sevenDayLastOK)],
             "tokensLastSuccess": iso(tokensLastOK),
-            "tokensZstdMissing": usage.tokensZstdMissing,
             "externalTokensToday": Fmt.tokensAbbr(usage.extToday?.total),
             "externalTokens7d": Fmt.tokensAbbr(usage.ext7d?.total),
             "externalTokens30d": Fmt.tokensAbbr(usage.ext30d?.total),
@@ -2999,9 +3002,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let error = usage.tokensError {
             codexNotices.append(notice("Codex用量统计失败：\(error)", .error))
-        }
-        if usage.tokensZstdMissing {
-            codexNotices.append(notice("⚠ 未安装 zstd，压缩归档会话未计入（brew install zstd）", .warning))
         }
         let codexSection = UsagePanelModel.TokenSection(title: "Codex用量", accent: .codex,
             buckets: codexBuckets, notices: codexNotices)
@@ -3492,15 +3492,10 @@ enum CodexOfflineRegression {
                     + "{\"total_token_usage\":{\"input_tokens\":\(input),\"output_tokens\":1,"
                     + "\"total_tokens\":\(input + 1)}}}}\n"
             }
-            func zstdCompress(src: String, dst: String) -> Bool {
-                guard let bin = TokenScanner.zstdBin else { return false }
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: bin)
-                p.arguments = ["-q", "-f", "-o", dst, "--", src]
-                p.standardError = FileHandle.nullDevice
-                do { try p.run(); p.waitUntilExit() } catch { return false }
-                return p.terminationStatus == 0
-            }
+            // .zst 夹具：① 内嵌真实 zstd CLI 生成的 .zst 帧（base64，与 Codex 归档
+            // 同源 zstandard 格式）——始终可用，直接进扫描根覆盖 .zst 统计路径；
+            // ② 系统 zstd 命令现压一个夹具（覆盖另一压缩参数组合）——命令缺失则跳过，
+            // 解码侧不依赖它
             let sesOld = now.addingTimeInterval(-10 * 86400)   // 30 天内、7 天外
             let sesNew = now.addingTimeInterval(-2 * 86400)    // 7 天内
             for d in [sesOld, sesNew] {
@@ -3509,35 +3504,61 @@ enum CodexOfflineRegression {
             }
             try sesUsage(499).write(toFile: sesRoot + "/" + sesDayDir(sesNew)
                 + "/rollout-\(sesStamp(sesNew))-aaaa.jsonl", atomically: true, encoding: .utf8)
+            // 内嵌真实帧：内容为 input 2999 / output 1 / total 3000 的 token_count 行
+            let embeddedFrame = Data(base64Encoded:
+                "KLUv/SSPHQMA0sUTGJApbS0Z12AkEl97m2Cpu98CaigcG8vtJ4CUUiqlDOxbAW59GWME9uVGaTyxY3Hb5zhWNaTxOmcr4SQelO2F0wM59HqxiMOJCbwdEcJPAgYAXnEY8ATnUD9HA+oGQ6Hyj2drig==")!
+            try embeddedFrame.write(to: URL(fileURLWithPath: sesRoot + "/" + sesDayDir(sesOld)
+                + "/rollout-\(sesStamp(sesOld))-cccc.jsonl.zst"))
+            // 系统 zstd 命令夹具（编码侧可选，解码侧不依赖）
+            func zstdCompress(src: String, dst: String) -> Bool {
+                let bin = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd",
+                           "/opt/local/bin/zstd", "/usr/bin/zstd"]
+                    .first { FileManager.default.isExecutableFile(atPath: $0) }
+                guard let bin = bin else { return false }
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: bin)
+                p.arguments = ["-q", "-f", "-o", dst, "--", src]
+                p.standardError = FileHandle.nullDevice
+                do { try p.run(); p.waitUntilExit() } catch { return false }
+                return p.terminationStatus == 0
+            }
             let oldPlain = root.path + "/old-session.jsonl"
             try sesUsage(2999).write(toFile: oldPlain, atomically: true, encoding: .utf8)
             let zstOK = zstdCompress(src: oldPlain,
                                      dst: sesRoot + "/" + sesDayDir(sesOld)
                                          + "/rollout-\(sesStamp(sesOld))-bbbb.jsonl.zst")
             if !zstOK {
-                print("CodexUsage --self-test: note: zstd not found, .zst path covered by plain file")
-                try sesUsage(2999).write(toFile: sesRoot + "/" + sesDayDir(sesOld)
-                    + "/rollout-\(sesStamp(sesOld))-bbbb.jsonl", atomically: true, encoding: .utf8)
+                print("CodexUsage --self-test: note: no system zstd CLI, second .zst fixture skipped "
+                      + "(embedded real frame still covers the decode path)")
             }
             let t1 = TokenScanner.scan(root: sesRoot, statePath: sesState, now: now)
             try expect(t1.seven.total == 500 && t1.seven.files == 1,
                        "tokens 7d window wrong (got \(t1.seven.total)/\(t1.seven.files))")
-            try expect(t1.thirty.total == 3500 && t1.thirty.files == 2,
+            // 30 天窗口 = 明文 500 + 内嵌真实帧 3000 + （系统 zstd 夹具 3000）
+            let expect30 = zstOK ? 6500.0 : 3500.0
+            let expectFiles = zstOK ? 3 : 2
+            try expect(t1.thirty.total == expect30 && t1.thirty.files == expectFiles,
                        "tokens 30d window wrong — .zst archived sessions missed "
                        + "(got \(t1.thirty.total)/\(t1.thirty.files))")
             let t2 = TokenScanner.scan(root: sesRoot, statePath: sesState, now: now)
-            try expect(t2.thirty.total == 3500 && t2.thirty.files == 2,
+            try expect(t2.thirty.total == expect30 && t2.thirty.files == expectFiles,
                        "tokens incremental rescan double-counted or dropped entries")
 
-            // zstd 缺失提示：发现 .zst 但 zstdPath=nil → zstdMissing 且归档不计入（30 天只剩明文）
-            if zstOK {
-                let noZstd = TokenScanner.scan(root: sesRoot,
-                                               statePath: root.path + "/ses-scan-state-nozstd.json",
-                                               now: now, zstdPath: nil)
-                try expect(noZstd.zstdMissing && noZstd.thirty.total == 500 && noZstd.thirty.files == 1,
-                           "missing zstd did not surface the archived-session gap "
-                           + "(got \(noZstd.thirty.total), missing=\(noZstd.zstdMissing))")
+            // 损坏 .zst：解不开的归档本轮跳过且不写状态条目，不阻塞其余会话统计
+            let badRoot = root.path + "/codex-sessions-badzst"
+            for d in [sesOld, sesNew] {
+                try FileManager.default.createDirectory(
+                    atPath: badRoot + "/" + sesDayDir(d), withIntermediateDirectories: true)
             }
+            try Data([0x28, 0xB5, 0x2F, 0xFD, 0x01, 0x00, 0xAA, 0xBB]).write(
+                to: URL(fileURLWithPath: badRoot + "/" + sesDayDir(sesOld)
+                    + "/rollout-\(sesStamp(sesOld))-bad.jsonl.zst"))
+            try sesUsage(777).write(toFile: badRoot + "/" + sesDayDir(sesNew)
+                + "/rollout-\(sesStamp(sesNew))-good.jsonl", atomically: true, encoding: .utf8)
+            let br = TokenScanner.scan(root: badRoot, statePath: root.path + "/bad-scan-state.json", now: now)
+            try expect(br.thirty.total == 778 && br.thirty.files == 1,
+                       "corrupt .zst archive was not skipped cleanly "
+                       + "(got \(br.thirty.total)/\(br.thirty.files))")
 
             // tail-read：>1MB 活跃文件尾部命中最后一条 token_count；
             // token_count 仅在开头时尾部反查未命中 → 全量读兜底，两条路径数值都必须正确
@@ -3762,7 +3783,7 @@ enum CodexOfflineRegression {
                        && Fmt.webURL("") == nil,
                        "non-web tibo link scheme was accepted")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives/tail-read/zstd-missing hint, external usage model/parse/scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare, tibo link scheme allowlist)")
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives/real-frame decode/tail-read, external usage model/parse/scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare, tibo link scheme allowlist)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
