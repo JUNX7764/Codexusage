@@ -6,8 +6,10 @@ macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时
 
 ## 功能
 
-- **菜单栏**：两行常驻，5H / 7D 剩余百分比
+- **菜单栏**：两行常驻，5H / 7D 剩余百分比；≥80% 绿色、40–79% 系统文本色、20–39% 橙色、<20% 红色，浅色/深色分别配色
 - **下拉面板**
+  - `.popover` 材质 + 90% 不透明窗口底色、16px 圆角；系统开启“减少透明度”时使用纯色背景
+  - 信息文字使用正常主/次文本色，不再显示为禁用菜单项灰字
   - 额度：套餐等级、5H / 7D 重置时间、重置卡
   - Tibo 重置动态：预告中的重置带预估窗口、最近一条已确认动态，点击行跳最新原帖
   - Token 统计：今天 / 近 7 天 / 近 30 天
@@ -20,7 +22,7 @@ macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时
   - 一轮刷新最多运行一次，刷新中的多次手动请求合并为一轮后续完整刷新
   - 5H、7D、Token、重置卡分别记录最后成功时间；失败时保留旧值并显示错误，超过对应时限标 ⚠
   - 「最近尝试刷新」显示请求开始时间
-  - 打开下拉菜单即触发一轮全量刷新；菜单打开期间不重建菜单，数据在关闭后更新、下次打开即最新
+  - 打开下拉面板即触发一轮全量刷新；面板打开期间不重建内容，数据在关闭后更新、下次打开即最新
   - 近 7 天 / 近 30 天为含今天共 7 / 30 个日历日；本机未安装 zstd 时压缩归档会话不计入，菜单会给出提示
   - 外部用量来源全部不可读时保留旧值并显示错误与 ⚠ 过期标注，不静默清零
   - Tibo 重置动态每 5 分钟刷新（ETag/304 轮询，内容未变也算有效成功），失败只降级该区块；预估窗口展示「预估/待确认」，不是倒计时（数据源：AIHOT 公开接口，匿名只读、不经凭据）；事件链接仅放行 http/https
@@ -29,7 +31,7 @@ macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时
 
 需要 macOS 13+。安装：到 [Releases](https://github.com/JUNX7764/Codexusage/releases) 下载最新 `CodexUsage.dmg`，打开后把 CodexUsage 拖进 Applications（或 `~/Applications`）双击运行。首次打开如遇 Gatekeeper 提示，右键 → 打开。
 
-**更新**：发布新 Release 后（每 30 分钟检查一次，打开菜单也会触发一次节流检查），菜单最上方出现「⬆ 新版本可用，点击更新」，点击即自动下载替换并重启（zip 经 SHA256 校验后才替换）；也可以随时手动重跑安装步骤。日常代码提交不会触发更新提示——只有正式发版才会。
+**更新**：发布新 Release 后（每 30 分钟检查一次，打开面板也会触发一次节流检查），面板最上方出现「⬆ 新版本可用，点击更新」，点击即自动下载替换并重启（zip 经 SHA256 校验后才替换）；也可以随时手动重跑安装步骤。日常代码提交不会触发更新提示——只有正式发版才会。
 
 从源码构建（开发者）：
 
@@ -63,6 +65,15 @@ python3 -m unittest discover -s tests -p '*_test.py'
 
 # 真实自检：读取本机凭据、联网拉一次数据后退出
 ./CodexUsage.app/Contents/MacOS/CodexUsage --once
+
+# 固定假数据视觉预览：不联网、不写真实 status.json
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-normal
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-dark
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-long
+
+# 面板事件回归：Esc / 外部点击 / R 刷新，自动验证并退出
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-events
 ```
 
 ## 文件说明

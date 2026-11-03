@@ -103,9 +103,11 @@ body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_to
 
 （100 − used_percent，四舍五入取整。）
 
+**菜单栏分档着色**：只给 `xx%` 着色，`5H / 7D / ⚠ / --` 保持系统文本色。按界面取整后的剩余百分比判断：≥80% 绿色（浅色 `#3E8660` / 深色 `#96CDA7`）、40–79% 系统 `labelColor`、20–39% 橙色（`#B46539` / `#E5A37D`）、<20% 红色（`#C8404A` / `#F08B94`）。`StackImage` 关闭模板渲染，5H 与 7D 独立分档。
+
 **数据新鲜度标注（v1 内置，重要）**：5H、7D、token 统计、重置卡分别记录**最后成功时间**。每个项目失败时保留旧值、保留原成功时间，并显示当前错误；5H/7D 超过 10 分钟、tokens 超过 30 分钟、重置卡超过 15 分钟未成功即标 ⚠。菜单栏 5H/7D 行分别标注各自状态。菜单“最近尝试刷新”显示请求开始时间，状态文件使用同一口径的 `lastAttemptAt`。
 
-**下拉菜单**（自上而下）：
+**下拉面板**（自上而下；`NSMenuItem` 仅作内容模型，实际由自定义 `NSPanel` 呈现）：
 
 ```
 Codex 用量（plus 套餐）        // plan_type 大写展示；第二行可显示 email（解析到时）
@@ -123,6 +125,10 @@ Codex用量 今天 12.3 万 · 7 天 87 万 · 30 天 210 万   // 格式化见 
 立即刷新
 退出
 ```
+
+**面板视觉与交互**：`NSPanel + NSVisualEffectView`（`.popover / behindWindow / active`），叠加 90% 不透明 `windowBackgroundColor` 底层与 16px 圆角；系统“减少透明度”开启时改为完全纯色。信息行使用 `labelColor / secondaryLabelColor`，失败与过期使用明确语义色，不再借助禁用菜单项灰字。支持状态栏图标开关、点击外部关闭、Esc 关闭与原按钮动作/快捷键；长内容进入 `NSScrollView`。
+
+**视觉预览**：`--visual-preview`（绿/红）、`--visual-preview-normal`（当前色/橙）、`--visual-preview-dark`（深色面板）、`--visual-preview-long`（长内容滚动）使用固定假数据，不联网、不写真实 `status.json`；追加 `--visual-preview-events` 自动经 `NSEvent` 验证 Esc、外部点击与 R 刷新后退出。
 
 **--once 自检模式**：拉一次额度 + 全量扫一次 token，打印摘要后退出（照 GlmUsage 的 --once 风格）。**输出严禁包含任何 token/密钥值。**
 
@@ -284,7 +290,7 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 
 开发计划与验收清单：`docs/features/perf-polish-20261103/01-plan.md`。变更点：
 
-- **菜单生命周期**：各数据源 apply 回调只更新数据，`group.notify` 统一渲染一次（此前一轮刷新重建菜单 5 次、写 status.json 5 次）；`NSMenuDelegate` 打开菜单即触发全量刷新（RefreshGate 合并），菜单打开期间不重建、关闭时补重建（避免打开中的菜单被替换闪断，数据下次打开即最新）。开机自启勾选、更新横幅出现/消失同样走统一 `updateUI()`。
+- **面板生命周期**：各数据源 apply 回调只更新数据，`group.notify` 统一渲染一次；打开面板即触发全量刷新（RefreshGate 合并），面板打开期间不重建、关闭时补重建（避免内容替换闪断，数据下次打开即最新）。开机自启勾选、更新横幅出现/消失同样走统一 `updateUI()`。
 - **外部用量失败面**：已安装来源全部不可读（目录存在但非目录/枚举失败，state.db 存在但查询失败）→ `Result.error`，保留旧值不推进 lastOK，现有 ⚠ 过期机制自动生效并显示错误行；未安装来源（路径不存在）不算失败，部分来源可读仍按成功。
 - **TokenScanner tail-read**：活跃 .jsonl 先读尾部 1MB 反查最后一条 `total_token_usage`，未命中再全量读兜底，不再每 5 分钟全量读入几十 MB 活跃会话；.zst 路径不变。
 - **zstd 缺失提示**：发现 .zst 归档但本机无 zstd → `zstdMissing`，菜单 Codex用量区块提示「未安装 zstd，压缩归档会话未计入（brew install zstd）」，status.json 同步；`TokenScanner.scan` 增 `zstdPath` 注入参数供回归。

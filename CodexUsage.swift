@@ -1242,24 +1242,77 @@ enum ExternalTokenScanner {
     }
 }
 
-// MARK: - 菜单栏堆叠两行文字渲染（与 GlmUsage 同款）
+// MARK: - 菜单栏堆叠两行文字渲染
+
+/// 按界面展示的剩余百分比整数分档；标签与中间档继续使用系统文本色。
+enum RemainingColorTier: Equatable {
+    case green, normal, orange, red
+
+    init(remaining: Int?) {
+        guard let remaining = remaining else { self = .normal; return }
+        switch remaining {
+        case 80...: self = .green
+        case 40..<80: self = .normal
+        case 20..<40: self = .orange
+        default: self = .red
+        }
+    }
+
+    private static func rgb(_ hex: UInt32) -> NSColor {
+        NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255,
+                green: CGFloat((hex >> 8) & 0xff) / 255,
+                blue: CGFloat(hex & 0xff) / 255,
+                alpha: 1)
+    }
+
+    func color(for appearance: NSAppearance) -> NSColor {
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        switch self {
+        case .green: return Self.rgb(dark ? 0x96CDA7 : 0x3E8660)
+        case .normal: return .labelColor
+        case .orange: return Self.rgb(dark ? 0xE5A37D : 0xB46539)
+        case .red: return Self.rgb(dark ? 0xF08B94 : 0xC8404A)
+        }
+    }
+}
 
 enum StackImage {
-    static func make(line1: String, line2: String) -> NSImage {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
-        let attrs: [NSAttributedString.Key: Any] = [
+    struct Line {
+        let label: String
+        let value: String
+        let remaining: Int?
+    }
+
+    private static func attributed(_ line: Line, font: NSFont,
+                                   appearance: NSAppearance) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: line.label + " ", attributes: [
             .font: font,
-            .foregroundColor: NSColor.black
-        ]
-        let s1 = NSAttributedString(string: line1, attributes: attrs)
-        let s2 = NSAttributedString(string: line2, attributes: attrs)
+            .foregroundColor: NSColor.labelColor
+        ])
+        result.append(NSAttributedString(string: line.value, attributes: [
+            .font: font,
+            .foregroundColor: RemainingColorTier(remaining: line.remaining).color(for: appearance)
+        ]))
+        return result
+    }
+
+    static func make(line1: Line, line2: Line, appearance: NSAppearance) -> NSImage {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
+        var s1: NSAttributedString!
+        var s2: NSAttributedString!
+        appearance.performAsCurrentDrawingAppearance {
+            s1 = attributed(line1, font: font, appearance: appearance)
+            s2 = attributed(line2, font: font, appearance: appearance)
+        }
         let w = max(ceil(s1.size().width), ceil(s2.size().width)) + 2
         let img = NSImage(size: NSSize(width: w, height: 21), flipped: false) { _ in
-            s1.draw(at: NSPoint(x: 1, y: 10.5))
-            s2.draw(at: NSPoint(x: 1, y: 0.5))
+            appearance.performAsCurrentDrawingAppearance {
+                s1.draw(at: NSPoint(x: 1, y: 10.5))
+                s2.draw(at: NSPoint(x: 1, y: 0.5))
+            }
             return true
         }
-        img.isTemplate = true   // 自动适配深色/浅色菜单栏
+        img.isTemplate = false   // 保留百分比的柔彩色；标签仍随外观使用系统文本色
         return img
     }
 }
@@ -1268,14 +1321,17 @@ enum StackImage {
 
 enum Fmt {
     /// 剩余百分比（整数，100 − used_percent，夹在 0-100）
-    static func remainingPct(_ usedPercent: Double?) -> String {
-        guard let u = usedPercent else { return "--" }
+    static func remaining(_ usedPercent: Double?) -> Int? {
+        guard let u = usedPercent else { return nil }
         let r = Int((100 - u).rounded())
-        return "\(max(0, min(100, r)))%"
+        return max(0, min(100, r))
+    }
+    static func remainingPct(_ usedPercent: Double?) -> String {
+        guard let r = remaining(usedPercent) else { return "--" }
+        return "\(r)%"
     }
     static func remainingInt(_ w: QuotaWindow?) -> Int {
-        guard let u = w?.usedPercent else { return -1 }
-        return max(0, min(100, Int((100 - u).rounded())))
+        remaining(w?.usedPercent) ?? -1
     }
     // 展示用 formatter 全部静态缓存：菜单每轮重建要调十几次，新建 DateFormatter 开销大
     private static func zhFormatter(_ format: String) -> DateFormatter {
@@ -1454,18 +1510,323 @@ final class UpdateChecker {
     }
 }
 
+// MARK: - 自定义下拉面板（NSMenuItem 仅作内容模型，不使用系统菜单材质）
+
+final class PanelSolidBackgroundView: NSView {
+    var opacity: CGFloat = 0.9 { didSet { needsDisplay = true } }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(opacity).cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+final class PanelActionButton: NSButton {
+    var menuItem: NSMenuItem?
+    private var hovered = false { didSet { needsDisplay = true } }
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = (hovered
+                ? NSColor.unemphasizedSelectedContentBackgroundColor
+                : NSColor.clear).cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+}
+
+final class UsagePanel: NSPanel {
+    var onCancel: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
+}
+
+final class UsagePanelController: NSObject {
+    var onClose: (() -> Void)?
+    var isOpen: Bool { panel.isVisible }
+
+    private let panel: UsagePanel
+    private let effect = NSVisualEffectView()
+    private let solid = PanelSolidBackgroundView()
+    private let scrollView = NSScrollView()
+    private let stack = NSStackView()
+    private var items: [NSMenuItem] = []
+    private var localMonitor: Any?
+    private var globalMonitor: Any?
+    private weak var anchorButton: NSStatusBarButton?
+    private var panelWidth: CGFloat = 540
+    private var contentWidth: CGFloat = 508
+
+    override init() {
+        panel = UsagePanel(contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 320),
+            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        super.init()
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.level = .popUpMenu
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.onCancel = { [weak self] in self?.close() }
+        configureContent()
+    }
+
+    deinit {
+        if let localMonitor = localMonitor { NSEvent.removeMonitor(localMonitor) }
+        if let globalMonitor = globalMonitor { NSEvent.removeMonitor(globalMonitor) }
+    }
+
+    private func configureContent() {
+        guard let container = panel.contentView else { return }
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 16
+        container.layer?.masksToBounds = true
+
+        effect.frame = container.bounds
+        effect.autoresizingMask = [.width, .height]
+        effect.material = .popover
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 16
+        effect.layer?.masksToBounds = true
+        container.addSubview(effect)
+
+        solid.frame = container.bounds
+        solid.autoresizingMask = [.width, .height]
+        solid.wantsLayer = true
+        solid.layer?.cornerRadius = 16
+        solid.layer?.masksToBounds = true
+        container.addSubview(solid)
+
+        scrollView.frame = container.bounds.insetBy(dx: 16, dy: 12)
+        scrollView.autoresizingMask = [.width, .height]
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.verticalScrollElasticity = .allowed
+        container.addSubview(scrollView)
+
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = stack
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor)
+        ])
+    }
+
+    func update(items: [NSMenuItem]) {
+        self.items = items
+        rebuildRows()
+    }
+
+    private func rebuildRows() {
+        for row in stack.arrangedSubviews {
+            stack.removeArrangedSubview(row)
+            row.removeFromSuperview()
+        }
+        for item in items {
+            if item.isSeparatorItem {
+                let separator = NSBox()
+                separator.boxType = .separator
+                separator.translatesAutoresizingMaskIntoConstraints = false
+                separator.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
+                separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+                stack.addArrangedSubview(separator)
+                stack.setCustomSpacing(8, after: separator)
+                continue
+            }
+            if item.isEnabled, item.action != nil {
+                stack.addArrangedSubview(actionRow(item))
+            } else {
+                let row = infoRow(item)
+                stack.addArrangedSubview(row)
+                if item.title == "Tibo 重置动态" { stack.setCustomSpacing(8, after: row) }
+            }
+        }
+        stack.needsLayout = true
+    }
+
+    private func infoRow(_ item: NSMenuItem) -> NSView {
+        let title = item.title
+        let label = NSTextField(wrappingLabelWithString: title)
+        let isHeader = title.hasPrefix("Codex 用量") || title == "Tibo 重置动态"
+        let isSecondary = title.hasPrefix("  ") || title.hasPrefix("最近尝试刷新")
+            || title.hasPrefix("版本 ") || (title.contains("@") && !title.contains(" "))
+        label.font = .systemFont(ofSize: isHeader ? 13 : (isSecondary ? 11 : 12),
+                                 weight: isHeader ? .semibold : .regular)
+        if title.contains("失败") || title.hasPrefix("额度错误") {
+            label.textColor = .systemRed
+        } else if title.hasPrefix("⚠") || title.contains("已过期") {
+            label.textColor = .systemOrange
+        } else {
+            label.textColor = isSecondary ? .secondaryLabelColor : .labelColor
+        }
+        label.preferredMaxLayoutWidth = contentWidth
+        label.maximumNumberOfLines = 0
+        label.cell?.lineBreakMode = .byWordWrapping
+        label.toolTip = title
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }
+
+    private func actionRow(_ item: NSMenuItem) -> NSView {
+        let button = PanelActionButton()
+        button.menuItem = item
+        button.target = self
+        button.action = #selector(performAction(_:))
+        button.setButtonType(.momentaryChange)
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 5
+        button.alignment = .left
+        let font = NSFont.systemFont(ofSize: 12, weight: item.title.hasPrefix("⬆") ? .semibold : .regular)
+        button.attributedTitle = NSAttributedString(string: item.title, attributes: [
+            .font: font, .foregroundColor: NSColor.labelColor
+        ])
+        button.cell?.wraps = true
+        button.cell?.lineBreakMode = .byWordWrapping
+        button.keyEquivalent = item.keyEquivalent
+        button.keyEquivalentModifierMask = []
+        button.toolTip = item.toolTip
+        if item.state == .on {
+            button.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "已开启")
+            button.imagePosition = .imageLeading
+            button.contentTintColor = .labelColor
+        }
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
+        button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return button
+    }
+
+    @objc private func performAction(_ sender: PanelActionButton) {
+        guard let item = sender.menuItem, let action = item.action else { return }
+        close()
+        DispatchQueue.main.async {
+            _ = NSApp.sendAction(action, to: item.target, from: item)
+        }
+    }
+
+    /// 视觉回归专用：真实滚动到底部并确认 clip view 位置发生变化。
+    func scrollToEndForPreview() -> Bool {
+        stack.layoutSubtreeIfNeeded()
+        guard let document = scrollView.documentView else { return false }
+        let clip = scrollView.contentView
+        let maxY = max(0, document.frame.height - clip.bounds.height)
+        guard maxY > 0 else { return false }
+        clip.scroll(to: NSPoint(x: 0, y: maxY))
+        scrollView.reflectScrolledClipView(clip)
+        return clip.documentVisibleRect.origin.y > 0
+    }
+
+    func toggle(anchoredTo button: NSStatusBarButton) {
+        if isOpen { close() } else { show(anchoredTo: button) }
+    }
+
+    private func show(anchoredTo button: NSStatusBarButton) {
+        guard let buttonWindow = button.window else { return }
+        anchorButton = button
+        layoutPanel(anchoredTo: button, buttonWindow: buttonWindow)
+        let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        solid.opacity = reduceTransparency ? 1 : 0.9
+        effect.isHidden = reduceTransparency
+        installMonitors()
+        panel.makeKeyAndOrderFront(nil)
+        scrollView.contentView.scroll(to: .zero)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    private func layoutPanel(anchoredTo button: NSStatusBarButton, buttonWindow: NSWindow) {
+        let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
+        let visible = screen.visibleFrame
+        let desiredWidth = min(540, visible.width - 24)
+        if desiredWidth != panelWidth {
+            panelWidth = desiredWidth
+            contentWidth = desiredWidth - 32
+            rebuildRows()
+        }
+        stack.layoutSubtreeIfNeeded()
+        let fittingHeight = max(stack.fittingSize.height, 40)
+        let height = min(fittingHeight + 24, min(720, visible.height * 0.72))
+        let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        let x = max(visible.minX + 8, min(buttonRect.midX - panelWidth / 2, visible.maxX - panelWidth - 8))
+        let y = max(visible.minY + 8, buttonRect.minY - height - 4)
+        panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: height), display: false)
+    }
+
+    private func installMonitors() {
+        removeMonitors()
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            DispatchQueue.main.async { self?.close() }
+        }
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in
+            guard let self = self else { return event }
+            if event.type == .keyDown {
+                if event.keyCode == 53 { self.close(); return nil }
+                return event
+            }
+            if event.window === self.panel || event.window === self.anchorButton?.window { return event }
+            self.close()
+            return event
+        }
+    }
+
+    private func removeMonitors() {
+        if let monitor = localMonitor { NSEvent.removeMonitor(monitor); localMonitor = nil }
+        if let monitor = globalMonitor { NSEvent.removeMonitor(monitor); globalMonitor = nil }
+    }
+
+    func close() {
+        guard panel.isVisible else { return }
+        panel.orderOut(nil)
+        removeMonitors()
+        anchorButton = nil
+        onClose?()
+    }
+}
+
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
+    private let panelController = UsagePanelController()
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
     private var cycle = 0
     private let refreshGate = RefreshGate()
-    // 菜单打开期间不重建菜单（避免打开中的菜单被替换闪断），关闭时补一次
-    private var menuOpen = false
+    // 面板打开期间不重建内容（避免闪断），关闭时补一次
     private var pendingMenuRebuild = false
+    private var visualPreview = false
     // token 扫描每 N 个刷新周期做一次（主循环 30s × 10 = 5 分钟；额度每轮都刷）
     private let tokenEveryCycles = 10
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
@@ -1484,10 +1845,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[CodexUsage] launched, creating status item")
+        if CommandLine.arguments.contains("--visual-preview-dark") {
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = true
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(togglePanel)
+        panelController.onClose = { [weak self] in self?.panelDidClose() }
+        visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
         rebuildMenu()
         renderBar()
+        if visualPreview {
+            configureVisualPreview()
+            return
+        }
         refresh(tokens: true, manual: true)
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -1505,8 +1877,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.checkForUpdate() }
     }
 
+    /// 本地视觉验收：固定数据、无网络/定时器，也不覆盖真实 status.json。
+    /// 默认展示绿/红；--visual-preview-normal 展示当前色/橙。
+    private func configureVisualPreview() {
+        let normal = CommandLine.arguments.contains("--visual-preview-normal")
+        let now = Date()
+        usage.fiveHour = QuotaWindow(usedPercent: normal ? 40 : 10, reset: now + 18_000)
+        usage.sevenDay = QuotaWindow(usedPercent: normal ? 80 : 90, reset: now + 604_800)
+        usage.planType = "plus"
+        usage.email = "preview@example.com"
+        usage.resetCards = [ResetCard(expires: now + 172_800, name: "全额重置卡")]
+        if CommandLine.arguments.contains("--visual-preview-long") {
+            usage.resetCards = (0..<30).map {
+                ResetCard(expires: now + TimeInterval($0 + 3) * 86_400, name: "全额重置卡 \($0 + 1)")
+            }
+        }
+        usage.tokensToday = TokenScanner.Stats(input: 1_200_000, output: 300_000, total: 1_500_000, files: 3)
+        usage.tokens7d = TokenScanner.Stats(input: 8_000_000, output: 2_000_000, total: 10_000_000, files: 20)
+        usage.tokens30d = TokenScanner.Stats(input: 24_000_000, output: 6_000_000, total: 30_000_000, files: 60)
+        usage.extToday = ExternalTokenScanner.Stats(input: 500_000, output: 100_000)
+        usage.ext7d = ExternalTokenScanner.Stats(input: 3_000_000, output: 600_000)
+        usage.ext30d = ExternalTokenScanner.Stats(input: 9_000_000, output: 1_800_000)
+        fiveHourLastOK = now
+        sevenDayLastOK = now
+        tokensLastOK = now
+        resetCardsLastOK = now
+        extLastOK = now
+        rebuildMenu()
+        renderBar()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self = self, let button = self.statusItem.button else { return }
+            self.panelController.toggle(anchoredTo: button)
+            if CommandLine.arguments.contains("--visual-preview-events") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    self.runVisualPanelEventTest()
+                }
+            }
+        }
+    }
+
+    /// 实际经 NSEvent 分发验证 Esc 与面板外点击，而非直接调用 close() 冒充通过。
+    private func runVisualPanelEventTest() {
+        func fail(_ message: String) {
+            fputs("CodexUsage visual event test: FAIL: \(message)\n", stderr)
+            exit(1)
+        }
+        if !panelController.isOpen, let button = statusItem.button {
+            panelController.toggle(anchoredTo: button)
+        }
+        guard panelController.isOpen else { return fail("preview panel did not open") }
+        if CommandLine.arguments.contains("--visual-preview-long")
+            && !panelController.scrollToEndForPreview() {
+            return fail("long content did not scroll")
+        }
+        guard let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: 0, context: nil, characters: "\u{1b}",
+            charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53) else {
+            return fail("could not create Escape event")
+        }
+        NSApp.postEvent(escape, atStart: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self = self else { return }
+            guard !self.panelController.isOpen else { return fail("Escape did not close panel") }
+            guard let button = self.statusItem.button else { return fail("status button missing") }
+            self.panelController.toggle(anchoredTo: button)
+            guard self.panelController.isOpen else { return fail("panel did not reopen") }
+            guard let outside = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero,
+                modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1) else {
+                return fail("could not create outside click event")
+            }
+            NSApp.postEvent(outside, atStart: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                guard !self.panelController.isOpen else { return fail("outside click did not close panel") }
+                self.panelController.toggle(anchoredTo: button)
+                guard let refresh = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                    timestamp: 0, windowNumber: 0, context: nil, characters: "r",
+                    charactersIgnoringModifiers: "r", isARepeat: false, keyCode: 15) else {
+                    return fail("could not create refresh key event")
+                }
+                NSApp.postEvent(refresh, atStart: false)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    guard !self.panelController.isOpen else { return fail("refresh action did not close panel") }
+                    print("CodexUsage visual event test: PASS (Escape, outside click, refresh action)")
+                    exit(0)
+                }
+            }
+        }
+    }
+
     // 拉取数据：额度走网络（回调内含 401 兜底刷新），token 扫描与重置卡明细走每 5 分钟周期
     private func refresh(tokens: Bool, manual: Bool = false) {
+        guard !visualPreview else { return }
         guard refreshGate.begin(manual: manual) else { return }
         performRefresh(tokens: tokens || manual)
     }
@@ -1564,24 +2026,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 菜单栏图标 + 下拉菜单的统一渲染入口；菜单打开期间延迟重建到关闭时
     private func updateUI() {
         renderBar()
-        if menuOpen { pendingMenuRebuild = true } else { rebuildMenu() }
+        if panelController.isOpen { pendingMenuRebuild = true } else { rebuildMenu() }
     }
 
-    // 打开菜单即触发一轮全量刷新（RefreshGate 防重入、合并重复请求）；
-    // 数据到位时若菜单仍打开，重建延迟到关闭后，下次打开即为最新
-    func menuWillOpen(_ menu: NSMenu) {
-        menuOpen = true
-        refresh(tokens: false, manual: true)
-        checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
+    @objc private func togglePanel() {
+        guard let button = statusItem.button else { return }
+        if !panelController.isOpen && pendingMenuRebuild {
+            pendingMenuRebuild = false
+            rebuildMenu()
+        }
+        panelController.toggle(anchoredTo: button)
+        if panelController.isOpen {
+            refresh(tokens: false, manual: true)
+            checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
+        }
     }
 
-    func menuDidClose(_ menu: NSMenu) {
-        menuOpen = false
+    private func panelDidClose() {
         if pendingMenuRebuild {
             pendingMenuRebuild = false
             rebuildMenu()
         }
     }
+
 
     // 本次新拉到的值非 nil 才算成功、才推进 lastOK；失败时保留旧数据 + 错误行
     private func applyQuota(_ r: QuotaData) {
@@ -1681,9 +2148,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // 菜单栏显示：5H / 7D 两行堆叠（剩余口径）；额度过期时第一行前缀 ⚠
     private func renderBar() {
-        let line1 = (fiveHourStale ? "⚠ " : "") + "5H \(Fmt.remainingPct(usage.fiveHour?.usedPercent))"
-        let line2 = (sevenDayStale ? "⚠ " : "") + "7D \(Fmt.remainingPct(usage.sevenDay?.usedPercent))"
-        statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
+        let fiveRemaining = Fmt.remaining(usage.fiveHour?.usedPercent)
+        let sevenRemaining = Fmt.remaining(usage.sevenDay?.usedPercent)
+        let line1 = StackImage.Line(label: (fiveHourStale ? "⚠ 5H" : "5H"),
+                                    value: Fmt.remainingPct(usage.fiveHour?.usedPercent),
+                                    remaining: fiveRemaining)
+        let line2 = StackImage.Line(label: (sevenDayStale ? "⚠ 7D" : "7D"),
+                                    value: Fmt.remainingPct(usage.sevenDay?.usedPercent),
+                                    remaining: sevenRemaining)
+        let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        statusItem.button?.image = StackImage.make(line1: line1, line2: line2, appearance: appearance)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = "Codex 用量 · 5H成功 \(fiveHourLastOK.map { Fmt.time($0) } ?? "--")"
@@ -1692,7 +2166,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             + " · 外部最后成功 \(extLastOK.map { Fmt.time($0) } ?? "--")"
             + " · 重置卡最后成功 \(resetCardsLastOK.map { Fmt.time($0) } ?? "--")"
             + " · Tibo 最后成功 \(tiboLastOK.map { Fmt.time($0) } ?? "--")"
-        writeStatus(line1: line1, line2: line2)
+        if !visualPreview {
+            writeStatus(line1: "\(line1.label) \(line1.value)", line2: "\(line2.label) \(line2.value)")
+        }
     }
 
     // 自诊断：把渲染内容写到本地，便于排查（绝不写任何凭证值）
@@ -1922,14 +2398,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quit.target = self
         menu.addItem(quit)
 
-        statusItem.menu = menu
-        menu.delegate = self
+        panelController.update(items: menu.items)
     }
 
     @objc private func onRefresh() { refresh(tokens: true, manual: true) }
 
     // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤30s 也会兜底重建）
     private func checkForUpdate() {
+        guard !visualPreview else { return }
         UpdateChecker.shared.check { [weak self] in self?.updateUI() }
     }
 
@@ -2019,6 +2495,22 @@ enum CodexOfflineRegression {
                        "out-of-range or fractional card count was accepted")
             try expect(CodexNumber.nonnegativeInteger(0) == 0,
                        "valid zero card count was rejected")
+
+            let tiers: [(Int?, RemainingColorTier)] = [
+                (nil, .normal), (0, .red), (19, .red), (20, .orange), (39, .orange),
+                (40, .normal), (79, .normal), (80, .green), (100, .green)
+            ]
+            for (remaining, expected) in tiers {
+                try expect(RemainingColorTier(remaining: remaining) == expected,
+                           "wrong menu bar color tier for \(remaining.map(String.init) ?? "nil")")
+            }
+            let previewLine = StackImage.Line(label: "5H", value: "90%", remaining: 90)
+            for name in [NSAppearance.Name.aqua, .darkAqua] {
+                let appearance = NSAppearance(named: name)!
+                let image = StackImage.make(line1: previewLine, line2: previewLine, appearance: appearance)
+                try expect(!image.isTemplate && image.size.width > 0 && image.tiffRepresentation != nil,
+                           "menu bar color image did not render for \(name.rawValue)")
+            }
 
             let missing = Fetcher.parseUsage([:], now: now, email: nil)
             try expect(missing.fiveHour == nil && missing.fiveHourError != nil, "missing 5H was not rejected")
@@ -2589,7 +3081,7 @@ enum CodexOfflineRegression {
                        && Fmt.webURL("") == nil,
                        "non-web tibo link scheme was accepted")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives/tail-read/zstd-missing hint, external usage model/parse/scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare, tibo link scheme allowlist)")
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives/tail-read/zstd-missing hint, external usage model/parse/scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare, tibo link scheme allowlist)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
