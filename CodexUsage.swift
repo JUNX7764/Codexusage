@@ -1946,6 +1946,7 @@ final class UsagePanelController: NSObject {
     private var codexExpanded = true
     private var externalExpanded = true
     private var updateMessage: String?
+    private var updateMessageDismissal: DispatchWorkItem?
     var previewWidth: CGFloat?
     var isOpen: Bool { panel.isVisible }
 
@@ -2131,12 +2132,21 @@ final class UsagePanelController: NSObject {
     @objc private func toggleCodex() { codexExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleExternal() { externalExpanded.toggle(); refreshPanelLayout() }
     @objc fileprivate func requestUpdateCheck() { onCheckUpdate?() }
-    func setUpdateMessage(_ message: String?) { updateMessage = message; refreshPanelLayout() }
+    func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
+        updateMessageDismissal?.cancel()
+        updateMessageDismissal = nil
+        updateMessage = message
+        refreshPanelLayout()
+        if message != nil, let delay = dismissAfter {
+            let dismissal = DispatchWorkItem { [weak self] in self?.setUpdateMessage(nil) }
+            updateMessageDismissal = dismissal
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: dismissal)
+        }
+    }
 
     private func makeTiboSection(_ model: UsagePanelModel.TiboSection) -> NSView {
         let card = PanelCardView(padding: 8)
         let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-        header.addArrangedSubview(PanelUI.symbol("checkmark.circle.fill", size: 16, color: .systemGreen))
         header.addArrangedSubview(PanelUI.label("Tibo 重置动态", size: 13, weight: .semibold, wrapping: false))
         header.addArrangedSubview(PanelUI.spacer())
         PanelUI.addFullWidth(header, to: card.contentStack)
@@ -3072,16 +3082,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func manualUpdateCheck() {
         panelController.setUpdateMessage("正在检查更新…")
         guard !visualPreview else {
-            panelController.setUpdateMessage("预览模式：未联网检查更新")
+            panelController.setUpdateMessage("预览模式：未联网检查更新", dismissAfter: 5)
             return
         }
         UpdateChecker.shared.check(force: true) { [weak self] result in
             guard let self = self else { return }
             switch result {
-            case .current: self.panelController.setUpdateMessage("当前已是最新版本")
-            case .available: self.panelController.setUpdateMessage("发现新版本，请点击上方更新提示")
-            case .failed: self.panelController.setUpdateMessage("检查失败，请稍后重试")
-            case .unknownVersion: self.panelController.setUpdateMessage("当前版本未知，无法比较")
+            case .current: self.panelController.setUpdateMessage("当前已是最新版本", dismissAfter: 5)
+            case .available: self.panelController.setUpdateMessage("发现新版本，请点击上方更新提示", dismissAfter: 5)
+            case .failed: self.panelController.setUpdateMessage("检查失败，请稍后重试", dismissAfter: 5)
+            case .unknownVersion: self.panelController.setUpdateMessage("当前版本未知，无法比较", dismissAfter: 5)
             }
             self.rebuildMenu()
         }
