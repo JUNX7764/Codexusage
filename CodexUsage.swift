@@ -142,7 +142,7 @@ enum TiboFreshness {
 //
 // 架构与同机 GlmUsage 完全同构（单文件 / 纯 Foundation + AppKit / 无外部依赖）。
 // 数据源：
-//   额度  GET https://chatgpt.com/backend-api/wham/usage（每 60s，Bearer 凭证来自 ~/.codex/auth.json）
+//   额度  GET https://chatgpt.com/backend-api/wham/usage（每 30s，Bearer 凭证来自 ~/.codex/auth.json）
 //   重置卡 GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits（每 5 分钟，认证头同款）
 //   Tibo 重置动态 GET https://aihot.news/api/v1/codex-resets/recent（每 5 分钟，AIHOT 公开接口，匿名只读不经凭据）
 //   token 统计：本地增量扫描 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl（每 5 分钟）
@@ -308,6 +308,8 @@ struct UsageData {
     var ext30d: ExternalTokenScanner.Stats?
     var quotaError: String?
     var tokensError: String?
+    var tokensZstdMissing = false   // 发现 .zst 归档但本机无 zstd（30 天口径缺失提示）
+    var extError: String?           // 外部用量已安装来源全部不可读
     var fiveHourError: String?
     var sevenDayError: String?
     var updatedAt: Date = Date()
@@ -704,6 +706,8 @@ enum TokenScanner {
         var seven = Stats()
         var thirty = Stats()
         var error: String?
+        /// 本轮发现 .zst 归档但本机无 zstd：归档会话未计入，30 天口径缺失需提示
+        var zstdMissing = false
     }
     struct Stats {
         var input = 0.0
@@ -726,13 +730,16 @@ enum TokenScanner {
 
     static func scan(root: String = sessionsRoot,
                      statePath: String = defaultStatePath,
-                     now: Date = Date()) -> Result {
+                     now: Date = Date(),
+                     zstdPath: String? = TokenScanner.zstdBin) -> Result {
         lock.lock(); defer { lock.unlock() }
         var st = loadState(at: statePath)
+        // 窗口口径：含今天共 7 / 30 个日历日（起算日 = 今天 −6 / −29 天）
         let todayKey = dayFmt.string(from: now)
-        let cutoff7 = dayFmt.string(from: now.addingTimeInterval(-7 * 86400))
-        let cutoff30 = dayFmt.string(from: now.addingTimeInterval(-30 * 86400))
+        let cutoff7 = dayFmt.string(from: now.addingTimeInterval(-6 * 86400))
+        let cutoff30 = dayFmt.string(from: now.addingTimeInterval(-29 * 86400))
         let cutoff31 = dayFmt.string(from: now.addingTimeInterval(-31 * 86400))
+        var zstdMissing = false
 
         var seen = Set<String>()
         var enumed = false
@@ -755,9 +762,12 @@ enum TokenScanner {
                 // 文件未变化：沿用上次结果（绝大多数文件走这里；.zst 以压缩档的
                 // size/mtime 为准，稳定不变）
                 if let e = st.files[path], e.size == Int64(size), e.mtime == mtime { continue }
-                guard let data = name.hasSuffix(".zst")
-                    ? zstdDecompress(path: path)
-                    : FileManager.default.contents(atPath: path) else { continue }
+                let isZst = name.hasSuffix(".zst")
+                if isZst && zstdPath == nil { zstdMissing = true; continue }
+                // 活跃 .jsonl 只需最后一条 token_count：尾部 1MB 反查，未命中才全量读
+                guard let data = isZst
+                    ? zstdDecompress(path: path, bin: zstdPath)
+                    : plainDataWithTailFallback(at: path) else { continue }
                 let u = lastTokenUsage(in: data) ?? (0.0, 0.0, 0.0)
                 st.files[path] = FileEntry(size: Int64(size), mtime: mtime, day: day,
                                            input: u.0, output: u.1, total: u.2)
@@ -777,6 +787,7 @@ enum TokenScanner {
 
         guard enumed else { return Result(error: "无法枚举 \(root)") }
         var r = Result()
+        r.zstdMissing = zstdMissing
         for e in st.files.values {
             if e.day == todayKey { add(&r.today, e) }
             if e.day >= cutoff7 { add(&r.seven, e) }
@@ -809,8 +820,8 @@ enum TokenScanner {
 
     /// 解压 .jsonl.zst 全量到内存（压缩档数百 KB、解压后 MB 级），复用 lastTokenUsage
     /// 的字节反查；任何失败返回 nil，按「本文件本轮无法读取」处理。
-    private static func zstdDecompress(path: String) -> Data? {
-        guard let bin = zstdBin else { return nil }
+    private static func zstdDecompress(path: String, bin: String?) -> Data? {
+        guard let bin = bin else { return nil }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: bin)
         p.arguments = ["-dc", "--", path]
@@ -822,6 +833,26 @@ enum TokenScanner {
         p.waitUntilExit()
         guard p.terminationStatus == 0, !data.isEmpty else { return nil }
         return data
+    }
+
+    /// 活跃 .jsonl 的读取：只要最后一条 token_count（通常在文件末尾附近），先读尾部
+    /// 1MB 做字节反查，命中即返回该尾部；未命中（token_count 只在头部或尾部截断行）
+    /// 再全量读兜底。tail 首行可能残缺，lastTokenUsage 的 JSON 校验会自然跳过它。
+    /// 避免每 5 分钟把几十 MB 的活跃会话全量读入内存。
+    private static func plainDataWithTailFallback(at path: String) -> Data? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        let end = fh.seekToEndOfFile()
+        let tailBytes: UInt64 = 1_048_576
+        guard end > tailBytes else {
+            fh.seek(toFileOffset: 0)
+            return fh.readDataToEndOfFile()
+        }
+        fh.seek(toFileOffset: end - tailBytes)
+        let tail = fh.readDataToEndOfFile()
+        if lastTokenUsage(in: tail) != nil { return tail }
+        fh.seek(toFileOffset: 0)
+        return fh.readDataToEndOfFile()
     }
 
     /// 取文件中最后一条 token_count 的 total_token_usage。
@@ -901,6 +932,9 @@ enum ExternalTokenScanner {
         var today = Stats()
         var seven = Stats()
         var thirty = Stats()
+        /// 已安装来源全部不可读（目录存在但枚举失败 / state.db 存在但查询失败）时置错；
+        /// 未安装任何来源（目录/库均不存在）不算失败——没装对应工具时该来源自然为 0
+        var error: String?
     }
 
     /// 按文件增量扫描状态：offset 为已消费字节数，days 为按日聚合 [input, output]
@@ -962,12 +996,21 @@ enum ExternalTokenScanner {
         var st = loadState(at: statePath)
         let cutoff = now.addingTimeInterval(-retainSeconds)
         let cutoffKey = dayFmt.string(from: cutoff)
-        scanFiles(roots: roots, cutoff: cutoff, cutoffKey: cutoffKey, into: &st)
-        if let db = hermesDB {
-            scanHermes(path: db, cutoffKey: cutoffKey, into: &st)
+        let files = scanFiles(roots: roots, cutoff: cutoff, cutoffKey: cutoffKey, into: &st)
+        var hermesOK: Bool?   // nil = 未安装（state.db 不存在），不算失败
+        if let db = hermesDB, FileManager.default.fileExists(atPath: db) {
+            hermesOK = scanHermes(path: db, cutoffKey: cutoffKey, into: &st)
         }
         saveState(st, at: statePath)
-        return buckets(st, now: now)
+        var r = buckets(st, now: now)
+        // 失败面：有已安装来源但无一可读 → 置错（调用方保留旧值、不推进成功时间）；
+        // 部分来源失败仍按成功处理（增量状态保留旧贡献，下轮自愈）
+        let anySource = files.installed > 0 || hermesOK != nil
+        let anySuccess = files.enumerated > 0 || hermesOK == true
+        if anySource && !anySuccess {
+            r.error = "外部会话目录 / hermes state.db 均不可读"
+        }
+        return r
     }
 
     /// 全解析符号链接的绝对路径（realpath(3)）；路径不存在时原样返回
@@ -978,14 +1021,20 @@ enum ExternalTokenScanner {
     }
 
     /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
-    /// 已被删除的文件从状态中剔除（枚举失败的 root 不动，避免目录临时不可用时误清）
+    /// 已被删除的文件从状态中剔除（枚举失败的 root 不动，避免目录临时不可用时误清）。
+    /// 返回 (已安装 root 数, 成功枚举 root 数)：目录不存在 = 未安装，不计入失败面。
     private static func scanFiles(roots: [String], cutoff: Date, cutoffKey: String,
-                                  into st: inout State) {
+                                  into st: inout State) -> (installed: Int, enumerated: Int) {
         var seen = Set<String>()
         var enumedRoots: [String] = []
+        var installed = 0
 
         for root in roots {
-            guard let enumerator = FileManager.default.enumerator(
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: root, isDirectory: &isDir) else { continue }
+            installed += 1
+            // 不是目录（异常）或枚举失败都算该 root 不可读；未枚举成功不入 enumedRoots
+            guard isDir.boolValue, let enumerator = FileManager.default.enumerator(
                 at: URL(fileURLWithPath: root),
                 includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles])
@@ -1037,6 +1086,7 @@ enum ExternalTokenScanner {
         for path in vanished {
             st.files.removeValue(forKey: path)
         }
+        return (installed, enumedRoots.count)
     }
 
     /// 解析一批完整行，把 OpenAI 系模型的 usage 按日累加进 days。
@@ -1089,10 +1139,11 @@ enum ExternalTokenScanner {
 
     /// hermes 用量库（sqlite，只读打开，绝不写入）。累计行与上次快照做差，
     /// delta 按 last_seen 归日；计数变小说明上游重置，rebase 不倒扣。
-    private static func scanHermes(path: String, cutoffKey: String, into st: inout State) {
+    /// 返回是否成功读取（库文件不存在由调用方先行排除，不算失败）。
+    private static func scanHermes(path: String, cutoffKey: String, into st: inout State) -> Bool {
         var db: OpaquePointer?
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db = db
-        else { _ = db.map { sqlite3_close($0) }; return }
+        else { _ = db.map { sqlite3_close($0) }; return false }
         defer { sqlite3_close(db) }
         // 行身份键与 KimiUsage 一致：同一 (session,model) 可因 task/billing 拆成多行；
         // input 含 cache read/write（与文件来源同口径，对齐中转/monitor 总量）
@@ -1102,7 +1153,7 @@ enum ExternalTokenScanner {
             FROM session_model_usage
             """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
 
         var hs = st.hermes ?? HermesState()
@@ -1136,13 +1187,14 @@ enum ExternalTokenScanner {
         hs.rows = hs.rows.filter { alive.contains($0.key) }
         hs.days = hs.days.filter { $0.key >= cutoffKey }
         st.hermes = hs
+        return true
     }
 
-    /// 按日聚合 → 今日/近7天/近30天（边界与 TokenScanner 一致：dayKey >= 起算日）
+    /// 按日聚合 → 今日/近7天/近30天（含今天共 7/30 个日历日，与 TokenScanner 一致）
     private static func buckets(_ st: State, now: Date) -> Result {
         let todayKey = dayFmt.string(from: now)
-        let d7Key = dayFmt.string(from: now.addingTimeInterval(-7 * 86400))
-        let d30Key = dayFmt.string(from: now.addingTimeInterval(-30 * 86400))
+        let d7Key = dayFmt.string(from: now.addingTimeInterval(-6 * 86400))
+        let d30Key = dayFmt.string(from: now.addingTimeInterval(-29 * 86400))
         var allDays: [String: [Double]] = [:]
         for (_, f) in st.files {
             for (day, v) in f.days {
@@ -1225,40 +1277,44 @@ enum Fmt {
         guard let u = w?.usedPercent else { return -1 }
         return max(0, min(100, Int((100 - u).rounded())))
     }
-    static func time(_ d: Date?) -> String {
-        guard let d = d else { return "" }
+    // 展示用 formatter 全部静态缓存：菜单每轮重建要调十几次，新建 DateFormatter 开销大
+    private static func zhFormatter(_ format: String) -> DateFormatter {
         let f = DateFormatter()
         f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = "HH:mm"
-        return f.string(from: d)
+        f.dateFormat = format
+        return f
+    }
+    private static let timeFmt = zhFormatter("HH:mm")
+    private static let dayTimeFmt = zhFormatter("MM-dd HH:mm")
+    private static let dayOnlyFmt = zhFormatter("MM-dd")
+    private static let expiresTodayFmt = zhFormatter("'今天' HH:mm")
+    private static let expiresTomorrowFmt = zhFormatter("'明天' HH:mm")
+    private static let expiresFullFmt = zhFormatter("yyyy-MM-dd HH:mm")
+
+    static func time(_ d: Date?) -> String {
+        guard let d = d else { return "" }
+        return timeFmt.string(from: d)
     }
     static func dayTime(_ d: Date?) -> String {
         guard let d = d else { return "" }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = "MM-dd HH:mm"
-        return f.string(from: d)
+        return dayTimeFmt.string(from: d)
     }
     static func day(_ d: Date?) -> String {
         guard let d = d else { return "" }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = "MM-dd"
-        return f.string(from: d)
+        return dayOnlyFmt.string(from: d)
     }
     /// 重置卡到期提示（本地时区）：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期
     static func expires(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "zh_CN")
         let cal = Calendar.current
-        if cal.isDateInToday(d) {
-            f.dateFormat = "'今天' HH:mm"
-        } else if cal.isDateInTomorrow(d) {
-            f.dateFormat = "'明天' HH:mm"
-        } else {
-            f.dateFormat = "yyyy-MM-dd HH:mm"
-        }
-        return f.string(from: d)
+        if cal.isDateInToday(d) { return expiresTodayFmt.string(from: d) }
+        if cal.isDateInTomorrow(d) { return expiresTomorrowFmt.string(from: d) }
+        return expiresFullFmt.string(from: d)
+    }
+    /// 第三方内容（AIHOT 事件）的链接只允许 http/https 打开，其他 scheme 一律拒绝
+    static func webURL(_ s: String) -> URL? {
+        guard let url = URL(string: s), let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else { return nil }
+        return url
     }
     /// token 数量缩写（B/M/K）：9,999 以内原样 / 123.4K / 1.23M / 1.23B（末尾多余的 .0 去掉）
     static func tokensAbbr(_ v: Double?) -> String {
@@ -1400,13 +1456,16 @@ final class UpdateChecker {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
     private var cycle = 0
     private let refreshGate = RefreshGate()
+    // 菜单打开期间不重建菜单（避免打开中的菜单被替换闪断），关闭时补一次
+    private var menuOpen = false
+    private var pendingMenuRebuild = false
     // token 扫描每 N 个刷新周期做一次（主循环 30s × 10 = 5 分钟；额度每轮都刷）
     private let tokenEveryCycles = 10
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
@@ -1453,8 +1512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func performRefresh(tokens: Bool) {
         lastAttemptAt = Date()
-        renderBar()
-        rebuildMenu()
+        updateUI()
         let group = DispatchGroup()
         group.enter()
         Fetcher.fetchQuota { [weak self] r in
@@ -1495,7 +1553,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
+            // 各 apply 回调只更新数据，渲染统一在这里做一次：
+            // 菜单重建与 status.json 写入每轮刷新各一次，而不是每个数据源一次
+            self.updateUI()
             if self.refreshGate.finish() { self.performRefresh(tokens: true) }
+        }
+    }
+
+    /// 菜单栏图标 + 下拉菜单的统一渲染入口；菜单打开期间延迟重建到关闭时
+    private func updateUI() {
+        renderBar()
+        if menuOpen { pendingMenuRebuild = true } else { rebuildMenu() }
+    }
+
+    // 打开菜单即触发一轮全量刷新（RefreshGate 防重入、合并重复请求）；
+    // 数据到位时若菜单仍打开，重建延迟到关闭后，下次打开即为最新
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        refresh(tokens: false, manual: true)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpen = false
+        if pendingMenuRebuild {
+            pendingMenuRebuild = false
+            rebuildMenu()
         }
     }
 
@@ -1513,8 +1595,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.quotaError = r.error
         usage.email = r.email ?? usage.email
         usage.updatedAt = Date()
-        renderBar()
-        rebuildMenu()
     }
 
     private func applyTokens(_ r: TokenScanner.Result) {
@@ -1526,21 +1606,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.tokens7d = r.seven
             usage.tokens30d = r.thirty
             usage.tokensError = nil
+            usage.tokensZstdMissing = r.zstdMissing
         }
         usage.updatedAt = Date()
-        renderBar()
-        rebuildMenu()
     }
 
-    // 外部用量：纯本地扫描，无网络失败面，结果总是全量可信快照
+    // 外部用量：成功则全量替换快照；已安装来源全部不可读时保留旧值、不推进 lastOK
+    // （30 分钟后现有 ⚠ 过期标注自动亮起），并显示错误行
     private func applyExternal(_ r: ExternalTokenScanner.Result) {
-        extLastOK = CodexFreshness.updated(extLastOK, succeeded: true, at: Date())
-        usage.extToday = r.today
-        usage.ext7d = r.seven
-        usage.ext30d = r.thirty
+        if let e = r.error {
+            usage.extError = e
+        } else {
+            extLastOK = CodexFreshness.updated(extLastOK, succeeded: true, at: Date())
+            usage.extToday = r.today
+            usage.ext7d = r.seven
+            usage.ext30d = r.thirty
+            usage.extError = nil
+        }
         usage.updatedAt = Date()
-        renderBar()
-        rebuildMenu()
     }
 
     // 重置卡：成功则更新并清错误；瞬时失败保留上次数据、仅记录错误
@@ -1552,8 +1635,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         resetCardsLastOK = r.lastOK
         usage.resetCardsError = r.error
         usage.updatedAt = Date()
-        renderBar()
-        rebuildMenu()
     }
 
     // Tibo 动态：304 = 内容未变但服务端确认有效（推进成功时间）；失败保留旧数据与旧成功时间。
@@ -1566,8 +1647,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tiboLastOK = r.lastOK
         usage.tiboError = r.error
         usage.updatedAt = Date()
-        renderBar()
-        rebuildMenu()
     }
 
     // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
@@ -1638,11 +1717,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "tiboError": usage.tiboError ?? "",
             "quotaLastSuccess": ["fiveHour": iso(fiveHourLastOK), "sevenDay": iso(sevenDayLastOK)],
             "tokensLastSuccess": iso(tokensLastOK),
+            "tokensZstdMissing": usage.tokensZstdMissing,
             "externalTokensToday": Fmt.tokensAbbr(usage.extToday?.total),
             "externalTokens7d": Fmt.tokensAbbr(usage.ext7d?.total),
             "externalTokens30d": Fmt.tokensAbbr(usage.ext30d?.total),
             "externalTokensLastSuccess": iso(extLastOK),
             "externalTokensStale": extStale,
+            "externalTokensError": usage.extError ?? "",
             "resetCardsLastSuccess": iso(resetCardsLastOK),
             "resetCardsStale": resetCardsStale,
             "fiveHourStale": fiveHourStale,
@@ -1747,7 +1828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             tiboItems.append(info("Tibo 重置动态"))
             for row in TiboDisplay.rows(events, now: Date()) {
                 let item = NSMenuItem(title: row.text, action: nil, keyEquivalent: "")
-                if let url = URL(string: row.link) {
+                if let url = Fmt.webURL(row.link) {   // 第三方链接仅放行 http/https
                     item.action = #selector(openLink(_:))
                     item.target = self
                     item.representedObject = url
@@ -1792,6 +1873,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(info("⚠ Codex用量已过期（最后成功 \(tokensLastOK.map { Fmt.dayTime($0) } ?? "--")）"))
         }
         if let e = usage.tokensError { menu.addItem(info("Codex用量统计失败：\(e)")) }
+        if usage.tokensZstdMissing {
+            menu.addItem(info("⚠ 未安装 zstd，压缩归档会话未计入（brew install zstd）"))
+        }
+        if let e = usage.extError { menu.addItem(info("外部用量统计失败：\(e)")) }
 
         // 外部用量（OpenAI 模型 · 非 Codex CLI）：Proma / Claude Code / hermes 里的
         // gpt* 等 OpenAI 系模型 token，与上方 Codex CLI 本机会话口径互补、不混算
@@ -1836,17 +1921,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quit)
 
         statusItem.menu = menu
+        menu.delegate = self
     }
 
     @objc private func onRefresh() { refresh(tokens: true, manual: true) }
 
     // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤30s 也会兜底重建）
     private func checkForUpdate() {
-        UpdateChecker.shared.check { [weak self] in self?.rebuildMenu() }
+        UpdateChecker.shared.check { [weak self] in self?.updateUI() }
     }
 
     @objc private func openLink(_ sender: NSMenuItem) {
-        if let url = sender.representedObject as? URL { NSWorkspace.shared.open(url) }
+        if let url = sender.representedObject as? URL,
+           let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // 更新横幅点击：唤起 Terminal 代跑 .app 内置 update.sh（从 GitHub Releases 下载最新
@@ -1894,7 +1983,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             """
             try? plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
         }
-        rebuildMenu()
+        updateUI()
     }
 
     @objc private func onQuit() { NSApp.terminate(nil) }
@@ -2265,6 +2354,34 @@ enum CodexOfflineRegression {
             try expect(t2.thirty.total == 3500 && t2.thirty.files == 2,
                        "tokens incremental rescan double-counted or dropped entries")
 
+            // zstd 缺失提示：发现 .zst 但 zstdPath=nil → zstdMissing 且归档不计入（30 天只剩明文）
+            if zstOK {
+                let noZstd = TokenScanner.scan(root: sesRoot,
+                                               statePath: root.path + "/ses-scan-state-nozstd.json",
+                                               now: now, zstdPath: nil)
+                try expect(noZstd.zstdMissing && noZstd.thirty.total == 500 && noZstd.thirty.files == 1,
+                           "missing zstd did not surface the archived-session gap "
+                           + "(got \(noZstd.thirty.total), missing=\(noZstd.zstdMissing))")
+            }
+
+            // tail-read：>1MB 活跃文件尾部命中最后一条 token_count；
+            // token_count 仅在开头时尾部反查未命中 → 全量读兜底，两条路径数值都必须正确
+            let tailRoot = root.path + "/codex-sessions-tail"
+            try FileManager.default.createDirectory(
+                atPath: tailRoot + "/" + sesDayDir(sesNew), withIntermediateDirectories: true)
+            let padding = String(repeating:
+                "{\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}\n",
+                count: 17_000)   // ~1.3MB，超过 1MB 尾部窗口
+            try (padding + sesUsage(1234)).write(
+                toFile: tailRoot + "/" + sesDayDir(sesNew)
+                    + "/rollout-\(sesStamp(sesNew))-cccc.jsonl", atomically: true, encoding: .utf8)
+            try (sesUsage(2222) + padding).write(
+                toFile: tailRoot + "/" + sesDayDir(sesNew)
+                    + "/rollout-\(sesStamp(sesNew))-dddd.jsonl", atomically: true, encoding: .utf8)
+            let tr = TokenScanner.scan(root: tailRoot, statePath: root.path + "/tail-scan-state.json", now: now)
+            try expect(tr.thirty.total == 1235 + 2223 && tr.thirty.files == 2,
+                       "tail-read or full-file fallback returned wrong totals (got \(tr.thirty.total))")
+
             // 外部用量增量扫描端到端（临时 roots + 临时状态文件，不碰真实 ~/.proma / ~/.claude）：
             // 窗口分桶、嵌套枚举、首见旧文件跳过、追加增量、删除剔除、截断重扫
             let extRootA = root.path + "/proma-a"
@@ -2280,7 +2397,9 @@ enum CodexOfflineRegression {
             let fileB = extRootB + "/nested/b.jsonl"   // 嵌套目录也必须枚举到
             let fileC = extRootA + "/old.jsonl"
             try [extLine("gpt-5.6-sol", extBase, inTok: 100, outTok: 10),
-                 extLine("gpt-5.6-sol", extBase.addingTimeInterval(-6 * 86400), inTok: 1000, outTok: 100)]
+                 extLine("gpt-5.6-sol", extBase.addingTimeInterval(-6 * 86400), inTok: 1000, outTok: 100),
+                 // −7 天：含今天共 7 天的窗口不含此行（钉口径），30 天窗口仍计入
+                 extLine("gpt-5.6-sol", extBase.addingTimeInterval(-7 * 86400), inTok: 5000, outTok: 500)]
                 .joined(separator: "\n").appending("\n")
                 .write(toFile: fileA, atomically: true, encoding: .utf8)
             try extLine("gpt-5.6-sol", extBase.addingTimeInterval(-29 * 86400), inTok: 10000, outTok: 1000)
@@ -2298,8 +2417,9 @@ enum CodexOfflineRegression {
             try expect(s1.today.input == 100 && s1.today.output == 10,
                        "external today window wrong (got \(s1.today.input)/\(s1.today.output))")
             try expect(s1.seven.input == 1100 && s1.seven.output == 110,
-                       "external 7d window wrong (got \(s1.seven.input))")
-            try expect(s1.thirty.input == 11100 && s1.thirty.output == 1110,
+                       "external 7d window wrong or −7d row leaked into 7-calendar-day window "
+                       + "(got \(s1.seven.input))")
+            try expect(s1.thirty.input == 16100 && s1.thirty.output == 1610,
                        "external 30d window wrong (old-file skip or nested enumeration failed)")
 
             let handleA = try FileHandle(forWritingTo: URL(fileURLWithPath: fileA))
@@ -2309,13 +2429,13 @@ enum CodexOfflineRegression {
             try handleA.close()
             let s2 = ExternalTokenScanner.scan(roots: extRoots, hermesDB: nil,
                                                statePath: extStatePath, now: extBase)
-            try expect(s2.today.input == 200 && s2.seven.input == 1200 && s2.thirty.input == 11200,
+            try expect(s2.today.input == 200 && s2.seven.input == 1200 && s2.thirty.input == 16200,
                        "external incremental append was double-counted or missed")
 
             try FileManager.default.removeItem(atPath: fileB)
             let s3 = ExternalTokenScanner.scan(roots: extRoots, hermesDB: nil,
                                                statePath: extStatePath, now: extBase)
-            try expect(s3.thirty.input == 1200,
+            try expect(s3.thirty.input == 6200,
                        "deleted external session file still contributed to the 30d window "
                        + "(got \(s3.thirty.input), state persisted: \(FileManager.default.contents(atPath: extStatePath) != nil))")
 
@@ -2325,6 +2445,26 @@ enum CodexOfflineRegression {
                                                statePath: extStatePath, now: extBase)
             try expect(s4.today.input == 30 && s4.seven.input == 30 && s4.thirty.input == 30,
                        "truncated external file did not rebase its aggregation")
+
+            // 外部用量失败面：已安装来源全部不可读 → error；未安装（路径不存在）不算失败；
+            // 部分来源可读仍按成功（增量状态保留旧贡献，下轮自愈）
+            let notADir = root.path + "/not-a-dir"
+            try Data("x".utf8).write(to: URL(fileURLWithPath: notADir))
+            let badScan = ExternalTokenScanner.scan(roots: [notADir], hermesDB: nil,
+                                                    statePath: root.path + "/ext-bad-state.json", now: extBase)
+            try expect(badScan.error != nil, "unreadable installed root was reported as success")
+            let absentScan = ExternalTokenScanner.scan(roots: [root.path + "/does-not-exist"], hermesDB: nil,
+                                                       statePath: root.path + "/ext-absent-state.json", now: extBase)
+            try expect(absentScan.error == nil, "not-installed source was reported as failure")
+            let notDB = root.path + "/not-a-db"
+            try Data("plain text".utf8).write(to: URL(fileURLWithPath: notDB))
+            let badHermes = ExternalTokenScanner.scan(roots: [], hermesDB: notDB,
+                                                      statePath: root.path + "/ext-badhermes-state.json", now: extBase)
+            try expect(badHermes.error != nil, "corrupt hermes db was reported as success")
+            let partialScan = ExternalTokenScanner.scan(roots: [extRootA, notADir], hermesDB: nil,
+                                                        statePath: root.path + "/ext-partial-state.json", now: extBase)
+            try expect(partialScan.error == nil && partialScan.thirty.input == 30,
+                       "partially readable sources were reported as total failure")
 
             // hermes 差分（临时 sqlite 夹具）：首扫按 last_seen 回填、累计行增长入当日、
             // 计数重置 rebase 不倒扣、行删除移出快照但保留历史差分
@@ -2440,7 +2580,14 @@ enum CodexOfflineRegression {
             try expect(!UpdateCheck.isOutdated(local: "", remote: "v1.0.0"), "empty local version flagged outdated")
             try expect(!UpdateCheck.isOutdated(local: "abc", remote: "1.2"), "non-numeric local version flagged outdated")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives, external usage model/parse/scan/hermes-diff, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare)")
+            // 第三方链接白名单：仅 http/https 允许打开
+            try expect(Fmt.webURL("https://x.com/a") != nil && Fmt.webURL("http://aihot.news") != nil,
+                       "http/https tibo link was rejected")
+            try expect(Fmt.webURL("javascript:alert(1)") == nil && Fmt.webURL("file:///etc/passwd") == nil
+                       && Fmt.webURL("") == nil,
+                       "non-web tibo link scheme was accepted")
+
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives/tail-read/zstd-missing hint, external usage model/parse/scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare, tibo link scheme allowlist)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
@@ -2497,6 +2644,7 @@ func onceMode() {
     let cards = cardsVar
     let cardsErr = cardsErrVar
     let ext = extVar
+    let tibo = tiboVar
     onceLock.unlock()
 
     if let q = quota {
@@ -2524,7 +2672,7 @@ func onceMode() {
     if let e = cardsErr { print("reset cards error: \(e)") }
 
     // Tibo 重置动态（AIHOT 公开接口）：第三方资讯源，只打印结果、不计入退出码
-    if let outcome = tiboVar {
+    if let outcome = tibo {
         switch outcome {
         case .fresh(let events, let checkedAt):
             print("tibo resets: \(events.count) events (AIHOT 核验 \(checkedAt.map { Fmt.dayTime($0) } ?? "--"))")

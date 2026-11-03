@@ -97,6 +97,8 @@ cp -R "$APP" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
 hdiutil create -volname "$EXECUTABLE $TAG" -srcfolder "$STAGING" -ov -format UDZO "$TMP/$EXECUTABLE.dmg" >/dev/null
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$TMP/$EXECUTABLE.zip"
+# zip 附带 SHA256 校验文件：update.sh 下载后 shasum -c 校验，缺失或不匹配即中止
+(cd "$TMP" && shasum -a 256 "$EXECUTABLE.zip" > "$EXECUTABLE.zip.sha256")
 hdiutil verify "$TMP/$EXECUTABLE.dmg" >/dev/null
 unzip -t "$TMP/$EXECUTABLE.zip" >/dev/null
 
@@ -104,6 +106,6 @@ echo "==> 推送 tag 并创建 GitHub Release"
 git push origin "$TAG"
 TAG_PUSHED=1
 gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes \
-    "$TMP/$EXECUTABLE.dmg" "$TMP/$EXECUTABLE.zip"
+    "$TMP/$EXECUTABLE.dmg" "$TMP/$EXECUTABLE.zip" "$TMP/$EXECUTABLE.zip.sha256"
 
 echo "✅ 已发布 ${TAG}；已装旧版本将在下轮检查（≤2 小时）提示更新"

@@ -72,7 +72,16 @@ out=""
 while [ "$#" -gt 0 ]; do
     if [ "$1" = "-o" ]; then out="$2"; shift 2; else shift; fi
 done
-: > "$out"
+case "$out" in
+    *.sha256)
+        if [ "${MOCK_SHA256_BAD:-0}" = 1 ]; then
+            printf '%064d  %s\n' 0 "CodexUsage.zip" > "$out"
+        else
+            (cd "$(dirname "$out")" && /usr/bin/shasum -a 256 "$(basename "${out%.sha256}")" > "$out")
+        fi
+        ;;
+    *) : > "$out" ;;
+esac
 ''')
         self._mock("unzip", r'''
 echo "unzip $*" >> "$MOCK_LOG"
@@ -232,6 +241,16 @@ exit 0
         self.assertFalse(any(self.apps.glob(f".{APP_NAME}.update.*")))
         self.assertTrue(self.state.exists())
 
+    def test_sha256_mismatch_aborts_before_any_replacement(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_SHA256_BAD="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("SHA256", result.stdout)
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+        self.assertFalse(any(line.startswith("mv ") for line in self.log_lines()))
+        self.assertTrue(self.state.exists())
+
     def test_staging_failure_preserves_old_app_and_service(self):
         installed = self.prepare_update()
         result = self.run_update(MOCK_CP_FAIL="1")
@@ -300,7 +319,8 @@ echo "build" >> "$MOCK_LOG"
         self.assertLess(next(i for i, line in enumerate(lines) if line.startswith("unzip -t")), push)
         if NEEDS_PEAK_TEST:
             self.assertLess(lines.index("peak-test"), push)
-        self.assertTrue(any(line.startswith("gh release create") for line in lines))
+        gh_line = next(line for line in lines if line.startswith("gh release create"))
+        self.assertIn(f"{EXECUTABLE}.zip.sha256", gh_line)
 
     def test_self_test_failure_blocks_push_release_and_cleans_local_tag(self):
         project = self.prepare_release()

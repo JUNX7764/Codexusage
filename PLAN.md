@@ -8,7 +8,7 @@
 
 ---
 
-## 1. 额度数据源（已实测，每 60 秒刷新）
+## 1. 额度数据源（已实测，每 30 秒刷新）
 
 ```
 GET https://chatgpt.com/backend-api/wham/usage
@@ -76,7 +76,7 @@ body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_to
 
 响应 `{ access_token, refresh_token?, id_token?, expires_in }`。发刷新请求前重新读取 auth.json；刷新成功写回前再次读取最新 JSON，并比较 access/refresh/id 三个认证字段。若 Codex CLI 已更新任一字段，则保留客户端的新凭据并用它重试额度请求。否则仅在最新文档上合并续期认证字段与 `last_refresh`，使用同目录唯一临时文件、原子 `rename()`，权限限制为仅所有者可访问。写入失败要作为失败返回，不能吞掉错误后报告续期成功。Codex CLI 不使用本应用的文件锁，因此检查最新字段到原子替换之间仍存在无法完全消除的并发写入窗口。刷新失败 → 记 quotaError。
 
-## 3. Token 统计（本地扫描，每 5 分钟一轮 = 每 5 个额度周期）
+## 3. Token 统计（本地扫描，每 5 分钟一轮 = 每 10 个额度周期）
 
 扫描 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`，仅近 30 天的日期目录。
 
@@ -88,7 +88,7 @@ body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_to
 ```
 
 - 会话日期 = 文件名前缀 `rollout-YYYY-MM-DDTHH-MM-SS-` 解析（本地时区）。
-- 聚合：今天 / 近 7 天 / 近 30 天 的 total_tokens 之和，附带 input（= input_tokens）/ output（= output_tokens）细分。
+- 聚合：今天 / 近 7 天 / 近 30 天 的 total_tokens 之和，附带 input（= input_tokens）/ output（= output_tokens）细分。**窗口口径：含今天共 7 / 30 个日历日**（起算日 = 今天 −6 / −29 天，2026-11-03 起；此前为 8 / 31 天）。
 - **增量扫描**（必须，避免每轮全量重读）：状态存 `~/Library/Application Support/CodexUsage/scan-state.json`，记录每文件 `{path: {size, mtime}}`；未变化的文件沿用上次结果；从索引消失的文件（已删除）剔除其贡献。可参考 KimiUsage 的同类实现：`/Users/Chester/Documents/kimi/workspace/kimi-usage-menubar/KimiUsage.swift`（搜"增量"）。
 - v1.0.0 不扫 `~/.proma`（Proma 目录）。
 
@@ -280,10 +280,22 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 - 脚本随包内置（.app Resources/update.sh），更新不再要求机器上有 clone、不依赖 swiftc。
 - 关键约束：下载产物替换的就是安装位置正在运行的那份并重启，不存在「clone 目录里构建了新 app 但没换装」的白更问题。
 
+## 4.9 性能与体验优化 —— 2026-11-03（perf-polish-20261103）
+
+开发计划与验收清单：`docs/features/perf-polish-20261103/01-plan.md`。变更点：
+
+- **菜单生命周期**：各数据源 apply 回调只更新数据，`group.notify` 统一渲染一次（此前一轮刷新重建菜单 5 次、写 status.json 5 次）；`NSMenuDelegate` 打开菜单即触发全量刷新（RefreshGate 合并），菜单打开期间不重建、关闭时补重建（避免打开中的菜单被替换闪断，数据下次打开即最新）。开机自启勾选、更新横幅出现/消失同样走统一 `updateUI()`。
+- **外部用量失败面**：已安装来源全部不可读（目录存在但非目录/枚举失败，state.db 存在但查询失败）→ `Result.error`，保留旧值不推进 lastOK，现有 ⚠ 过期机制自动生效并显示错误行；未安装来源（路径不存在）不算失败，部分来源可读仍按成功。
+- **TokenScanner tail-read**：活跃 .jsonl 先读尾部 1MB 反查最后一条 `total_token_usage`，未命中再全量读兜底，不再每 5 分钟全量读入几十 MB 活跃会话；.zst 路径不变。
+- **zstd 缺失提示**：发现 .zst 归档但本机无 zstd → `zstdMissing`，菜单 Codex用量区块提示「未安装 zstd，压缩归档会话未计入（brew install zstd）」，status.json 同步；`TokenScanner.scan` 增 `zstdPath` 注入参数供回归。
+- **窗口口径**：近 7 天 / 近 30 天统一为含今天共 7 / 30 个日历日（TokenScanner 与 ExternalTokenScanner 同步；Token Monitor 对账基准是 today，不受影响）。展示数字较此前（8/31 天）略降，属口径修正。
+- **SHA256 校验链**：release.sh 生成并上传 `CodexUsage.zip.sha256`；update.sh 下载后 `shasum -a 256 -c`，校验文件缺失或不匹配即中止，在解压/替换之前。
+- **其他**：`--once` tiboVar 与其余变量统一在锁内取快照（修数据竞争）；Fmt 展示用 DateFormatter 全部静态缓存；Tibo 第三方链接仅放行 http/https（菜单建项与 openLink 双保险）。
+
 ## 5. 工程与部署边界
 
 - 单文件 `CodexUsage.swift`；构建部署目标保持 macOS 13.0（本机 CLT 默认 macosx28 会被 LaunchServices 拒绝）。
-- 刷新节奏：额度 60s / token 扫描每 5 周期（照 GlmUsage 的 tokenEveryCycles 模式）。
+- 刷新节奏：额度 30s / token 扫描每 10 周期（照 GlmUsage 的 tokenEveryCycles 模式）。
 - 网络瞬断时保留上次成功数据但**必须**带 ⚠ 过期标注（与 GlmUsage 的静默保留不同，这是刻意改进）。
 - **本任务不做部署**：不动 LaunchAgents、不 kill CodexMeter、不拷贝到 ~/Applications（由主会话与用户确认后进行）。
 

@@ -87,6 +87,15 @@ if ! curl -fsSL --max-time 180 -o "${TMP}/CodexUsage.zip" "$ZIP_URL"; then
 fi
 
 echo "==> 2/5 校验发布包"
+# SHA256 校验：release.sh 随包上传 CodexUsage.zip.sha256，缺失或不匹配即中止
+if ! curl -fsSL --max-time 60 -o "${TMP}/CodexUsage.zip.sha256" "${ZIP_URL}.sha256"; then
+    echo "!! 校验文件下载失败（Release 缺少 SHA256 或网络异常），已中止"
+    exit 1
+fi
+if ! (cd "$TMP" && shasum -a 256 -c CodexUsage.zip.sha256); then
+    echo "!! 发布包 SHA256 校验失败，已中止"
+    exit 1
+fi
 unzip -q -o "${TMP}/CodexUsage.zip" -d "$TMP"
 NEW_APP="${TMP}/${APP_NAME}"
 NEW_BINARY="${NEW_APP}/Contents/MacOS/${EXECUTABLE}"
