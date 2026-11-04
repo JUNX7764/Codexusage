@@ -1,106 +1,47 @@
-# CodexUsage — Codex 订阅余量菜单栏小工具
+# CodexUsage
 
-macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时 / 7 天额度余量。原生 Swift 单文件实现，纯本地运行。
+**Codex 还剩多少，什么时候恢复？在 Mac 菜单栏一眼看见。**
 
-与 [KimiUsage](https://github.com/JUNX7764/kimi-usage-menubar)、[GlmUsage](https://github.com/JUNX7764/Glmusage) 是同族三件套，分别盯 Kimi / GLM / Codex 的订阅余量。
+无需反复打开网页，随时查看额度、重置时间和用量。
 
-## 功能
+[下载 CodexUsage](https://github.com/JUNX7764/Codexusage/releases/latest) · macOS 13+ · Apple Silicon
 
-- **菜单栏**：两行常驻，5H / 7D 剩余百分比；≥80% 绿色、40–79% 系统文本色、20–39% 橙色、<20% 红色，浅色/深色分别配色
-- **下拉面板**
-  - 原生 AppKit 分区面板：`.popover` 材质 + 90% 不透明窗口底色、16px 圆角、目标宽度 330pt；系统开启“减少透明度”时使用纯色背景
-  - 标题与底部操作区固定，中间内容滚动；信息使用系统主/次文本色与明确的语义色
-  - 额度：套餐等级、5H / 7D 剩余百分比与进度条、重置时间、重置卡分组；百分比与进度条共用四档语义色
-  - Tibo 重置动态：预告中的重置带预估窗口、最近一条已确认动态，点击行跳最新原帖
-  - Token 统计：今天 / 近 7 天 / 近 30 天的总量、输入和输出表格；两个用量区可分别折叠，默认展开
-  - 点击版本号可手动检查更新，结果显示 5 秒后自动收起
-  - 外部用量（Codex 之外，独立区块）：统计本机其他 AI 工具消耗的 token，与 Codex 用量分开显示、不合并计算
-    - 覆盖来源：Proma、Claude Code 本机会话、Hermes Agent 中走 OpenAI 系模型（gpt* / codex* / chatgpt* / o 系列）的会话
-    - 没装对应工具时该来源自然为 0；input 含 cache read
-    - 同一会话在多个目录重复写入时只统计一处，避免双算
-- **刷新机制**
-  - 额度每 30 秒；Token / 重置卡每 5 分钟；手动刷新拉取全部项目
-  - 一轮刷新最多运行一次，刷新中的多次手动请求合并为一轮后续完整刷新
-  - 5H、7D、Token、重置卡分别记录最后成功时间；失败时保留旧值并显示错误，超过对应时限标 ⚠
-  - 「最近尝试刷新」显示请求开始时间
-  - 打开下拉面板即触发一轮全量刷新；面板打开期间不重建内容，数据在关闭后更新、下次打开即最新
-  - 近 7 天 / 近 30 天为含今天共 7 / 30 个日历日；压缩归档（.zst）会话由内置的 zstd 解码源（vendor/zstddeclib.c）进程内解压计入，无需安装外部工具
-  - 外部用量来源全部不可读时保留旧值并显示错误与 ⚠ 过期标注，不静默清零
-  - Tibo 重置动态每 5 分钟刷新（ETag/304 轮询，内容未变也算有效成功），失败只降级该区块；预估窗口展示「预估/待确认」，不是倒计时（数据源：AIHOT 公开接口，匿名只读、不经凭据）；事件链接仅放行 http/https
 
-## 安装与更新
+**本地统计会话用量，不上传会话记录。**
 
-需要 macOS 13+。安装：到 [Releases](https://github.com/JUNX7764/Codexusage/releases) 下载最新 `CodexUsage.dmg`，打开后把 CodexUsage 拖进 Applications（或 `~/Applications`）双击运行。首次打开如遇 Gatekeeper 提示，右键 → 打开。
+<img src="docs/images/codex-usage.png" width="330" alt="CodexUsage 面板：剩余额度、重置卡和用量统计" />
 
-**更新**：发布新 Release 后（每 30 分钟检查一次，打开面板也会触发一次节流检查），面板最上方出现「⬆ 新版本可用，点击更新」，点击后在应用内显示下载进度与安装状态，完成后自动重启（zip 经 SHA256 校验后才替换）；也可以随时手动重跑安装步骤。更新检查和下载只认 `CodexUsage.zip` 与 `.sha256` 附件齐全的 Release；最新 Release 缺附件时自动选择最近的可安装版本，不会再对空 Release 发起必然 404 的下载。日常代码提交不会触发更新提示——只有正式发版才会。
+*截图使用演示数据。*
 
-从源码构建（开发者）：
+## 能做什么
 
-```bash
-./build.sh
-```
+- **随时看额度**：菜单栏显示 5 小时和 7 天剩余百分比，点开即可查看重置时间。
+- **查看重置卡和动态**：了解可用重置卡及到期时间，查看近期额度重置动态。预告时间仅供参考。
+- **回顾使用情况**：查看今天、近 7 天和近 30 天的 Token 用量，分别展示输入与输出。
+- **了解其他工具用量**：单独查看本机部分其他 AI 工具使用 OpenAI 模型的用量，与 Codex 用量分开展示。
 
-发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——创建本地 tag → 构建与离线自测 → 签名及 DMG/zip 校验 → 推送 tag → 创建 GitHub Release。若同名 Release 已存在（人工创建或上次上传中断），会补传/替换完整附件。验证失败不会推送远端 tag。
+额度来自当前登录账号；Token 用量根据本机可读取的会话记录统计，不代表其他设备的完整用量。
 
-## 原理
+## 安装
 
-- **凭据**：只读 `~/.codex/auth.json`（Codex CLI 维护），不落盘、不外传
-- **401 续期**：续期前及写回前重新读取 auth.json；若 Codex CLI 已更新认证字段，保留最新值。续期只合并认证字段到最新 JSON，使用唯一临时文件、原子替换和仅所有者权限。官方客户端不使用共享文件锁，检查与替换之间仍存在无法完全消除的并发写入窗口
-- **重置卡**：接口缺少列表或结构错误时按失败处理，保留旧卡和原成功时间；只有明确返回的空列表才表示暂无可用卡
-- **压缩归档**：Codex 会把超过保留期的会话就地压缩成 `rollout-*.jsonl.zst`；解压用内置的上游 zstd 单文件解码源（`vendor/zstddeclib.c`，v1.5.7，BSD-3-Clause）进程内完成，无需安装外部工具；损坏或解压后超过 256 MiB 的单个归档会跳过
-- **外部用量**：外部会话目录与数据库全程只读；Hermes 按累计快照差分统计，首次扫描回填近 30 天
+1. 在 [Releases](https://github.com/JUNX7764/Codexusage/releases/latest) 下载最新的 `CodexUsage.dmg`。
+2. 打开安装包，将 CodexUsage 拖入“应用程序”，然后打开。
+3. 使用前请先在本机 Codex CLI 登录 ChatGPT 账号。应用会读取已有登录状态来查询额度。
 
-## 隐私与安全
+首次打开如遇系统安全提示，可在 Finder 中右键点击应用，选择“打开”。本应用使用 ad-hoc 签名。
 
-- 纯本地运行，数据不上传
-- 凭据只读，不写入、不外传
-- 扫描的外部会话目录与数据库全程只读
+## 更新
 
-## 调试与自检
+有新版本时，点击面板顶部的更新提示，应用会显示更新进度并自动重启。较早的旧版本升级到带有此功能的版本时，仍会打开一次终端窗口。
 
-```bash
-# 离线自检：只用临时目录和假凭据，不读真实 Codex 凭据、不联网
-./CodexUsage.app/Contents/MacOS/CodexUsage --self-test
+## 数据与隐私
 
-# 脚本回归：PATH mock 故障注入，不操作真实 app、LaunchAgent 或 GitHub
-python3 -m unittest discover -s tests -p '*_test.py'
+**本机会话记录和用量统计在 Mac 上处理，不会上传到开发者服务器。**
 
-# 真实自检：读取本机凭据、联网拉一次数据后退出
-./CodexUsage.app/Contents/MacOS/CodexUsage --once
+查询额度和重置卡需要使用登录凭据连接 OpenAI；重置动态及版本检查分别连接 AIHOT 和 GitHub。登录状态过期时，应用可能续期并更新本机 Codex 凭据文件。
 
-# 固定假数据视觉预览：不联网、不写真实 status.json
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-normal
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-dark
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-long
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-states
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-empty
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-update
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-narrow
+## 其他工具
 
-# 面板本地截图：只捕捉面板；scroll-end 可先滚动到底部
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-output=/tmp/codex-panel.png
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-dark --visual-preview-scroll-end --visual-preview-output=/tmp/codex-panel-bottom.png
+同系列：[KimiUsage](https://github.com/JUNX7764/kimi-usage-menubar) · [GlmUsage](https://github.com/JUNX7764/Glmusage)
 
-# 面板事件回归：Esc / 外部点击 / R 刷新，自动验证并退出
-./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-events
-```
-
-## 文件说明
-
-| 文件 | 说明 |
-|---|---|
-| `CodexUsage.swift` | 全部源码（单文件 AppKit 菜单栏应用） |
-| `vendor/zstddeclib.c` | 上游 zstd v1.5.7 单文件解码源（BSD-3-Clause，许可见 `vendor/zstd-LICENSE`），用于进程内解压 `.zst` 会话归档 |
-| `vendor/zstd_bridge.c` / `.h` | zstd 解码的 C 桥接层（供 Swift 调用） |
-| `build.sh` | 编译 + 打包 + ad-hoc 签名脚本 |
-| `Info.plist` | App Bundle 配置（LSUIElement = 菜单栏常驻） |
-| `scripts/icon_gen.swift` | 图标生成脚本（缺 icns 时 build.sh 自动调用） |
-| `scripts/update.sh` | 就地更新脚本（从 Release 下载替换；build.sh 随包内置进 .app Resources） |
-| `scripts/release.sh` | 发布脚本（本地 tag → 构建与测试 → 资产校验 → 推 tag → GitHub Release） |
-| `tests/script_test.py` | 更新、发布、签名故障的离线回归测试 |
-| `PLAN.md` | 开发规格（数据源已实测、解析规则、UI 规格、验收标准） |
-
-## License
-
-MIT
+[开发说明](docs/DEVELOPMENT.md) · [MIT License](LICENSE)
