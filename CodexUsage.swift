@@ -1440,7 +1440,7 @@ enum BuildInfo {
 /// 提示的唯一触发条件是「GitHub 发布了更高版本的 Release」；commit hash 回答的是
 /// 「分支动没动」，不代表存在可安装的新版本。
 enum UpdateCheck {
-    static let apiURL = URL(string: "https://api.github.com/repos/JUNX7764/Codexusage/releases/latest")!
+    static let apiURL = URL(string: "https://api.github.com/repos/JUNX7764/Codexusage/releases?per_page=20")!
     static let releasesPage = URL(string: "https://github.com/JUNX7764/Codexusage/releases")!
     /// GitHub 匿名限额 60 次/小时/IP，30 分钟一查仅 2 次/小时；ETag/304 条件请求不耗配额
     static let interval: TimeInterval = 30 * 60
@@ -1471,6 +1471,22 @@ enum UpdateCheck {
             return l[i] < r[i]
         }
         return false
+    }
+
+    /// GitHub 按创建时间倒序返回 Release；空 Release 或附件上传不完整时跳过，
+    /// 与 update.sh 选择同一个「最近可安装版本」，避免提示后下载 404。
+    static func latestDownloadableTag(in releases: [[String: Any]]) -> String? {
+        for release in releases {
+            guard let tag = release["tag_name"] as? String, normalized(tag) != nil,
+                  release["draft"] as? Bool != true, release["prerelease"] as? Bool != true
+            else { continue }
+            let assets = release["assets"] as? [[String: Any]] ?? []
+            let names = Set(assets.compactMap { $0["name"] as? String })
+            if names.contains("CodexUsage.zip") && names.contains("CodexUsage.zip.sha256") {
+                return tag
+            }
+        }
+        return nil
     }
 }
 
@@ -1509,14 +1525,16 @@ final class UpdateChecker {
                 if err == nil, http?.statusCode == 304, self.etag != nil {
                     result = UpdateCheck.normalized(BuildInfo.version) == nil ? .unknownVersion : (self.available ? .available : .current)
                 } else if err == nil, let data = data, http?.statusCode == 200,
-                          let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                          let tag = obj["tag_name"] as? String,
-                          UpdateCheck.normalized(tag) != nil {
+                          let releases = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
                     if UpdateCheck.normalized(BuildInfo.version) == nil {
                         result = .unknownVersion
-                    } else {
+                    } else if let tag = UpdateCheck.latestDownloadableTag(in: releases) {
                         self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
                         result = self.available ? .available : .current
+                    } else {
+                        // 没有附件齐全的 Release：检查本身成功，结论为无可安装更新
+                        self.available = false
+                        result = .current
                     }
                     self.etag = http?.value(forHTTPHeaderField: "ETag")
                 }
@@ -3780,6 +3798,29 @@ enum CodexOfflineRegression {
             try expect(!UpdateCheck.isOutdated(local: "", remote: "v1.0.0"), "empty local version flagged outdated")
             try expect(!UpdateCheck.isOutdated(local: "abc", remote: "1.2"), "non-numeric local version flagged outdated")
 
+            // 更新检查与脚本都只认附件完整的 Release；最新空 Release 不遮挡最近可安装版本
+            let completeRelease: [String: Any] = [
+                "tag_name": "v1.0.8", "draft": false, "prerelease": false,
+                "assets": [["name": "CodexUsage.zip"], ["name": "CodexUsage.zip.sha256"]],
+            ]
+            let emptyRelease: [String: Any] = [
+                "tag_name": "v1.0.9", "draft": false, "prerelease": false, "assets": [],
+            ]
+            let zipOnlyRelease: [String: Any] = [
+                "tag_name": "v1.0.10", "draft": false, "prerelease": false,
+                "assets": [["name": "CodexUsage.zip"]],
+            ]
+            try expect(UpdateCheck.latestDownloadableTag(in: [emptyRelease, completeRelease]) == "v1.0.8",
+                       "empty latest release hid downloadable release")
+            try expect(UpdateCheck.latestDownloadableTag(in: [zipOnlyRelease]) == nil,
+                       "release without SHA256 accepted")
+            try expect(UpdateCheck.latestDownloadableTag(in: [emptyRelease]) == nil,
+                       "release without assets accepted")
+            var prerelease = completeRelease
+            prerelease["prerelease"] = true
+            try expect(UpdateCheck.latestDownloadableTag(in: [prerelease, completeRelease]) == "v1.0.8",
+                       "prerelease not skipped")
+
             // 第三方链接白名单：仅 http/https 允许打开
             try expect(Fmt.webURL("https://x.com/a") != nil && Fmt.webURL("http://aihot.news") != nil,
                        "http/https tibo link was rejected")
@@ -3787,7 +3828,7 @@ enum CodexOfflineRegression {
                        && Fmt.webURL("") == nil,
                        "non-web tibo link scheme was accepted")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives/real-frame decode/tail-read, external usage model/parse/scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare, tibo link scheme allowlist)")
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives/real-frame decode/tail-read, external usage model/parse/scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)

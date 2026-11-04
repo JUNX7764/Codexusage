@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO="JUNX7764/Codexusage"
-ZIP_URL="https://github.com/${REPO}/releases/latest/download/CodexUsage.zip"
+API_URL="https://api.github.com/repos/${REPO}/releases?per_page=20"
 APP_NAME="CodexUsage.app"
 EXECUTABLE="CodexUsage"
 LABEL="com.local.codex-usage"
@@ -79,16 +79,63 @@ on_exit() {
 }
 trap on_exit EXIT
 
-echo "==> 1/5 下载最新 Release（${ZIP_URL}）"
+echo "==> 1/5 查找并下载最新可安装 Release"
+# 不假设 releases/latest 一定带附件：人工建 Release 或上传中断时会留下空 Release。
+# 用 macOS 自带 JXA 解析 GitHub JSON，跳过 draft/prerelease 及 ZIP/SHA256 不完整的条目。
+if ! curl -fsSL --max-time 60 \
+    -H 'Accept: application/vnd.github+json' -H 'User-Agent: CodexUsage-Updater' \
+    -o "${TMP}/releases.json" "$API_URL"; then
+    echo "!! Release 信息获取失败，请检查网络后重试"
+    exit 1
+fi
+if ! SELECTION="$(/usr/bin/osascript -l JavaScript - "${TMP}/releases.json" "$EXECUTABLE" <<'JXA'
+function run(argv) {
+    const text = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null);
+    if (!text) { return ""; }
+    const releases = JSON.parse(text.js);
+    if (!Array.isArray(releases)) { return ""; }
+    const zipName = argv[1] + ".zip";
+    for (const release of releases) {
+        if (release.draft || release.prerelease || !Array.isArray(release.assets)) { continue; }
+        let zip = null;
+        let checksum = null;
+        for (const asset of release.assets) {
+            if (asset.name === zipName) { zip = asset; }
+            if (asset.name === zipName + ".sha256") { checksum = asset; }
+        }
+        if (zip && checksum && typeof release.tag_name === "string") {
+            return [zip.browser_download_url, checksum.browser_download_url, release.tag_name].join("\t");
+        }
+    }
+    return "";
+}
+JXA
+)"; then
+    echo "!! Release 信息解析失败，已中止"
+    exit 1
+fi
+if [ -z "$SELECTION" ]; then
+    echo "!! 没有找到 ZIP 和 SHA256 齐全的 Release，已中止"
+    exit 1
+fi
+IFS=$'\t' read -r ZIP_URL SHA256_URL RELEASE_TAG <<< "$SELECTION"
+case "$ZIP_URL" in
+    "https://github.com/${REPO}/releases/download/"*"/${EXECUTABLE}.zip") ;;
+    *) echo "!! Release 返回了非预期的 ZIP 地址，已中止"; exit 1 ;;
+esac
+case "$SHA256_URL" in
+    "https://github.com/${REPO}/releases/download/"*"/${EXECUTABLE}.zip.sha256") ;;
+    *) echo "!! Release 返回了非预期的 SHA256 地址，已中止"; exit 1 ;;
+esac
+echo "==> 下载 ${RELEASE_TAG}（${ZIP_URL}）"
 if ! curl -fsSL --max-time 180 -o "${TMP}/CodexUsage.zip" "$ZIP_URL"; then
-    echo "!! 下载失败——打开 Releases 页面手动下载"
-    open "https://github.com/${REPO}/releases"
+    echo "!! 发布包下载失败，请稍后重试"
     exit 1
 fi
 
 echo "==> 2/5 校验发布包"
 # SHA256 校验：release.sh 随包上传 CodexUsage.zip.sha256，缺失或不匹配即中止
-if ! curl -fsSL --max-time 60 -o "${TMP}/CodexUsage.zip.sha256" "${ZIP_URL}.sha256"; then
+if ! curl -fsSL --max-time 60 -o "${TMP}/CodexUsage.zip.sha256" "$SHA256_URL"; then
     echo "!! 校验文件下载失败（Release 缺少 SHA256 或网络异常），已中止"
     exit 1
 fi

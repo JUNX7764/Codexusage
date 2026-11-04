@@ -1,3 +1,4 @@
+import json
 import os
 import plistlib
 import re
@@ -44,6 +45,14 @@ class ScriptTest(unittest.TestCase):
         self.real_cp = shutil.which("cp")
         self.real_mv = shutil.which("mv")
         self._write_mocks()
+        zip_url = f"https://github.com/{REPO}/releases/download/v2.0.0/{EXECUTABLE}.zip"
+        releases = [{
+            "tag_name": "v2.0.0", "draft": False, "prerelease": False,
+            "assets": [
+                {"name": f"{EXECUTABLE}.zip", "browser_download_url": zip_url},
+                {"name": f"{EXECUTABLE}.zip.sha256", "browser_download_url": zip_url + ".sha256"},
+            ],
+        }]
         self.env = os.environ.copy()
         self.env.update({
             "HOME": str(self.home),
@@ -53,6 +62,7 @@ class ScriptTest(unittest.TestCase):
             "MOCK_UNHEALTHY_MARKER": str(self.unhealthy_marker),
             "MOCK_ORIGIN_REPO": REPO,
             "MOCK_APP_NAME": APP_NAME,
+            "MOCK_RELEASES_JSON": json.dumps(releases),
             "REAL_CP": self.real_cp,
             "REAL_MV": self.real_mv,
         })
@@ -73,6 +83,9 @@ while [ "$#" -gt 0 ]; do
     if [ "$1" = "-o" ]; then out="$2"; shift 2; else shift; fi
 done
 case "$out" in
+    *releases.json)
+        printf '%s' "$MOCK_RELEASES_JSON" > "$out"
+        ;;
     *.sha256)
         if [ "${MOCK_SHA256_BAD:-0}" = 1 ]; then
             printf '%064d  %s\n' 0 "CodexUsage.zip" > "$out"
@@ -154,7 +167,14 @@ case "$1" in
 esac
 exit 0
 ''')
-        self._mock("gh", 'echo "gh $*" >> "$MOCK_LOG"\nexit 0\n')
+        self._mock("gh", r'''
+echo "gh $*" >> "$MOCK_LOG"
+if [ "$1 $2" = "release view" ]; then
+    [ "${MOCK_RELEASE_EXISTS:-0}" = 1 ]
+    exit $?
+fi
+exit 0
+''')
         self._mock("hdiutil", r'''
 echo "hdiutil $*" >> "$MOCK_LOG"
 if [ "$1" = "create" ]; then : > "${!#}"; fi
@@ -241,6 +261,37 @@ exit 0
         self.assertFalse(any(self.apps.glob(f".{APP_NAME}.update.*")))
         self.assertTrue(self.state.exists())
 
+    def test_update_skips_empty_latest_release(self):
+        installed = self.prepare_update()
+        zip_url = f"https://github.com/{REPO}/releases/download/v2.0.0/{EXECUTABLE}.zip"
+        releases = [
+            {"tag_name": "v3.0.0", "draft": False, "prerelease": False, "assets": []},
+            {
+                "tag_name": "v2.0.0", "draft": False, "prerelease": False,
+                "assets": [
+                    {"name": f"{EXECUTABLE}.zip", "browser_download_url": zip_url},
+                    {"name": f"{EXECUTABLE}.zip.sha256", "browser_download_url": zip_url + ".sha256"},
+                ],
+            },
+        ]
+        result = self.run_update(MOCK_RELEASES_JSON=json.dumps(releases))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        self.assertIn("下载 v2.0.0", result.stdout)
+        curls = [line for line in self.log_lines() if line.startswith("curl")]
+        self.assertTrue(any(zip_url in line for line in curls))
+        self.assertFalse(any("releases/latest/download" in line for line in curls))
+
+    def test_no_complete_release_preserves_old_app_and_service(self):
+        installed = self.prepare_update()
+        releases = [{"tag_name": "v3.0.0", "draft": False, "prerelease": False, "assets": []}]
+        result = self.run_update(MOCK_RELEASES_JSON=json.dumps(releases))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("没有找到 ZIP 和 SHA256 齐全", result.stdout)
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+        self.assertTrue(self.state.exists())
+
     def test_sha256_mismatch_aborts_before_any_replacement(self):
         installed = self.prepare_update()
         result = self.run_update(MOCK_SHA256_BAD="1")
@@ -321,6 +372,17 @@ echo "build" >> "$MOCK_LOG"
             self.assertLess(lines.index("peak-test"), push)
         gh_line = next(line for line in lines if line.startswith("gh release create"))
         self.assertIn(f"{EXECUTABLE}.zip.sha256", gh_line)
+
+    def test_existing_release_is_completed_with_clobber_upload(self):
+        project = self.prepare_release()
+        result = self.run_release(project, MOCK_RELEASE_EXISTS="1")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        lines = self.log_lines()
+        self.assertFalse(any(line.startswith("gh release create") for line in lines))
+        upload = next(line for line in lines if line.startswith("gh release upload"))
+        self.assertIn("--clobber", upload)
+        for suffix in (".dmg", ".zip", ".zip.sha256"):
+            self.assertIn(f"{EXECUTABLE}{suffix}", upload)
 
     def test_self_test_failure_blocks_push_release_and_cleans_local_tag(self):
         project = self.prepare_release()
