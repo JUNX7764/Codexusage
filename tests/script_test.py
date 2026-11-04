@@ -32,7 +32,7 @@ OTHER_LABELS = {"com.local.codex-usage", "com.local.glm-usage", "com.local.kimi-
 class ScriptTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()
         self.home = self.base / "home"
         self.apps = self.home / "Applications"
         self.apps.mkdir(parents=True)
@@ -115,7 +115,7 @@ exit 0
         self._mock("launchctl", r'''
 echo "launchctl $*" >> "$MOCK_LOG"
 case "$1" in
-    print) [ "${MOCK_AGENT_ACTIVE:-0}" = 1 ] ;;
+    print) [ "${MOCK_AGENT_ACTIVE:-0}" = 1 ] || exit 1; printf "\tprogram = %s\n" "${MOCK_LOADED_BINARY:-$MOCK_TARGET/Contents/MacOS/$MOCK_EXECUTABLE}" ;;
     bootout)
         if [ "${MOCK_BOOTOUT_FAIL:-0}" = 1 ]; then exit 42; fi
         rm -f "$MOCK_STATE"
@@ -133,6 +133,10 @@ esac
 echo "open $*" >> "$MOCK_LOG"
 if [ "$1" = "-R" ]; then exit 0; fi
 : > "$MOCK_STATE"
+''')
+        self._mock("ps", r'''
+if [ -e "$MOCK_STATE" ]; then echo "99999 $MOCK_TARGET/Contents/MacOS/$MOCK_EXECUTABLE"; fi
+if [ "${MOCK_OTHER_COPY:-0}" = 1 ]; then echo "99998 /other/${MOCK_APP_NAME}/Contents/MacOS/$MOCK_EXECUTABLE"; fi
 ''')
         self._mock("pgrep", '[ -e "$MOCK_STATE" ]\n')
         self._mock("pkill", 'echo "pkill $*" >> "$MOCK_LOG"\nrm -f "$MOCK_STATE"\n')
@@ -199,6 +203,7 @@ chmod +x "$out"
         resources.mkdir(parents=True)
         info = {
             "CFBundleExecutable": EXECUTABLE,
+            "CFBundleIdentifier": LABEL,
             "CFBundleShortVersionString": version.lstrip("v"),
             "CFBundleVersion": version.lstrip("v"),
             "CUBuildVersion": version,
@@ -233,16 +238,17 @@ exit 0
         payload = self.make_app(self.base / "payload", "v2.0.0", "new")
         plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
         plist.parent.mkdir(parents=True)
-        plist.write_text("test plist")
+        with plist.open("wb") as handle:
+            plistlib.dump({"ProgramArguments": [str(installed / "Contents" / "MacOS" / EXECUTABLE)]}, handle)
         self.state.write_text("old process")
-        self.env.update({"MOCK_AGENT_ACTIVE": "1", "MOCK_PAYLOAD": str(payload)})
+        self.env.update({"MOCK_AGENT_ACTIVE": "1", "MOCK_PAYLOAD": str(payload), "MOCK_TARGET": str(installed), "MOCK_EXECUTABLE": EXECUTABLE})
         return installed
 
     def run_update(self, **overrides):
         env = self.env.copy()
         env.update(overrides)
         return subprocess.run(
-            ["bash", str(UPDATE)], env=env, text=True,
+            ["bash", str(UPDATE), "v2.0.0", str(self.apps / APP_NAME)], env=env, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
         )
 
@@ -343,6 +349,72 @@ exit 0
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.marker(installed), "old")
         self.assertFalse(any(line.startswith("mv ") for line in self.log_lines()))
+
+    def test_wrong_payload_version_is_rejected(self):
+        installed = self.prepare_update()
+        with (self.base / "payload" / APP_NAME / "Contents" / "Info.plist").open("rb") as f:
+            info = plistlib.load(f)
+        info["CUBuildVersion"] = "v3.0.0"
+        with (self.base / "payload" / APP_NAME / "Contents" / "Info.plist").open("wb") as f:
+            plistlib.dump(info, f)
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_wrong_bundle_identifier_is_rejected(self):
+        installed = self.prepare_update()
+        info_path = self.base / "payload" / APP_NAME / "Contents" / "Info.plist"
+        with info_path.open("rb") as f: info = plistlib.load(f)
+        info["CFBundleIdentifier"] = "other.app"
+        with info_path.open("wb") as f: plistlib.dump(info, f)
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_downgrade_and_other_copy_are_rejected(self):
+        installed = self.prepare_update()
+        info_path = installed / "Contents" / "Info.plist"
+        with info_path.open("rb") as f: info = plistlib.load(f)
+        info["CUBuildVersion"] = "v3.0.0"
+        with info_path.open("wb") as f: plistlib.dump(info, f)
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        info["CUBuildVersion"] = "v1.0.0"
+        with info_path.open("wb") as f: plistlib.dump(info, f)
+        result = self.run_update(MOCK_OTHER_COPY="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_agent_pointing_elsewhere_is_rejected(self):
+        installed = self.prepare_update()
+        plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        with plist.open("wb") as f: plistlib.dump({"ProgramArguments": ["/other/CodexUsage"]}, f)
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_target_release_cannot_point_to_other_tag_assets(self):
+        installed = self.prepare_update()
+        zip_url = f"https://github.com/{REPO}/releases/download/v3.0.0/{EXECUTABLE}.zip"
+        releases = [{"tag_name": "v2.0.0", "draft": False, "prerelease": False, "assets": [
+            {"name": f"{EXECUTABLE}.zip", "browser_download_url": zip_url},
+            {"name": f"{EXECUTABLE}.zip.sha256", "browser_download_url": zip_url + ".sha256"}]}]
+        result = self.run_update(MOCK_RELEASES_JSON=json.dumps(releases))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_loaded_agent_mismatch_rejected_even_when_plist_matches(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_LOADED_BINARY="/other/CodexUsage")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("已加载的 LaunchAgent", result.stdout)
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
 
     def prepare_release(self):
         project = self.base / "release-project"

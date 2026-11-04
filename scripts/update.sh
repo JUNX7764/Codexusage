@@ -10,7 +10,7 @@ LABEL="com.local.codex-usage"
 MYUID="$(id -u)"
 AGENT_PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 
-TMP="$(mktemp -d)"
+TMP=""
 KEEP_TMP=0
 WORK=""
 BACKUP=""
@@ -19,17 +19,59 @@ AGENT=0
 STOPPED=0
 SUCCESS=0
 NEW_VERSION=""
+[ "$#" -eq 2 ] || { echo "!! 需要目标版本和当前应用路径"; exit 1; }
+TARGET_TAG="$1"
+INSTALLED="$2"
+[[ "$TARGET_TAG" =~ ^v?[0-9]+(\.[0-9]+)+$ ]] || { echo "!! 目标版本无效"; exit 1; }
+[ -d "$INSTALLED" ] && [ "$(basename "$INSTALLED")" = "$APP_NAME" ] || { echo "!! 应用路径无效"; exit 1; }
+INSTALLED="$(cd "$(dirname "$INSTALLED")" && pwd -P)/${APP_NAME}"
+BINARY="${INSTALLED}/Contents/MacOS/${EXECUTABLE}"
+[ -x "$BINARY" ] || { echo "!! 当前应用缺少可执行文件"; exit 1; }
+TMP="$(mktemp -d)"
+
+# 仅匹配实际可执行路径；遇到同名的其他副本时中止，绝不按名称杀进程。
+processes() { ps -axo pid=,comm=; }
+target_pids() {
+    while read -r pid command; do
+        case "$command" in "$BINARY") echo "$pid";; esac
+    done < <(processes)
+}
+other_copy_running() {
+    while read -r pid command; do
+        case "$command" in
+          "$BINARY") ;;
+          *"/${EXECUTABLE}") return 0;;
+        esac
+    done < <(processes)
+    return 1
+}
+stop_target() {
+    local pid
+    while read -r pid; do [ -z "$pid" ] || kill "$pid" 2>/dev/null || true; done < <(target_pids)
+}
+version_newer() {
+    /usr/bin/osascript -l JavaScript - "$1" "$2" <<'JXA'
+function run(a) {
+  function parts(s) { let m = /^v?(\d+(?:\.\d+)+)(?:-.+)?$/.exec(s); return m ? m[1].split('.').map(Number) : null; }
+  let n = parts(a[0]), o = parts(a[1]); if (!n || !o) return 'no';
+  for (let i = 0; i < Math.max(n.length, o.length); i++) {
+    let x = n[i] || 0, y = o[i] || 0; if (x !== y) return x > y ? 'yes' : 'no';
+  }
+  return 'no';
+}
+JXA
+}
 
 start_and_wait() {
     if [ "$AGENT" = 1 ]; then
         launchctl bootstrap "gui/${MYUID}" "$AGENT_PLIST"
     else
-        open "$INSTALLED"
+        open -n "$INSTALLED"
     fi
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        if pgrep -x "$EXECUTABLE" >/dev/null 2>&1; then
+        if [ -n "$(target_pids)" ]; then
             sleep 1
-            if pgrep -x "$EXECUTABLE" >/dev/null 2>&1; then
+            if [ -n "$(target_pids)" ]; then
                 return 0
             fi
         fi
@@ -45,7 +87,7 @@ rollback() {
     if [ "$AGENT" = 1 ]; then
         launchctl bootout "gui/${MYUID}/${LABEL}" >/dev/null 2>&1
     fi
-    pkill -x "$EXECUTABLE" 2>/dev/null
+    stop_target
     sleep 1
     if [ -d "$BACKUP" ]; then
         if [ -d "$INSTALLED" ]; then
@@ -88,7 +130,7 @@ if ! curl -fsSL --max-time 60 \
     echo "!! Release 信息获取失败，请检查网络后重试"
     exit 1
 fi
-if ! SELECTION="$(/usr/bin/osascript -l JavaScript - "${TMP}/releases.json" "$EXECUTABLE" <<'JXA'
+if ! SELECTION="$(/usr/bin/osascript -l JavaScript - "${TMP}/releases.json" "$EXECUTABLE" "$TARGET_TAG" <<'JXA'
 function run(argv) {
     const text = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null);
     if (!text) { return ""; }
@@ -96,7 +138,7 @@ function run(argv) {
     if (!Array.isArray(releases)) { return ""; }
     const zipName = argv[1] + ".zip";
     for (const release of releases) {
-        if (release.draft || release.prerelease || !Array.isArray(release.assets)) { continue; }
+        if (release.tag_name !== argv[2] || release.draft || release.prerelease || !Array.isArray(release.assets)) { continue; }
         let zip = null;
         let checksum = null;
         for (const asset of release.assets) {
@@ -120,11 +162,11 @@ if [ -z "$SELECTION" ]; then
 fi
 IFS=$'\t' read -r ZIP_URL SHA256_URL RELEASE_TAG <<< "$SELECTION"
 case "$ZIP_URL" in
-    "https://github.com/${REPO}/releases/download/"*"/${EXECUTABLE}.zip") ;;
+    "https://github.com/${REPO}/releases/download/${TARGET_TAG}/${EXECUTABLE}.zip") ;;
     *) echo "!! Release 返回了非预期的 ZIP 地址，已中止"; exit 1 ;;
 esac
 case "$SHA256_URL" in
-    "https://github.com/${REPO}/releases/download/"*"/${EXECUTABLE}.zip.sha256") ;;
+    "https://github.com/${REPO}/releases/download/${TARGET_TAG}/${EXECUTABLE}.zip.sha256") ;;
     *) echo "!! Release 返回了非预期的 SHA256 地址，已中止"; exit 1 ;;
 esac
 echo "==> 下载 ${RELEASE_TAG}（${ZIP_URL}）"
@@ -158,30 +200,27 @@ if ! NEW_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${NEW_AP
     echo "!! 发布包缺少构建版本"
     exit 1
 fi
+[ "$NEW_VERSION" = "$TARGET_TAG" ] || { echo "!! 发布包构建版本与目标不符"; exit 1; }
+for bundle in "$NEW_APP" "$INSTALLED"; do
+    BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Contents/Info.plist")" || { echo "!! 应用缺少身份标识"; exit 1; }
+    [ "$BUNDLE_ID" = "$LABEL" ] || { echo "!! 应用身份标识不符"; exit 1; }
+done
+OLD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${INSTALLED}/Contents/Info.plist")" || { echo "!! 当前应用缺少构建版本"; exit 1; }
+[ "$(version_newer "$NEW_VERSION" "$OLD_VERSION")" = yes ] || { echo "!! 目标版本必须高于当前应用"; exit 1; }
 codesign --verify --deep --strict "$NEW_APP"
 "$NEW_BINARY" --self-test
 
-# 定位已安装副本（~/Applications 优先，/Applications 兜底）
-for cand in "$HOME/Applications/${APP_NAME}" "/Applications/${APP_NAME}"; do
-    if [ -d "$cand" ]; then
-        INSTALLED="$cand"
-        break
-    fi
-done
-if [ -z "$INSTALLED" ]; then
-    echo "!! 未找到已安装的 ${APP_NAME}"
-    echo "   已下载解压到：${TMP} —— 手动拖入 /Applications 即完成安装"
-    KEEP_TMP=1
-    open -R "$NEW_APP"
-    exit 0
+if other_copy_running; then
+    echo "!! 检测到另一应用副本正在运行，已中止"
+    exit 1
 fi
-
-if launchctl print "gui/${MYUID}/${LABEL}" >/dev/null 2>&1; then
+if JOB_INFO="$(launchctl print "gui/${MYUID}/${LABEL}" 2>/dev/null)"; then
+    LOADED_BINARY="$(printf '%s\n' "$JOB_INFO" | awk '/^[[:space:]]*program = / { sub(/^[[:space:]]*program = /, ""); print; exit }')"
+    [ "$LOADED_BINARY" = "$BINARY" ] || { echo "!! 已加载的 LaunchAgent 指向另一副本或无法确认，已中止"; exit 1; }
+    [ -f "$AGENT_PLIST" ] || { echo "!! LaunchAgent plist 不存在"; exit 1; }
+    AGENT_BINARY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null || true)"
+    [ "$AGENT_BINARY" = "$BINARY" ] || { echo "!! LaunchAgent 指向另一副本，已中止"; exit 1; }
     AGENT=1
-    if [ ! -f "$AGENT_PLIST" ]; then
-        echo "!! LaunchAgent 已加载但 plist 不存在：${AGENT_PLIST}"
-        exit 1
-    fi
 fi
 
 echo "==> 3/5 在安装位置旁暂存新版本"
@@ -193,13 +232,13 @@ cp -R "$NEW_APP" "$STAGE"
 [ -x "${STAGE}/Contents/MacOS/${EXECUTABLE}" ]
 
 echo "==> 4/5 停止 ${LABEL} 并切换版本"
-STOPPED=1
 if [ "$AGENT" = 1 ]; then
     launchctl bootout "gui/${MYUID}/${LABEL}"
 fi
-pkill -x "$EXECUTABLE" 2>/dev/null || true
+STOPPED=1
+stop_target
 sleep 1
-if pgrep -x "$EXECUTABLE" >/dev/null 2>&1; then
+if [ -n "$(target_pids)" ]; then
     echo "!! 旧进程仍未退出，取消换包"
     exit 1
 fi

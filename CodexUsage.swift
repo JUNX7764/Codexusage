@@ -2132,7 +2132,9 @@ final class QuotaWindowView: NSView {
         let remaining = PanelUI.label(model.remaining.map { "\($0)%" } ?? "--",
             size: 14, weight: .semibold, color: remainingColor,
             wrapping: false, monospacedDigits: true)
-        remaining.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        // 保留两位百分比时的对齐宽度；100% 按实际文字宽度扩展，避免百分号被截断。
+        remaining.widthAnchor.constraint(greaterThanOrEqualToConstant: 40).isActive = true
+        remaining.setContentHuggingPriority(.required, for: .horizontal)
         remaining.setContentCompressionResistancePriority(.required, for: .horizontal)
         main.addArrangedSubview(remaining)
         let progress = QuotaProgressView(remaining: model.remaining)
@@ -2923,7 +2925,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 本地视觉验收：固定数据、无网络/定时器，也不覆盖真实 status.json。
-    /// 默认展示绿/红；normal 展示当前色/橙；states / empty 覆盖异常与空数据。
+    /// 默认展示绿/红；normal 展示当前色/橙；full 展示 100%；states / empty 覆盖异常与空数据。
     private func configureVisualPreview() {
         let arguments = CommandLine.arguments
         let normal = arguments.contains("--visual-preview-normal")
@@ -2933,6 +2935,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let now = Date()
         usage.fiveHour = QuotaWindow(usedPercent: normal ? 40 : 10, reset: now + 18_000)
         usage.sevenDay = QuotaWindow(usedPercent: normal ? 80 : 90, reset: now + 604_800)
+        if arguments.contains("--visual-preview-full") {
+            usage.fiveHour = QuotaWindow(usedPercent: 0, reset: now + 18_000)
+            usage.sevenDay = QuotaWindow(usedPercent: 0, reset: now + 604_800)
+        }
         usage.planType = "plus"
         usage.email = "preview@example.com"
         usage.resetCards = [
