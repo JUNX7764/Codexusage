@@ -1406,6 +1406,12 @@ enum RemainingColorTier: Equatable {
         case .red: return Self.rgb(dark ? 0xF08B94 : 0xC8404A)
         }
     }
+
+    /// 动态颜色：不钉死绘制外观，由系统在每条菜单栏绘制时按该栏外观解析——
+    /// 双屏两条栏底色不同（扩展屏全屏深色栏 + 主屏浅色栏）也能各自正确
+    func color() -> NSColor {
+        NSColor(name: nil) { appearance in self.color(for: appearance) }
+    }
 }
 
 enum StackImage {
@@ -1415,36 +1421,31 @@ enum StackImage {
         let remaining: Int?
     }
 
-    private static func attributed(_ line: Line, font: NSFont,
-                                   appearance: NSAppearance) -> NSAttributedString {
+    private static func attributed(_ line: Line, font: NSFont) -> NSAttributedString {
         let result = NSMutableAttributedString(string: line.label + " ", attributes: [
             .font: font,
             .foregroundColor: NSColor.labelColor
         ])
         result.append(NSAttributedString(string: line.value, attributes: [
             .font: font,
-            .foregroundColor: RemainingColorTier(remaining: line.remaining).color(for: appearance)
+            .foregroundColor: RemainingColorTier(remaining: line.remaining).color()
         ]))
         return result
     }
 
-    static func make(line1: Line, line2: Line, appearance: NSAppearance) -> NSImage {
+    static func make(line1: Line, line2: Line) -> NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
-        var s1: NSAttributedString!
-        var s2: NSAttributedString!
-        appearance.performAsCurrentDrawingAppearance {
-            s1 = attributed(line1, font: font, appearance: appearance)
-            s2 = attributed(line2, font: font, appearance: appearance)
-        }
+        let s1 = attributed(line1, font: font)
+        let s2 = attributed(line2, font: font)
         let w = max(ceil(s1.size().width), ceil(s2.size().width)) + 2
+        // 不钉死绘制外观：全部使用动态颜色（labelColor / RemainingColorTier 动态包装），
+        // 由系统在每条菜单栏上绘制时按该栏外观解析——双屏两条栏底色不同也能各自正确
         let img = NSImage(size: NSSize(width: w, height: 21), flipped: false) { _ in
-            appearance.performAsCurrentDrawingAppearance {
-                s1.draw(at: NSPoint(x: 1, y: 10.5))
-                s2.draw(at: NSPoint(x: 1, y: 0.5))
-            }
+            s1.draw(at: NSPoint(x: 1, y: 10.5))
+            s2.draw(at: NSPoint(x: 1, y: 0.5))
             return true
         }
-        img.isTemplate = false   // 保留百分比的柔彩色；标签仍随外观使用系统文本色
+        img.isTemplate = false   // 保留百分比的柔彩色；动态色由系统按各屏菜单栏外观解析
         return img
     }
 }
@@ -3309,7 +3310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     remaining: sevenRemaining)
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
         barThemeDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        statusItem.button?.image = StackImage.make(line1: line1, line2: line2, appearance: appearance)
+        statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = "Codex 用量 · 5H成功 \(fiveHourLastOK.map { Fmt.time($0) } ?? "--")"
@@ -3696,7 +3697,12 @@ enum CodexOfflineRegression {
             let previewLine = StackImage.Line(label: "5H", value: "90%", remaining: 90)
             for name in [NSAppearance.Name.aqua, .darkAqua] {
                 let appearance = NSAppearance(named: name)!
-                let image = StackImage.make(line1: previewLine, line2: previewLine, appearance: appearance)
+                // 菜单栏图片已全面动态取色；此处分外观验证解析结果与渲染仍然成立
+                let green = RemainingColorTier.green.color(for: appearance).usingColorSpace(.sRGB)
+                try expect(green.map { $0.greenComponent > $0.redComponent
+                                      && $0.greenComponent > $0.blueComponent } == true,
+                           "green tier did not resolve to green for \(name.rawValue)")
+                let image = StackImage.make(line1: previewLine, line2: previewLine)
                 try expect(!image.isTemplate && image.size.width > 0 && image.tiffRepresentation != nil,
                            "menu bar color image did not render for \(name.rawValue)")
             }
