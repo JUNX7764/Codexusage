@@ -78,18 +78,18 @@ body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_to
 
 ## 3. Token 统计（本地扫描，每 5 分钟一轮 = 每 10 个额度周期）
 
-扫描 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`，仅近 30 天的日期目录。
+扫描 `~/.codex/sessions/` 内的 `rollout-*.jsonl` 与 `.jsonl.zst`；老文件如近期仍有写入也参与统计。
 
-- 每行是 JSON 事件。目标事件：`type == "event_msg"` 且 `payload.type == "token_count"`，取**该文件中最后一条**的 `payload.info.total_token_usage`（会话累计值）：
+- 每行是 JSON 事件。目标事件：`type == "event_msg"` 且 `payload.type == "token_count"`，按顺序读取 `payload.info.total_token_usage`（会话累计值），将与前一有效累计值的差额归入事件本地日期：
 
 ```jsonc
 { "input_tokens": 37522, "cached_input_tokens": 13056, "cache_write_input_tokens": 0,
   "output_tokens": 235, "reasoning_output_tokens": 92, "total_tokens": 37757 }
 ```
 
-- 会话日期 = 文件名前缀 `rollout-YYYY-MM-DDTHH-MM-SS-` 解析（本地时区）。
-- 聚合：今天 / 近 7 天 / 近 30 天 的 total_tokens 之和，附带 input（= input_tokens）/ output（= output_tokens）细分。**窗口口径：含今天共 7 / 30 个日历日**（起算日 = 今天 −6 / −29 天，2026-11-03 起；此前为 8 / 31 天）。
-- **增量扫描**（必须，避免每轮全量重读）：状态存 `~/Library/Application Support/CodexUsage/scan-state.json`，记录每文件 `{path: {size, mtime}}`；未变化的文件沿用上次结果；从索引消失的文件（已删除）剔除其贡献。可参考 KimiUsage 的同类实现：`/Users/Chester/Documents/kimi/workspace/kimi-usage-menubar/KimiUsage.swift`（搜"增量"）。
+- 事件日期按时间戳转换为本地日；缺少时间的旧事件回退文件名日期。无效累计行不改变基线。每段增量同时归入最近一条 `turn_context.payload.model`，同一会话切换模型时随上下文切换归属；缺失模型信息的记录归为「未知模型」。
+- 聚合：今天 / 近 7 天 / 近 30 天 的 total_tokens 之和，附带 input（= input_tokens）/ output（= output_tokens）细分。**窗口口径：含今天共 7 / 30 个日历日**（起算日 = 今天 −6 / −29 天，2026-11-03 起；此前为 8 / 31 天）。每个窗口另按模型聚合相同三项，模型合计与原窗口汇总保持一致。
+- **增量扫描**（必须，避免每轮全量重读）：状态存 `~/Library/Application Support/CodexUsage/scan-state.json`，记录文件大小、修改时间、已读取位置、累计基线、当前模型及逐日（含逐模型）增量；缓存版本升级为 3 后首次扫描重建。未变化的文件沿用上次结果，明文追加只读新内容；从索引消失的文件（已删除）剔除其贡献。可参考 KimiUsage 的同类实现：`/Users/Chester/Documents/kimi/workspace/kimi-usage-menubar/KimiUsage.swift`（搜"增量"）。
 - v1.0.0 不扫 `~/.proma`（Proma 目录）。
 
 ## 4. UI 规格（与 GlmUsage 视觉一致）
@@ -111,12 +111,12 @@ body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_to
 
 - 额度窗口显示剩余百分比、重置时间与剩余量进度条；进度按 `100 - usedPercent` 绘制，百分比和进度条共用 `RemainingColorTier` 四档语义色。未知值显示「暂无数据」与空轨道。
 - 重置卡与 Tibo 使用独立分组卡片；卡名、到期时间、事件链接、临期/失败/过期状态均保留在所属区块。
-- Codex 用量与外部用量使用同款组件：今天 / 7 天 / 30 天三行表格，每行包含总量、输入和输出。数字使用等宽数字字形；Codex 橙色与外部蓝色只承担区块识别。
+- Codex 用量与外部用量使用同款组件：今天 / 7 天 / 30 天三行表格，每行包含总量、输入和输出。数字使用等宽数字字形；Codex 橙色与外部蓝色只承担区块识别。点击周期整行可在该行下方展开或收起模型明细，明细按总量降序并展示模型名、总量、输入和输出；周期行尾不增加箭头，展开状态在面板刷新后保留。
 - 空数据、失败、数据过期与最后成功时间归入对应区块，不使用禁用菜单项灰字。
 
 **面板视觉与交互**：`NSPanel + NSVisualEffectView`（`.popover / behindWindow / active`），叠加 90% 不透明 `windowBackgroundColor` 底层与 16px 圆角，目标宽度 330pt（窄屏自适应）；系统“减少透明度”开启时改为完全纯色。卡片使用中性 surface 与 hairline separator，布局采用 4px 网格。最大高度为可用屏幕的 85%；标题与两行底部操作区固定，中间内容进入 `NSScrollView`；底部第一行显示最近尝试刷新与版本，第二行显示立即刷新、开机自启和退出。支持状态栏图标开关、点击外部关闭、Esc 关闭、`R` 刷新、`Q` 退出与 Tibo 链接。两个用量区可分别折叠，启动默认展开，折叠后错误提示仍显示。点击版本号强制检查 Release，面板内反馈检查中、最新、可更新、失败或版本未知。
 
-**视觉预览**：`--visual-preview`（绿/红）、`--visual-preview-normal`（当前色/橙）、`--visual-preview-dark`（深色）、`--visual-preview-long`（长内容）、`--visual-preview-states`（失败/过期）、`--visual-preview-empty`（空数据）、`--visual-preview-update`（更新横幅）、`--visual-preview-narrow`（320px 与长版本号）使用固定假数据，不联网、不写真实 `status.json`。`--visual-preview-output=<path>` 仅捕捉面板并保存 PNG，可搭配 `--visual-preview-scroll-end` 检查底部；追加 `--visual-preview-events` 自动经 `NSEvent` 验证 Esc、外部点击与 R 刷新后退出。
+**视觉预览**：`--visual-preview`（绿/红）、`--visual-preview-normal`（当前色/橙）、`--visual-preview-dark`（深色）、`--visual-preview-long`（长内容）、`--visual-preview-states`（失败/过期）、`--visual-preview-empty`（空数据）、`--visual-preview-update`（更新横幅）、`--visual-preview-narrow`（320px 与长版本号）使用固定假数据，不联网、不写真实 `status.json`。追加 `--visual-preview-models` 展开全部模型明细。`--visual-preview-output=<path>` 仅捕捉面板并保存 PNG，可搭配 `--visual-preview-scroll-end` 检查底部；追加 `--visual-preview-events` 自动验证周期行展开/收起、刷新状态、Esc、外部点击与 R 刷新后退出。
 
 **--once 自检模式**：拉一次额度 + 全量扫一次 token，打印摘要后退出（照 GlmUsage 的 --once 风格）。**输出严禁包含任何 token/密钥值。**
 
@@ -271,6 +271,8 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 - 关键约束：下载产物替换的就是安装位置正在运行的那份并重启，不存在「clone 目录里构建了新 app 但没换装」的白更问题。
 
 ## 4.9 性能与体验优化 —— 2026-11-03（perf-polish-20261103）
+
+以下为当时记录；面板刷新和 Token 归日现以 §3 和本次准确性修复实现为准。
 
 开发计划与验收清单：`docs/features/perf-polish-20261103/01-plan.md`。变更点：
 

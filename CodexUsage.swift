@@ -172,6 +172,7 @@ enum CodexAuth {
         var refreshToken: String?
         var idToken: String?
         var email: String?
+        var accountID: String? = nil
     }
     /// 当前认证字段快照；写回时必须重新读取最新 JSON，不能复用旧文档。
     struct Snapshot {
@@ -189,11 +190,34 @@ enum CodexAuth {
         let id = tokens["id_token"] as? String
         return Snapshot(
             tokens: Tokens(accessToken: access, refreshToken: refresh,
-                           idToken: id, email: id.flatMap(jwtEmail)))
+                           idToken: id, email: id.flatMap(jwtEmail), accountID: tokens["account_id"] as? String))
+    }
+
+    // Only use stable identity when both the user and workspace can be identified.
+    // Otherwise the in-memory access token is a conservative boundary, never persisted.
+    static func identity(_ snapshot: Snapshot?) -> String? {
+        guard let tokens = snapshot?.tokens else { return nil }
+        func claims(_ jwt: String?) -> [String: Any] {
+            guard let jwt = jwt, jwt.split(separator: ".").count > 1 else { return [:] }
+            var part = String(jwt.split(separator: ".")[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+            part += String(repeating: "=", count: (4 - part.count % 4) % 4)
+            guard let data = Data(base64Encoded: part),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+            return obj
+        }
+        let id = claims(tokens.idToken), access = claims(tokens.accessToken)
+        let auth = access["https://api.openai.com/auth"] as? [String: Any] ?? [:]
+        let subject = (id["sub"] as? String) ?? (access["sub"] as? String)
+        let account = tokens.accountID ?? (auth["chatgpt_account_id"] as? String)
+        if let subject = subject, !subject.isEmpty, let account = account, !account.isEmpty {
+            return "account:" + subject + "|" + account
+        }
+        return "token:" + tokens.accessToken
     }
 
     static func sameAuth(_ a: Tokens, _ b: Tokens) -> Bool {
         a.accessToken == b.accessToken && a.refreshToken == b.refreshToken && a.idToken == b.idToken
+            && a.accountID == b.accountID
     }
 
     /// Re-read and merge into the newest document. A Codex CLI rotation during refresh wins.
@@ -209,7 +233,8 @@ enum CodexAuth {
         let latest = Tokens(accessToken: latestAccess,
                             refreshToken: tokens["refresh_token"] as? String,
                             idToken: tokens["id_token"] as? String,
-                            email: (tokens["id_token"] as? String).flatMap(jwtEmail))
+                            email: (tokens["id_token"] as? String).flatMap(jwtEmail),
+                            accountID: tokens["account_id"] as? String)
         guard sameAuth(expected, latest) else { return (latestAccess, false) }
         tokens["access_token"] = accessToken
         if let r = refreshToken, !r.isEmpty { tokens["refresh_token"] = r }
@@ -314,6 +339,19 @@ struct UsageData {
     var updatedAt: Date = Date()
 }
 
+enum AccountIsolation {
+    static func clear(_ usage: inout UsageData) {
+        usage.fiveHour = nil; usage.sevenDay = nil; usage.planType = nil
+        usage.resetCredits = nil; usage.resetCards = nil; usage.email = nil
+        usage.quotaError = nil; usage.fiveHourError = nil; usage.sevenDayError = nil
+        usage.resetCardsError = nil
+    }
+    static func accepts(capturedGeneration: Int, currentGeneration: Int,
+                        capturedIdentity: String?, currentIdentity: String?) -> Bool {
+        capturedGeneration == currentGeneration && capturedIdentity == currentIdentity
+    }
+}
+
 enum QuotaMerge {
     static func preferred(_ fresh: QuotaWindow?, old: QuotaWindow?) -> QuotaWindow? {
         fresh ?? old
@@ -340,14 +378,14 @@ enum Fetcher {
     static let refreshMinInterval: TimeInterval = 300
 
     private static let refreshLock = NSLock()
-    private static var lastRefreshAttempt: Date?
+    private static var lastRefreshAttempt: [String: Date] = [:]
 
     // Tibo 动态（AIHOT）：上次响应的 ETag，带 If-None-Match 轮询（接口要求同端点 ≥60s 间隔，5 分钟周期满足）
     private static let tiboLock = NSLock()
     private static var tiboETag: String?
 
-    static func fetchQuota(completion: @escaping (QuotaData) -> Void) {
-        guard let auth = CodexAuth.load() else {
+    static func fetchQuota(auth: CodexAuth.Snapshot? = CodexAuth.load(), completion: @escaping (QuotaData) -> Void) {
+        guard let auth = auth else {
             var e = QuotaData()
             e.error = "未找到 Codex 凭证（~/.codex/auth.json）"
             e.fiveHourError = e.error
@@ -358,7 +396,8 @@ enum Fetcher {
         requestUsage(usageURL, token: auth.tokens.accessToken) { obj, status, netErr in
             if status == 401 {
                 attemptRefresh(auth: auth) { refreshErr in
-                    guard refreshErr == nil, let fresh = CodexAuth.load() else {
+                    guard refreshErr == nil, let fresh = CodexAuth.load(),
+                          CodexAuth.identity(fresh) == CodexAuth.identity(auth) else {
                         var e = QuotaData(email: auth.tokens.email)
                         e.error = refreshErr.map { "HTTP 401（\($0)）" }
                             ?? "HTTP 401（刷新后无可用凭证）"
@@ -430,11 +469,12 @@ enum Fetcher {
         }
         refreshLock.lock()
         let now = Date()
-        if let last = lastRefreshAttempt, now.timeIntervalSince(last) < refreshMinInterval {
+        let refreshIdentity = CodexAuth.identity(current) ?? "unknown"
+        if let last = lastRefreshAttempt[refreshIdentity], now.timeIntervalSince(last) < refreshMinInterval {
             refreshLock.unlock()
             completion("刷新冷却中，5 分钟内已尝试过"); return
         }
-        lastRefreshAttempt = now
+        lastRefreshAttempt[refreshIdentity] = now
         refreshLock.unlock()
 
         guard let rt = current.tokens.refreshToken, !rt.isEmpty else {
@@ -531,8 +571,8 @@ enum Fetcher {
 
     /// 重置卡（额度重置卡）明细：GET wham/rate-limit-reset-credits（认证头与 wham/usage 同款）。
     /// 401 不做兜底刷新（避免新增写 auth.json 的路径），失败由调用方降级展示。
-    static func fetchResetCards(completion: @escaping ([ResetCard]?, String?) -> Void) {
-        guard let auth = CodexAuth.load() else {
+    static func fetchResetCards(auth: CodexAuth.Snapshot? = CodexAuth.load(), completion: @escaping ([ResetCard]?, String?) -> Void) {
+        guard let auth = auth else {
             completion(nil, "未找到 Codex 凭证（~/.codex/auth.json）"); return
         }
         requestUsage(resetCreditsURL, token: auth.tokens.accessToken) { obj, status, err in
@@ -679,28 +719,28 @@ enum TiboDisplay {
 
 // MARK: - 本地会话 token 统计（增量扫描 ~/.codex/sessions）
 //
-// 扫描 sessions/YYYY/MM/DD/rollout-*.jsonl，仅近 30 天的会话文件；codex 会把超过
-// 保留期的会话就地压缩成 rollout-*.jsonl.zst（2026-10 实测 7 天前的文件全是 .zst），
-// 两种后缀都计入，.zst 经 vendor 的上游 zstd 解码源（zstddeclib.c v1.5.7）在 App
-// 内解压后走同一条字节反查路径，不依赖用户机器安装任何工具。
-// 每个文件取最后一条 type=="event_msg" 且 payload.type=="token_count" 事件的
-// payload.info.total_token_usage（会话累计值）：input_tokens / output_tokens / total_tokens。
-// 会话日期 = 文件名前缀 rollout-YYYY-MM-DDTHH-MM-SS-（本地时区）。
-// 增量策略：scan-state.json 记录每文件 {size, mtime, 当日聚合}；未变化文件只做一次 stat
-// 沿用上次结果，变化的文件重读（只取最后一条，字节级反查避免逐行 JSON 解析；
-// .zst 以压缩后 size/mtime 为准，明文被压缩归档时视同删除+新增，自动迁移），
-// 已删除文件从索引剔除；31 天前的旧条目清理，保证状态文件不随历史无限增长。
+// 扫描 rollout-*.jsonl 和 .jsonl.zst；累计 token 按事件本地日期做差分。
+// 缺少时间的旧事件回退到文件名日期；明文追加按 offset 分块读取，压缩档变化时重解。
+// 未变化文件复用缓存，明文和同名归档并存时只计一次；冷文件在文件名及修改日都过窗时跳过。
+
+struct ModelTokenUsage {
+    var input = 0.0
+    var output = 0.0
+    var total = 0.0
+}
 
 enum TokenScanner {
     struct FileEntry: Codable {
-        var size: Int64
-        var mtime: Double
-        var day: String       // 会话日期 yyyy-MM-dd（文件名前缀）
-        var input: Double
-        var output: Double
-        var total: Double
+        var size: Int64 = 0
+        var mtime: Double = 0
+        var offset: UInt64 = 0
+        var previous: [Double] = [0, 0, 0]
+        var currentModel: String?
+        var days: [String: [Double]] = [:]
+        var daysByModel: [String: [String: [Double]]] = [:]
     }
-    struct State: Codable { var files: [String: FileEntry] = [:] }
+    // Model dimensions require one rebuild; aggregate totals keep the original accounting rules.
+    struct State: Codable { var version: Int = 3; var files: [String: FileEntry] = [:] }
     struct Result {
         var today = Stats()
         var seven = Stats()
@@ -712,6 +752,7 @@ enum TokenScanner {
         var output = 0.0
         var total = 0.0
         var files = 0
+        var models: [String: ModelTokenUsage] = [:]
     }
 
     static let sessionsRoot = NSHomeDirectory() + "/.codex/sessions"
@@ -722,7 +763,7 @@ enum TokenScanner {
     private static let dayFmt: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd"   // 本地时区，与文件名日期口径一致
+        f.dateFormat = "yyyy-MM-dd"   // 事件本地日；旧数据无时间时回退文件名
         return f
     }()
 
@@ -733,10 +774,9 @@ enum TokenScanner {
         var st = loadState(at: statePath)
         // 窗口口径：含今天共 7 / 30 个日历日（起算日 = 今天 −6 / −29 天）
         let todayKey = dayFmt.string(from: now)
-        let cutoff7 = dayFmt.string(from: now.addingTimeInterval(-6 * 86400))
-        let cutoff30 = dayFmt.string(from: now.addingTimeInterval(-29 * 86400))
-        let cutoff31 = dayFmt.string(from: now.addingTimeInterval(-31 * 86400))
-
+        let calendar = Calendar.current
+        let cutoff7 = dayFmt.string(from: calendar.date(byAdding: .day, value: -6, to: now)!)
+        let cutoff30 = dayFmt.string(from: calendar.date(byAdding: .day, value: -29, to: now)!)
         var seen = Set<String>()
         var enumed = false
         if let enumm = FileManager.default.enumerator(
@@ -747,65 +787,150 @@ enum TokenScanner {
             for case let url as URL in enumm {
                 let name = url.lastPathComponent
                 guard name.hasPrefix("rollout-"),
-                      name.hasSuffix(".jsonl") || name.hasSuffix(".jsonl.zst") else { continue }
+                      name.hasSuffix(".jsonl") || name.hasSuffix(".jsonl.zst"),
+                      let fallbackDay = dayFromFilename(name) else { continue }
                 let path = url.path
+                let compressed = name.hasSuffix(".zst")
+                // During compression both representations may coexist; count the live file once.
+                if compressed && FileManager.default.fileExists(atPath: String(path.dropLast(4))) { continue }
                 seen.insert(path)
-                guard let day = dayFromFilename(name), day >= cutoff30 else { continue }
-                guard let vals = try? url.resourceValues(
-                        forKeys: [.fileSizeKey, .contentModificationDateKey]),
+                guard let vals = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
                       let size = vals.fileSize else { continue }
                 let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
-                // 文件未变化：沿用上次结果（绝大多数文件走这里；.zst 以压缩档的
-                // size/mtime 为准，稳定不变）
-                if let e = st.files[path], e.size == Int64(size), e.mtime == mtime { continue }
-                let isZst = name.hasSuffix(".zst")
-                // .zst 在 App 内解压；活跃 .jsonl 只需最后一条 token_count：
-                // 尾部 1MB 反查，未命中才全量读
-                guard let data = isZst
-                    ? zstdDecompress(path: path)
-                    : plainDataWithTailFallback(at: path) else { continue }
-                let u = lastTokenUsage(in: data) ?? (0.0, 0.0, 0.0)
-                st.files[path] = FileEntry(size: Int64(size), mtime: mtime, day: day,
-                                           input: u.0, output: u.1, total: u.2)
+                let cached = st.files[path]
+                let valid = cached.map { entry in
+                    entry.previous.count == 3 && entry.days.values.allSatisfy { $0.count == 3 }
+                        && entry.daysByModel.values.allSatisfy { models in
+                            models.values.allSatisfy { $0.count == 3 }
+                        }
+                        && (compressed || entry.offset <= UInt64(max(0, entry.size)))
+                } ?? true
+                if !valid { st.files.removeValue(forKey: path) }
+                let old = valid ? cached : nil
+                // An old filename may still be active: only skip when its mtime is also outside the window.
+                if old == nil && fallbackDay < cutoff30 && mtime > 0 &&
+                    dayFmt.string(from: Date(timeIntervalSince1970: mtime)) < cutoff30 { continue }
+                if let e = old, e.size == Int64(size), e.mtime == mtime { continue }
+                var entry = old ?? FileEntry()
+                let append = !compressed && old != nil && Int64(size) > entry.size
+                if !append { entry = FileEntry() }
+                let needle = Data("\"total_token_usage\"".utf8)
+                let contextNeedle = Data("\"turn_context\"".utf8)
+                var pending = Data()
+                var consumed: UInt64 = 0
+                func parseLine(_ line: Data) {
+                    guard line.range(of: needle) != nil || line.range(of: contextNeedle) != nil,
+                          let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                          let payload = obj["payload"] as? [String: Any] else { return }
+                    if obj["type"] as? String == "turn_context" {
+                        if let model = (payload["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !model.isEmpty {
+                            entry.currentModel = model
+                        }
+                        return
+                    }
+                    guard obj["type"] as? String == "event_msg",
+                          payload["type"] as? String == "token_count",
+                          let info = payload["info"] as? [String: Any],
+                          let usage = info["total_token_usage"] as? [String: Any],
+                          let input = CodexNumber.finite(usage["input_tokens"]), input >= 0,
+                          let output = CodexNumber.finite(usage["output_tokens"]), output >= 0,
+                          let total = CodexNumber.finite(usage["total_tokens"]), total >= 0 else { return }
+                    let values = [input, output, total]
+                    let day = Fmt.parseDateValue(obj["timestamp"]).map { dayFmt.string(from: $0) } ?? fallbackDay
+                    let deltas = values.indices.map { max(0, values[$0] - entry.previous[$0]) }
+                    var bucket = entry.days[day] ?? [0, 0, 0]
+                    for i in 0..<3 { bucket[i] += deltas[i] }
+                    entry.days[day] = bucket
+                    let model = entry.currentModel ?? "未知模型"
+                    var models = entry.daysByModel[day] ?? [:]
+                    var modelBucket = models[model] ?? [0, 0, 0]
+                    for i in 0..<3 { modelBucket[i] += deltas[i] }
+                    models[model] = modelBucket
+                    entry.daysByModel[day] = models
+                    entry.previous = values
+                }
+                func consume(_ chunk: Data) {
+                    var start = chunk.startIndex
+                    while let newline = chunk[start...].firstIndex(of: 10) {
+                        pending.append(contentsOf: chunk[start..<newline])
+                        parseLine(pending)
+                        consumed += UInt64(pending.count + 1)
+                        pending.removeAll(keepingCapacity: true)
+                        start = chunk.index(after: newline)
+                    }
+                    pending.append(contentsOf: chunk[start...])
+                }
+                var readOK = true
+                if compressed {
+                    if let bytes = zstdDecompress(path: path) {
+                        consume(bytes)
+                        if !pending.isEmpty { parseLine(pending); consumed += UInt64(pending.count) }
+                    } else { readOK = false }
+                } else if let handle = FileHandle(forReadingAtPath: path) {
+                    do {
+                        try handle.seek(toOffset: entry.offset)
+                        while let chunk = try handle.read(upToCount: 256 * 1024), !chunk.isEmpty { consume(chunk) }
+                        try handle.close()
+                    } catch { try? handle.close(); readOK = false }
+                } else { readOK = false }
+                guard readOK else { continue }
+                // Pending bytes are intentionally reread when the writer finishes that line.
+                entry.offset += consumed
+                entry.size = Int64(size); entry.mtime = mtime
+                entry.days = entry.days.filter { $0.key >= cutoff30 }
+                entry.daysByModel = entry.daysByModel.filter { $0.key >= cutoff30 }
+                st.files[path] = entry
             }
         }
         if enumed {
-            // 枚举成功才清理：目录临时不可用时保留旧索引，避免误清
-            for path in Array(st.files.keys) where !seen.contains(path) {
-                st.files.removeValue(forKey: path)     // 已删除文件：剔除其贡献
-            }
-            for path in Array(st.files.keys) where st.files[path]!.day < cutoff31 {
-                st.files.removeValue(forKey: path)     // 31 天前旧条目：不再可能贡献窗口
-            }
+            for path in Array(st.files.keys) where !seen.contains(path) { st.files.removeValue(forKey: path) }
         }
         if statePath == defaultStatePath { cache = st }
         saveState(st, to: statePath)
-
         guard enumed else { return Result(error: "无法枚举 \(root)") }
         var r = Result()
         for e in st.files.values {
-            if e.day == todayKey { add(&r.today, e) }
-            if e.day >= cutoff7 { add(&r.seven, e) }
-            if e.day >= cutoff30 { add(&r.thirty, e) }
+            var today = [0.0, 0.0, 0.0], seven = today, thirty = today
+            for (day, values) in e.days where day <= todayKey && values.count == 3 {
+                for i in 0..<3 {
+                    if day == todayKey { today[i] += values[i] }
+                    if day >= cutoff7 { seven[i] += values[i] }
+                    if day >= cutoff30 { thirty[i] += values[i] }
+                }
+            }
+            add(&r.today, today); add(&r.seven, seven); add(&r.thirty, thirty)
+            for (day, models) in e.daysByModel where day <= todayKey {
+                for (model, values) in models {
+                    if day == todayKey { addModel(&r.today.models, name: model, values: values) }
+                    if day >= cutoff7 { addModel(&r.seven.models, name: model, values: values) }
+                    if day >= cutoff30 { addModel(&r.thirty.models, name: model, values: values) }
+                }
+            }
         }
         return r
     }
 
-    /// rollout-2026-09-26T19-35-37-<uuid>.jsonl → "2026-09-26"
     private static func dayFromFilename(_ name: String) -> String? {
         guard name.count >= 18 else { return nil }
         let day = String(name.dropFirst("rollout-".count).prefix(10))
-        guard dayFmt.date(from: day) != nil else { return nil }
-        return day
+        return dayFmt.date(from: day) == nil ? nil : day
     }
 
-    private static func add(_ s: inout Stats, _ e: FileEntry) {
-        guard e.total > 0 else { return }   // 无 token_count 记录的空会话不计文件数（数值本就为 0）
-        s.input += e.input; s.output += e.output; s.total += e.total; s.files += 1
+    private static func add(_ s: inout Stats, _ values: [Double]) {
+        guard values.count == 3, values[2] > 0 else { return }
+        s.input += values[0]; s.output += values[1]; s.total += values[2]; s.files += 1
     }
 
-    /// 解压 .jsonl.zst 全量到内存（压缩档数百 KB、解压后 MB 级），复用 lastTokenUsage
-    /// 的字节反查；任何失败返回 nil，按「本文件本轮无法读取」处理（不写状态条目，
+    private static func addModel(_ models: inout [String: ModelTokenUsage], name: String, values: [Double]) {
+        guard values.count == 3, values[2] > 0 else { return }
+        var stats = models[name] ?? ModelTokenUsage()
+        stats.input += values[0]; stats.output += values[1]; stats.total += values[2]
+        models[name] = stats
+    }
+
+    /// 解压 .jsonl.zst 全量到内存后逐行处理；任何失败返回 nil，
+    /// 按「本文件本轮无法读取」处理（不写状态条目，
     /// 修复或删除该归档后下轮扫描自动收敛）。
     ///
     /// 解码走 vendor/zstddeclib.c（上游 zstd v1.5.7 单文件解码源，BSD-3-Clause）
@@ -841,61 +966,10 @@ enum TokenScanner {
         }
     }
 
-    /// 活跃 .jsonl 的读取：只要最后一条 token_count（通常在文件末尾附近），先读尾部
-    /// 1MB 做字节反查，命中即返回该尾部；未命中（token_count 只在头部或尾部截断行）
-    /// 再全量读兜底。tail 首行可能残缺，lastTokenUsage 的 JSON 校验会自然跳过它。
-    /// 避免每 5 分钟把几十 MB 的活跃会话全量读入内存。
-    private static func plainDataWithTailFallback(at path: String) -> Data? {
-        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { try? fh.close() }
-        let end = fh.seekToEndOfFile()
-        let tailBytes: UInt64 = 1_048_576
-        guard end > tailBytes else {
-            fh.seek(toFileOffset: 0)
-            return fh.readDataToEndOfFile()
-        }
-        fh.seek(toFileOffset: end - tailBytes)
-        let tail = fh.readDataToEndOfFile()
-        if lastTokenUsage(in: tail) != nil { return tail }
-        fh.seek(toFileOffset: 0)
-        return fh.readDataToEndOfFile()
-    }
-
-    /// 取文件中最后一条 token_count 的 total_token_usage。
-    /// 字节级反查 "total_token_usage"（每条 token_count 事件必含该键），命中后展开所在行
-    /// 再做 JSON 校验，避免逐行 JSON 解析大文件；校验不过则继续向前找。
-    private static func lastTokenUsage(in data: Data) -> (Double, Double, Double)? {
-        let needle = Data("\"total_token_usage\"".utf8)
-        var searchEnd = data.endIndex
-        while let r = data.range(of: needle, options: [.backwards],
-                                 in: data.startIndex..<searchEnd) {
-            defer { searchEnd = r.lowerBound }
-            let lineStart = data[data.startIndex..<r.lowerBound]
-                .lastIndex(of: UInt8(0x0A)).map { data.index(after: $0) }
-                ?? data.startIndex
-            let lineEnd = data[r.upperBound...].firstIndex(of: UInt8(0x0A))
-                ?? data.endIndex
-            let line = data.subdata(in: lineStart..<lineEnd)
-            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                  obj["type"] as? String == "event_msg",
-                  let payload = obj["payload"] as? [String: Any],
-                  payload["type"] as? String == "token_count",
-                  let info = payload["info"] as? [String: Any],
-                  let usage = info["total_token_usage"] as? [String: Any] else {
-                continue
-            }
-            let i = (usage["input_tokens"] as? NSNumber)?.doubleValue ?? 0
-            let o = (usage["output_tokens"] as? NSNumber)?.doubleValue ?? 0
-            let t = (usage["total_tokens"] as? NSNumber)?.doubleValue ?? 0
-            return (i, o, t)
-        }
-        return nil
-    }
-
     private static func loadState(at path: String) -> State {
         if path == defaultStatePath, let s = cache { return s }
         if let data = FileManager.default.contents(atPath: path),
-           let s = try? JSONDecoder().decode(State.self, from: data) {
+           let s = try? JSONDecoder().decode(State.self, from: data), s.version == 3 {
             return s
         }
         return State()
@@ -933,6 +1007,7 @@ enum ExternalTokenScanner {
         var input = 0.0
         var output = 0.0
         var total: Double { input + output }
+        var models: [String: ModelTokenUsage] = [:]
     }
     struct Result {
         var today = Stats()
@@ -947,11 +1022,13 @@ enum ExternalTokenScanner {
     struct FileState: Codable {
         var offset: UInt64 = 0
         var days: [String: [Double]] = [:]
+        var daysByModel: [String: [String: [Double]]] = [:]
     }
     /// hermes 快照：rows 存上次各累计行的值，days 存按 last_seen 归日的差分历史
     struct HermesState: Codable {
         var rows: [String: [Double]] = [:]
         var days: [String: [Double]] = [:]
+        var daysByModel: [String: [String: [Double]]] = [:]
     }
     struct State: Codable {
         var files: [String: FileState] = [:]
@@ -968,9 +1045,9 @@ enum ExternalTokenScanner {
     ]
     static let hermesDBPath = NSHomeDirectory() + "/.hermes/state.db"
     // 文件名带版本号：口径/来源变更后弃用旧缓存强制重建（v2 目录去重、v3 含 cache、
-    // v4 proma 源切 agent-sessions 对齐 Token Monitor）
+    // v4 proma 源切 agent-sessions 对齐 Token Monitor、v5 增加模型维度）
     static let defaultStatePath = NSHomeDirectory()
-        + "/Library/Application Support/CodexUsage/external-scan-state-v4.json"
+        + "/Library/Application Support/CodexUsage/external-scan-state-v5.json"
 
     // 只关心近 30 天窗口，日聚合保留 31 天余量
     private static let retainSeconds: TimeInterval = 31 * 86400
@@ -998,14 +1075,15 @@ enum ExternalTokenScanner {
     static func scan(roots: [String] = fileRoots,
                      hermesDB: String? = hermesDBPath,
                      statePath: String = defaultStatePath,
-                     now: Date = Date()) -> Result {
+                     now: Date = Date(),
+                     hermesFailAfterRows: Int? = nil) -> Result {
         var st = loadState(at: statePath)
         let cutoff = now.addingTimeInterval(-retainSeconds)
         let cutoffKey = dayFmt.string(from: cutoff)
         let files = scanFiles(roots: roots, cutoff: cutoff, cutoffKey: cutoffKey, into: &st)
         var hermesOK: Bool?   // nil = 未安装（state.db 不存在），不算失败
         if let db = hermesDB, FileManager.default.fileExists(atPath: db) {
-            hermesOK = scanHermes(path: db, cutoffKey: cutoffKey, into: &st)
+            hermesOK = scanHermes(path: db, cutoffKey: cutoffKey, into: &st, failAfterRows: hermesFailAfterRows)
         }
         saveState(st, at: statePath)
         var r = buckets(st, now: now)
@@ -1081,6 +1159,7 @@ enum ExternalTokenScanner {
                 }
                 fs.offset = consumed
                 fs.days = fs.days.filter { $0.key >= cutoffKey }
+                fs.daysByModel = fs.daysByModel.filter { $0.key >= cutoffKey }
                 st.files[path] = fs
             }
         }
@@ -1123,7 +1202,7 @@ enum ExternalTokenScanner {
             guard let usage = usage else { continue }
             let model = (obj["message"] as? [String: Any])?["model"] as? String
                 ?? obj["model"] as? String
-            guard isOpenAIModel(model) else { continue }
+            guard let model = model, isOpenAIModel(model) else { continue }
             var input: Double = 0
             for k in ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
                       "input", "cacheRead", "cacheWrite"] {
@@ -1139,6 +1218,12 @@ enum ExternalTokenScanner {
                 day[0] += input
                 day[1] += output
                 st.days[dayKey] = day
+                var models = st.daysByModel[dayKey] ?? [:]
+                var modelDay = models[model] ?? [0, 0]
+                modelDay[0] += input
+                modelDay[1] += output
+                models[model] = modelDay
+                st.daysByModel[dayKey] = models
             }
         }
     }
@@ -1146,7 +1231,7 @@ enum ExternalTokenScanner {
     /// hermes 用量库（sqlite，只读打开，绝不写入）。累计行与上次快照做差，
     /// delta 按 last_seen 归日；计数变小说明上游重置，rebase 不倒扣。
     /// 返回是否成功读取（库文件不存在由调用方先行排除，不算失败）。
-    private static func scanHermes(path: String, cutoffKey: String, into st: inout State) -> Bool {
+    private static func scanHermes(path: String, cutoffKey: String, into st: inout State, failAfterRows: Int?) -> Bool {
         var db: OpaquePointer?
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db = db
         else { _ = db.map { sqlite3_close($0) }; return false }
@@ -1164,7 +1249,13 @@ enum ExternalTokenScanner {
 
         var hs = st.hermes ?? HermesState()
         var alive = Set<String>()
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rowsRead = 0
+        var stepResult = sqlite3_step(stmt)
+        while stepResult == SQLITE_ROW {
+            defer {
+                rowsRead += 1
+                stepResult = rowsRead == failAfterRows ? SQLITE_IOERR : sqlite3_step(stmt)
+            }
             func col(_ i: Int32) -> String {
                 sqlite3_column_text(stmt, i).map { String(cString: $0) } ?? ""
             }
@@ -1187,11 +1278,18 @@ enum ExternalTokenScanner {
                 var day = hs.days[dayKey] ?? [0, 0]
                 day[0] += dIn; day[1] += dOut
                 hs.days[dayKey] = day
+                var models = hs.daysByModel[dayKey] ?? [:]
+                var modelDay = models[model] ?? [0, 0]
+                modelDay[0] += dIn; modelDay[1] += dOut
+                models[model] = modelDay
+                hs.daysByModel[dayKey] = models
             }
         }
+        guard stepResult == SQLITE_DONE else { return false }
         // 会话被 hermes 删除（ON DELETE CASCADE）的行：移出快照，停止差分
         hs.rows = hs.rows.filter { alive.contains($0.key) }
         hs.days = hs.days.filter { $0.key >= cutoffKey }
+        hs.daysByModel = hs.daysByModel.filter { $0.key >= cutoffKey }
         st.hermes = hs
         return true
     }
@@ -1202,19 +1300,33 @@ enum ExternalTokenScanner {
         let d7Key = dayFmt.string(from: now.addingTimeInterval(-6 * 86400))
         let d30Key = dayFmt.string(from: now.addingTimeInterval(-29 * 86400))
         var allDays: [String: [Double]] = [:]
+        var allModels: [String: [String: [Double]]] = [:]
+        func mergeModels(_ source: [String: [String: [Double]]]) {
+            for (day, models) in source {
+                var target = allModels[day] ?? [:]
+                for (model, values) in models {
+                    var a = target[model] ?? [0, 0]
+                    a[0] += values[0]; a[1] += values[1]
+                    target[model] = a
+                }
+                allModels[day] = target
+            }
+        }
         for (_, f) in st.files {
             for (day, v) in f.days {
                 var a = allDays[day] ?? [0, 0]
                 a[0] += v[0]; a[1] += v[1]
                 allDays[day] = a
             }
+            mergeModels(f.daysByModel)
         }
-        if let hd = st.hermes?.days {
-            for (day, v) in hd {
+        if let hermes = st.hermes {
+            for (day, v) in hermes.days {
                 var a = allDays[day] ?? [0, 0]
                 a[0] += v[0]; a[1] += v[1]
                 allDays[day] = a
             }
+            mergeModels(hermes.daysByModel)
         }
         var r = Result()
         for (day, v) in allDays where day >= d30Key {
@@ -1222,7 +1334,21 @@ enum ExternalTokenScanner {
             if day >= d7Key { r.seven.input += v[0]; r.seven.output += v[1] }
             if day >= todayKey { r.today.input += v[0]; r.today.output += v[1] }
         }
+        for (day, models) in allModels where day >= d30Key {
+            for (model, values) in models {
+                addModel(&r.thirty.models, name: model, values: values)
+                if day >= d7Key { addModel(&r.seven.models, name: model, values: values) }
+                if day >= todayKey { addModel(&r.today.models, name: model, values: values) }
+            }
+        }
         return r
+    }
+
+    private static func addModel(_ models: inout [String: ModelTokenUsage], name: String, values: [Double]) {
+        guard values.count == 2, values[0] + values[1] > 0 else { return }
+        var stats = models[name] ?? ModelTokenUsage()
+        stats.input += values[0]; stats.output += values[1]; stats.total += values[0] + values[1]
+        models[name] = stats
     }
 
     private static func loadState(at path: String) -> State {
@@ -1434,7 +1560,7 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
     private var timer: Timer?
     private var directory: URL?
 
-    func start(script: String) {
+    func start(script: String, targetTag: String, appPath: String) {
         if let window = window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         do {
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("usage-update-" + UUID().uuidString, isDirectory: true)
@@ -1447,7 +1573,7 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             #!/bin/bash
             cd "$1" || exit 1
             export UPDATE_PROGRESS_FILE="$1/progress"
-            /bin/bash "$1/update.sh" > "$1/log" 2>&1
+            /bin/bash "$1/update.sh" "$3" "$4" > "$1/log" 2>&1
             result=$?
             printf '%s' "$result" > "$1/result"
             if [ "$result" -ne 0 ] && /usr/bin/grep -q '4/5' "$1/log"; then
@@ -1472,7 +1598,7 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             let launch = Process()
             launch.executableURL = URL(fileURLWithPath: "/bin/launchctl")
             let jobLabel = "com.local.usage-update." + UUID().uuidString
-            launch.arguments = ["submit", "-l", jobLabel, "--", "/bin/bash", wrapper.path, dir.path, jobLabel]
+            launch.arguments = ["submit", "-l", jobLabel, "--", "/bin/bash", wrapper.path, dir.path, jobLabel, targetTag, appPath]
             launch.standardOutput = FileHandle.nullDevice; launch.standardError = FileHandle.nullDevice
             try launch.run(); launch.waitUntilExit()
             guard launch.terminationStatus == 0 else { throw NSError(domain: "Update", code: Int(launch.terminationStatus)) }
@@ -1570,7 +1696,8 @@ enum UpdateCheck {
     /// 与 update.sh 选择同一个「最近可安装版本」，避免提示后下载 404。
     static func latestDownloadableTag(in releases: [[String: Any]]) -> String? {
         for release in releases {
-            guard let tag = release["tag_name"] as? String, normalized(tag) != nil,
+            guard let tag = release["tag_name"] as? String,
+                  tag.range(of: "^v?[0-9]+(\\.[0-9]+)+$", options: .regularExpression) != nil,
                   release["draft"] as? Bool != true, release["prerelease"] as? Bool != true
             else { continue }
             let assets = release["assets"] as? [[String: Any]] ?? []
@@ -1589,6 +1716,7 @@ final class UpdateChecker {
     enum Result { case current, available, failed, unknownVersion }
     static let shared = UpdateChecker()
     private(set) var available = false
+    private(set) var availableTag: String?
     private var etag: String?
     private var lastCheck: Date?
     private var inFlight = false
@@ -1623,10 +1751,12 @@ final class UpdateChecker {
                         result = .unknownVersion
                     } else if let tag = UpdateCheck.latestDownloadableTag(in: releases) {
                         self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
+                        self.availableTag = self.available ? tag : nil
                         result = self.available ? .available : .current
                     } else {
                         // 没有附件齐全的 Release：检查本身成功，结论为无可安装更新
                         self.available = false
+                        self.availableTag = nil
                         result = .current
                     }
                     self.etag = http?.value(forHTTPHeaderField: "ETag")
@@ -1675,12 +1805,19 @@ struct UsagePanelModel {
         var rows: [TiboRow]
         var notices: [Notice]
     }
+    struct TokenModel {
+        var name: String
+        var total: String
+        var input: String
+        var output: String
+    }
     struct TokenBucket {
         var summaryLabel: String
         var detailLabel: String
         var total: String
         var input: String
         var output: String
+        var models: [TokenModel]
     }
     struct TokenSection {
         var title: String
@@ -1703,6 +1840,16 @@ struct UsagePanelModel {
     var refreshItem: NSMenuItem
     var loginItem: NSMenuItem
     var quitItem: NSMenuItem
+}
+
+enum TokenModelList {
+    static func visible(_ models: [String: ModelTokenUsage]) -> [(name: String, stats: ModelTokenUsage)] {
+        models.filter { $0.value.total > 0 }
+            .sorted { lhs, rhs in
+                lhs.value.total != rhs.value.total ? lhs.value.total > rhs.value.total : lhs.key < rhs.key
+            }
+            .map { (name: $0.key, stats: $0.value) }
+    }
 }
 
 enum PanelAccent {
@@ -2055,6 +2202,8 @@ final class UsagePanelController: NSObject {
     var onCheckUpdate: (() -> Void)?
     private var codexExpanded = true
     private var externalExpanded = true
+    private var expandedCodexBuckets: Set<Int> = []
+    private var expandedExternalBuckets: Set<Int> = []
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
     var previewWidth: CGFloat?
@@ -2158,7 +2307,7 @@ final class UsagePanelController: NSObject {
 
     func update(model: UsagePanelModel) {
         self.model = model
-        if isOpen { refreshPanelLayout() } else { rebuildContent() }
+        if isOpen { refreshPanelLayout() }
     }
 
     private func clear(container: NSView) {
@@ -2225,9 +2374,13 @@ final class UsagePanelController: NSObject {
         if let tibo = model.tibo {
             addContentRow(makeTiboSection(tibo))
         }
-        addContentRow(TokenSectionView(model: model.codexTokens, expanded: codexExpanded, target: self, action: #selector(toggleCodex)))
+        addContentRow(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
+            expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
+            bucketAction: #selector(toggleCodexBucket(_:))))
         if let external = model.externalTokens {
-            addContentRow(TokenSectionView(model: external, expanded: externalExpanded, target: self, action: #selector(toggleExternal)))
+            addContentRow(TokenSectionView(model: external, expanded: externalExpanded,
+                expandedBuckets: expandedExternalBuckets, target: self, action: #selector(toggleExternal),
+                bucketAction: #selector(toggleExternalBucket(_:))))
         }
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
@@ -2250,6 +2403,20 @@ final class UsagePanelController: NSObject {
     }
     @objc private func toggleCodex() { codexExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleExternal() { externalExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleCodexBucket(_ sender: NSButton) {
+        expandedCodexBuckets = toggledBucket(sender.tag, expanded: expandedCodexBuckets)
+        refreshPanelLayout()
+    }
+    @objc private func toggleExternalBucket(_ sender: NSButton) {
+        expandedExternalBuckets = toggledBucket(sender.tag, expanded: expandedExternalBuckets)
+        refreshPanelLayout()
+    }
+    private func toggledBucket(_ index: Int, expanded: Set<Int>) -> Set<Int> {
+        guard (0..<3).contains(index) else { return expanded }
+        var result = expanded
+        if result.contains(index) { result.remove(index) } else { result.insert(index) }
+        return result
+    }
     @objc fileprivate func requestUpdateCheck() { onCheckUpdate?() }
     func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
         updateMessageDismissal?.cancel()
@@ -2350,6 +2517,60 @@ final class UsagePanelController: NSObject {
         return abs(clip.bounds.origin.y - targetY) < 1
     }
 
+    func expandAllTokenBucketsForPreview() {
+        expandedCodexBuckets = [0, 1, 2]
+        expandedExternalBuckets = [0, 1, 2]
+        refreshPanelLayout()
+    }
+
+    /// 面板事件回归：逐一点击两个板块的三个周期行，并核对真实明细行数量与刷新后的状态。
+    func verifyTokenBucketInteractionsForPreview() -> Bool {
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap { descendants($0) }
+        }
+        func rows(_ action: Selector) -> [TokenBucketRow] {
+            descendants(stack).compactMap { $0 as? TokenBucketRow }
+                .filter { $0.action == action }.sorted { $0.tag < $1.tag }
+        }
+        func details() -> [TokenDetailRow] {
+            descendants(stack).compactMap { $0 as? TokenDetailRow }.filter { $0.isModelDetail }
+        }
+        func detailCount() -> Int { details().count }
+        func numericColumnsAligned() -> Bool {
+            panel.contentView?.layoutSubtreeIfNeeded()
+            stack.layoutSubtreeIfNeeded()
+            let summary = rows(#selector(toggleCodexBucket(_:)))[0].cells
+            guard let detail = details().first else { return false }
+            for index in 1..<4 {
+                let summaryLabel = summary.columnLabels[index]
+                let detailLabel = detail.columnLabels[index]
+                let summaryFrame = summaryLabel.convert(summaryLabel.bounds, to: stack)
+                let detailFrame = detailLabel.convert(detailLabel.bounds, to: stack)
+                guard abs(summaryFrame.minX - detailFrame.minX) < 0.5,
+                      abs(summaryFrame.width - detailFrame.width) < 0.5 else { return false }
+            }
+            return true
+        }
+        guard rows(#selector(toggleCodexBucket(_:))).count == 3,
+              rows(#selector(toggleExternalBucket(_:))).count == 3,
+              detailCount() == 0 else { return false }
+        for (index, expected) in [(0, 2), (1, 4), (2, 6)] {
+            rows(#selector(toggleCodexBucket(_:)))[index].performClick(nil)
+            guard detailCount() == expected else { return false }
+            if index == 0, !numericColumnsAligned() { return false }
+        }
+        rows(#selector(toggleCodexBucket(_:)))[1].performClick(nil)
+        guard detailCount() == 4 else { return false }
+        for (index, expected) in [(0, 6), (1, 8), (2, 10)] {
+            rows(#selector(toggleExternalBucket(_:)))[index].performClick(nil)
+            guard detailCount() == expected else { return false }
+        }
+        rows(#selector(toggleExternalBucket(_:)))[1].performClick(nil)
+        guard detailCount() == 8, let model = model else { return false }
+        update(model: model)
+        return expandedCodexBuckets == [0, 2] && expandedExternalBuckets == [0, 2] && detailCount() == 8
+    }
+
     /// 固定假数据预览的本地截图，只包含面板，不读取或捕捉其他窗口。
     func savePreviewImage(to path: String) -> Bool {
         guard let view = panel.contentView else { return false }
@@ -2367,6 +2588,7 @@ final class UsagePanelController: NSObject {
     private func show(anchoredTo button: NSStatusBarButton) {
         guard let buttonWindow = button.window else { return }
         anchorButton = button
+        rebuildContent()
         layoutPanel(anchoredTo: button, buttonWindow: buttonWindow)
         let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         solid.opacity = reduceTransparency ? 1 : 0.9
@@ -2438,18 +2660,29 @@ final class UsagePanelController: NSObject {
 }
 
 private final class TokenDetailRow: NSView {
-    init(values: [String], header: Bool, accent: PanelAccent) {
+    let isModelDetail: Bool
+    private(set) var columnLabels: [NSTextField] = []
+
+    init(values: [String], header: Bool, accent: PanelAccent, modelDetail: Bool = false) {
+        isModelDetail = modelDetail
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
         row.distribution = .fillEqually
         for (index, value) in values.enumerated() {
-            let label = PanelUI.label(value, size: header ? 10 : 11,
-                weight: header ? .regular : (index == 0 ? .regular : .semibold),
-                color: header ? .secondaryLabelColor : (index == 1 ? accent.color : .labelColor),
+            let size: CGFloat = header ? 10 : (modelDetail ? (index == 0 ? 9 : 10) : 11)
+            let label = PanelUI.label(value, size: size,
+                weight: header || modelDetail ? .regular : (index == 0 ? .regular : .semibold),
+                color: header || modelDetail ? .secondaryLabelColor : (index == 1 ? accent.color : .labelColor),
                 wrapping: false, monospacedDigits: !header && index > 0)
             label.alignment = index == 0 ? .left : .right
+            if modelDetail && index == 0 {
+                label.maximumNumberOfLines = 1
+                label.lineBreakMode = .byTruncatingMiddle
+                label.toolTip = value
+            }
             row.addArrangedSubview(label)
+            columnLabels.append(label)
         }
         addSubview(row)
         NSLayoutConstraint.activate([
@@ -2462,8 +2695,44 @@ private final class TokenDetailRow: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
+private final class TokenBucketRow: NSButton {
+    let cells: TokenDetailRow
+
+    init(bucket: UsagePanelModel.TokenBucket, accent: PanelAccent, expanded: Bool,
+         tag: Int, target: AnyObject, action: Selector) {
+        cells = TokenDetailRow(values: [bucket.summaryLabel, bucket.total, bucket.input, bucket.output],
+            header: false, accent: accent)
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        title = ""
+        isBordered = false
+        isEnabled = !bucket.models.isEmpty
+        self.tag = tag
+        self.target = target
+        self.action = action
+        addSubview(cells)
+        NSLayoutConstraint.activate([
+            cells.topAnchor.constraint(equalTo: topAnchor),
+            cells.leadingAnchor.constraint(equalTo: leadingAnchor),
+            cells.trailingAnchor.constraint(equalTo: trailingAnchor),
+            cells.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        let summary = "\(bucket.detailLabel)，总量 \(bucket.total)，输入 \(bucket.input)，输出 \(bucket.output)"
+        toolTip = bucket.models.isEmpty ? "暂无模型明细" : (expanded ? "收起模型明细" : "展开模型明细")
+        setAccessibilityLabel(summary + (bucket.models.isEmpty ? "，无模型明细" : "，\(expanded ? "收起" : "展开")模型明细"))
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard isEnabled, let parent = superview else { return super.hitTest(point) }
+        return bounds.contains(convert(point, from: parent)) ? self : nil
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 private final class TokenSectionView: NSView {
-    init(model: UsagePanelModel.TokenSection, expanded: Bool, target: AnyObject, action: Selector) {
+    init(model: UsagePanelModel.TokenSection, expanded: Bool, expandedBuckets: Set<Int>,
+         target: AnyObject, action: Selector, bucketAction: Selector) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 3)
@@ -2481,12 +2750,22 @@ private final class TokenSectionView: NSView {
         header.addArrangedSubview(toggle)
         PanelUI.addFullWidth(header, to: root)
         if expanded {
-        let tableHeader = TokenDetailRow(values: ["周期", "总量", "输入", "输出"], header: true, accent: model.accent)
-        PanelUI.addFullWidth(tableHeader, to: root)
-        for bucket in model.buckets {
-            let row = TokenDetailRow(values: [bucket.summaryLabel, bucket.total, bucket.input, bucket.output], header: false, accent: model.accent)
-            PanelUI.addFullWidth(row, to: root)
-        }
+            let tableHeader = TokenDetailRow(values: ["周期", "总量", "输入", "输出"], header: true, accent: model.accent)
+            PanelUI.addFullWidth(tableHeader, to: root)
+            for (index, bucket) in model.buckets.enumerated() {
+                let row = TokenBucketRow(bucket: bucket, accent: model.accent,
+                    expanded: expandedBuckets.contains(index), tag: index, target: target, action: bucketAction)
+                PanelUI.addFullWidth(row, to: root)
+                if expandedBuckets.contains(index) {
+                    for (modelIndex, tokenModel) in bucket.models.enumerated() {
+                        let detail = TokenDetailRow(values: [tokenModel.name, tokenModel.total,
+                            tokenModel.input, tokenModel.output], header: false,
+                            accent: model.accent, modelDetail: true)
+                        PanelUI.addFullWidth(detail, to: root)
+                        if modelIndex == bucket.models.count - 1 { root.setCustomSpacing(8, after: detail) }
+                    }
+                }
+            }
         }
         for notice in PanelUI.notices(model.notices) { PanelUI.addFullWidth(notice, to: root) }
         addSubview(root)
@@ -2558,6 +2837,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var resetCardsLastOK: Date?
     private var tiboLastOK: Date?
     private var extLastOK: Date?
+    private var accountIdentity: String?
+    private var accountGeneration = 0
     private var lastAttemptAt = Date()
     private let launchAgentLabel = "com.local.codex-usage"
     // 深浅主题切换重画（GlmUsage 同款）：菜单栏是彩色非模板图，不随系统明暗自动变色。
@@ -2639,12 +2920,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 title: "重置卡已发放", estimateLabel: nil, estimateFrom: nil, estimateThrough: nil,
                 presentationStatus: nil, occurredAt: now - 86_400, link: "https://aihot.news/codex-reset")
         ]
-        usage.tokensToday = TokenScanner.Stats(input: 1_200_000, output: 300_000, total: 1_500_000, files: 3)
-        usage.tokens7d = TokenScanner.Stats(input: 8_000_000, output: 2_000_000, total: 10_000_000, files: 20)
-        usage.tokens30d = TokenScanner.Stats(input: 24_000_000, output: 6_000_000, total: 30_000_000, files: 60)
-        usage.extToday = ExternalTokenScanner.Stats(input: 3_350_000, output: 20_000)
-        usage.ext7d = ExternalTokenScanner.Stats(input: 64_710_000, output: 230_000)
-        usage.ext30d = ExternalTokenScanner.Stats(input: 653_870_000, output: 3_480_000)
+        usage.tokensToday = TokenScanner.Stats(input: 1_200_000, output: 300_000, total: 1_500_000, files: 3, models: [
+            "gpt-5.5-codex": ModelTokenUsage(input: 700_000, output: 180_000, total: 880_000),
+            "gpt-5.5": ModelTokenUsage(input: 500_000, output: 120_000, total: 620_000)
+        ])
+        usage.tokens7d = TokenScanner.Stats(input: 8_000_000, output: 2_000_000, total: 10_000_000, files: 20, models: [
+            "gpt-5.5-codex": ModelTokenUsage(input: 5_000_000, output: 1_200_000, total: 6_200_000),
+            "gpt-5.5": ModelTokenUsage(input: 3_000_000, output: 800_000, total: 3_800_000)
+        ])
+        usage.tokens30d = TokenScanner.Stats(input: 24_000_000, output: 6_000_000, total: 30_000_000, files: 60, models: [
+            "gpt-5.5-codex": ModelTokenUsage(input: 14_000_000, output: 3_600_000, total: 17_600_000),
+            "gpt-5.5": ModelTokenUsage(input: 10_000_000, output: 2_400_000, total: 12_400_000)
+        ])
+        usage.extToday = ExternalTokenScanner.Stats(input: 3_350_000, output: 20_000, models: [
+            "gpt-5.6-sol": ModelTokenUsage(input: 2_000_000, output: 12_000, total: 2_012_000),
+            "gpt-5.5": ModelTokenUsage(input: 1_350_000, output: 8_000, total: 1_358_000)
+        ])
+        usage.ext7d = ExternalTokenScanner.Stats(input: 64_710_000, output: 230_000, models: [
+            "gpt-5.6-sol": ModelTokenUsage(input: 40_000_000, output: 150_000, total: 40_150_000),
+            "gpt-5.5": ModelTokenUsage(input: 24_710_000, output: 80_000, total: 24_790_000)
+        ])
+        usage.ext30d = ExternalTokenScanner.Stats(input: 653_870_000, output: 3_480_000, models: [
+            "gpt-5.6-sol": ModelTokenUsage(input: 400_000_000, output: 2_000_000, total: 402_000_000),
+            "gpt-5.5": ModelTokenUsage(input: 253_870_000, output: 1_480_000, total: 255_350_000)
+        ])
         fiveHourLastOK = now
         sevenDayLastOK = now
         tokensLastOK = now
@@ -2680,6 +2979,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             resetCardsLastOK = now - 3_600
             tiboLastOK = now - 3_600
             extLastOK = now - 3_600
+        }
+        if arguments.contains("--visual-preview-models") {
+            panelController.expandAllTokenBucketsForPreview()
         }
 
         rebuildMenu()
@@ -2728,6 +3030,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             && !panelController.scrollToEndForPreview() {
             return fail("long content did not scroll")
         }
+        guard panelController.verifyTokenBucketInteractionsForPreview() else {
+            return fail("token bucket expansion, collapse, or refresh state failed")
+        }
         guard let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
             timestamp: 0, windowNumber: 0, context: nil, characters: "\u{1b}",
             charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53) else {
@@ -2757,7 +3062,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.postEvent(refresh, atStart: false)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     guard self.panelController.isOpen else { return fail("refresh action closed the panel") }
-                    print("CodexUsage visual event test: PASS (status button toggle, Escape, outside click, refresh keeps panel open)")
+                    print("CodexUsage visual event test: PASS (status button toggle, model row expand/collapse/refresh state, Escape, outside click, refresh keeps panel open)")
                     exit(0)
                 }
             }
@@ -2772,13 +3077,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func performRefresh(tokens: Bool) {
+        synchronizeAccount()
+        let generation = accountGeneration
+        let identity = accountIdentity
+        let auth = CodexAuth.load()
+        guard CodexAuth.identity(auth) == identity else {
+            synchronizeAccount()
+            updateUI()
+            if refreshGate.finish() { performRefresh(tokens: true) }
+            return
+        }
         lastAttemptAt = Date()
         updateUI()
         let group = DispatchGroup()
         group.enter()
-        Fetcher.fetchQuota { [weak self] r in
+        Fetcher.fetchQuota(auth: auth) { [weak self] r in
             DispatchQueue.main.async {
-                self?.applyQuota(r)
+                if let self = self {
+                    if self.acceptAccountResponse(generation: generation, identity: identity) { self.applyQuota(r) }
+                    self.updateUI()
+                }
                 group.leave()
             }
         }
@@ -2797,9 +3115,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             // 重置卡（额度重置卡）：与 token 统计同周期；失败不触发额度 ⚠ 过期标注
             group.enter()
-            Fetcher.fetchResetCards { [weak self] cards, err in
+            Fetcher.fetchResetCards(auth: auth) { [weak self] cards, err in
                 DispatchQueue.main.async {
-                    self?.applyResetCards(cards, err)
+                    if let self = self, self.acceptAccountResponse(generation: generation, identity: identity) {
+                        self.applyResetCards(cards, err)
+                    }
                     group.leave()
                 }
             }
@@ -2821,6 +3141,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func synchronizeAccount() {
+        let current = CodexAuth.identity(CodexAuth.load())
+        guard current != accountIdentity else { return }
+        accountIdentity = current
+        accountGeneration += 1
+        AccountIsolation.clear(&usage)
+        fiveHourLastOK = nil; sevenDayLastOK = nil; resetCardsLastOK = nil
+    }
+
+    private func acceptAccountResponse(generation: Int, identity: String?) -> Bool {
+        synchronizeAccount()
+        return AccountIsolation.accepts(capturedGeneration: generation, currentGeneration: accountGeneration,
+                                        capturedIdentity: identity, currentIdentity: accountIdentity)
+    }
+
     /// 菜单栏图标 + 下拉菜单的统一渲染入口；面板打开时也就地重建（refreshPanelLayout 保持滚动位置、无动画闪断）
     private func updateUI() {
         renderBar()
@@ -2831,7 +3166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         panelController.toggle(anchoredTo: button)
         if panelController.isOpen {
-            refresh(tokens: false, manual: true)
+            refresh(tokens: false)
             checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
         }
     }
@@ -3139,17 +3474,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         func bucket(_ summary: String, _ detail: String,
-                    total: Double?, input: Double?, output: Double?) -> UsagePanelModel.TokenBucket {
-            UsagePanelModel.TokenBucket(summaryLabel: summary, detailLabel: detail,
-                total: Fmt.tokensAbbr(total), input: Fmt.tokensAbbr(input), output: Fmt.tokensAbbr(output))
+                    total: Double?, input: Double?, output: Double?,
+                    models: [String: ModelTokenUsage]? = nil) -> UsagePanelModel.TokenBucket {
+            let modelRows = TokenModelList.visible(models ?? [:]).map {
+                UsagePanelModel.TokenModel(name: $0.name, total: Fmt.tokensAbbr($0.stats.total),
+                    input: Fmt.tokensAbbr($0.stats.input), output: Fmt.tokensAbbr($0.stats.output))
+            }
+            return UsagePanelModel.TokenBucket(summaryLabel: summary, detailLabel: detail,
+                total: Fmt.tokensAbbr(total), input: Fmt.tokensAbbr(input),
+                output: Fmt.tokensAbbr(output), models: modelRows)
         }
         let codexBuckets = [
             bucket("今天", "今天", total: usage.tokensToday?.total,
-                input: usage.tokensToday?.input, output: usage.tokensToday?.output),
+                input: usage.tokensToday?.input, output: usage.tokensToday?.output,
+                models: usage.tokensToday?.models),
             bucket("7 天", "近 7 天", total: usage.tokens7d?.total,
-                input: usage.tokens7d?.input, output: usage.tokens7d?.output),
+                input: usage.tokens7d?.input, output: usage.tokens7d?.output,
+                models: usage.tokens7d?.models),
             bucket("30 天", "近 30 天", total: usage.tokens30d?.total,
-                input: usage.tokens30d?.input, output: usage.tokens30d?.output)
+                input: usage.tokens30d?.input, output: usage.tokens30d?.output,
+                models: usage.tokens30d?.models)
         ]
         var codexNotices: [UsagePanelModel.Notice] = []
         if usage.tokensToday == nil && usage.tokens7d == nil && usage.tokens30d == nil {
@@ -3169,11 +3513,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if usage.extToday != nil || usage.ext7d != nil || usage.ext30d != nil || usage.extError != nil {
             let buckets = [
                 bucket("今天", "今天", total: usage.extToday?.total,
-                    input: usage.extToday?.input, output: usage.extToday?.output),
+                    input: usage.extToday?.input, output: usage.extToday?.output,
+                    models: usage.extToday?.models),
                 bucket("7 天", "近 7 天", total: usage.ext7d?.total,
-                    input: usage.ext7d?.input, output: usage.ext7d?.output),
+                    input: usage.ext7d?.input, output: usage.ext7d?.output,
+                    models: usage.ext7d?.models),
                 bucket("30 天", "近 30 天", total: usage.ext30d?.total,
-                    input: usage.ext30d?.input, output: usage.ext30d?.output)
+                    input: usage.ext30d?.input, output: usage.ext30d?.output,
+                    models: usage.ext30d?.models)
             ]
             var notices: [UsagePanelModel.Notice] = []
             if let error = usage.extError {
@@ -3257,7 +3604,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let script = Bundle.main.path(forResource: "update", ofType: "sh") else {
             NSWorkspace.shared.open(UpdateCheck.releasesPage); return
         }
-        UpdateProgressController.shared.start(script: script)
+        guard let tag = UpdateChecker.shared.availableTag else { return }
+        UpdateProgressController.shared.start(script: script, targetTag: tag, appPath: Bundle.main.bundleURL.standardizedFileURL.path)
     }
 
     // MARK: 开机自启（LaunchAgent，与 GlmUsage/KimiUsage 同款）
@@ -3319,6 +3667,13 @@ enum CodexOfflineRegression {
             try expect(Fmt.tokensAbbr(20_000) == "20K" && Fmt.tokensAbbr(300_000) == "300K"
                        && Fmt.tokensAbbr(1_500_000) == "1.5M" && Fmt.tokensAbbr(nil) == "--",
                        "token abbreviation scale or missing value is incorrect")
+            let visibleModels = TokenModelList.visible([
+                "gpt-zero": ModelTokenUsage(),
+                "gpt-a": ModelTokenUsage(input: 80, output: 20, total: 100),
+                "gpt-b": ModelTokenUsage(input: 150, output: 50, total: 200)
+            ])
+            try expect(visibleModels.map { $0.name } == ["gpt-b", "gpt-a"],
+                       "model details are not sorted by usage with zero rows filtered")
 
             try expect(CodexNumber.finite(Double.nan) == nil, "NaN accepted as a quota value")
             try expect(CodexNumber.finite(Double.infinity) == nil, "infinity accepted as a quota value")
@@ -3621,6 +3976,10 @@ enum CodexOfflineRegression {
             // 100+50(cache_read)+20(cache_creation)+200，cache 计入 input
             try expect(fs.days.count == 1 && fs.days[extDayKey] == [370, 70],
                        "external parse did not aggregate OpenAI usage only (got \(fs.days))")
+            try expect(fs.daysByModel[extDayKey]?["gpt-5.6-sol"] == [170, 30]
+                       && fs.daysByModel[extDayKey]?["gpt-6.1-sol"] == [200, 40]
+                       && fs.daysByModel[extDayKey]?.count == 2,
+                       "external per-model aggregation wrong (got \(fs.daysByModel))")
 
             // 本地会话统计端到端（临时 sessions 根 + 临时状态文件，不碰真实 ~/.codex）：
             // 窗口分桶 + codex 压缩归档 .jsonl.zst 必须计入 30 天窗口（2026-10 实况：
@@ -3696,6 +4055,85 @@ enum CodexOfflineRegression {
             let t2 = TokenScanner.scan(root: sesRoot, statePath: sesState, now: now)
             try expect(t2.thirty.total == expect30 && t2.thirty.files == expectFiles,
                        "tokens incremental rescan double-counted or dropped entries")
+            try expect(t2.seven.models["未知模型"]?.total == 500
+                       && t2.thirty.models["未知模型"]?.total == expect30,
+                       "legacy records without model metadata were not grouped as unknown")
+
+            // A session can switch models between turns. Deltas follow the active turn_context,
+            // including when a later incremental append switches back to an earlier model.
+            let modelRoot = root.path + "/model-session"
+            try FileManager.default.createDirectory(atPath: modelRoot, withIntermediateDirectories: true)
+            let modelFile = modelRoot + "/rollout-\(sesStamp(now))-models.jsonl"
+            let modelState = root.path + "/model-state.json"
+            let modelStamp = Fmt.isoFrac.string(from: now)
+            func modelContext(_ model: String) -> String {
+                "{\"timestamp\":\"\(modelStamp)\",\"type\":\"turn_context\",\"payload\":{\"model\":\"\(model)\"}}\n"
+            }
+            func modelUsage(_ input: Int) -> String {
+                "{\"timestamp\":\"\(modelStamp)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\(input),\"output_tokens\":1,\"total_tokens\":\(input + 1)}}}}\n"
+            }
+            let initialModels = modelContext("gpt-5.5-codex") + modelUsage(99)
+                + modelContext("gpt-5.5") + modelUsage(249)
+            try initialModels.write(toFile: modelFile, atomically: true, encoding: .utf8)
+            let models1 = TokenScanner.scan(root: modelRoot, statePath: modelState, now: now)
+            try expect(models1.today.total == 250
+                       && models1.today.models["gpt-5.5-codex"]?.total == 100
+                       && models1.today.models["gpt-5.5"]?.total == 150,
+                       "initial per-model turn attribution wrong (got \(models1.today.models))")
+            let modelHandle = FileHandle(forWritingAtPath: modelFile)!
+            modelHandle.seekToEndOfFile()
+            modelHandle.write(Data((modelContext("gpt-5.5-codex") + modelUsage(399)).utf8))
+            try modelHandle.close()
+            let models2 = TokenScanner.scan(root: modelRoot, statePath: modelState, now: now)
+            try expect(models2.today.total == 400
+                       && models2.today.models["gpt-5.5-codex"]?.total == 250
+                       && models2.today.models["gpt-5.5"]?.total == 150
+                       && models2.today.models.values.reduce(0) { $0 + $1.total } == models2.today.total,
+                       "incremental model switch attribution wrong (got \(models2.today.models))")
+
+            // One session crosses midnight: cumulative 100 yesterday, then 140 today.
+            let crossRoot = root.path + "/cross-session"
+            try FileManager.default.createDirectory(atPath: crossRoot, withIntermediateDirectories: true)
+            let crossFile = crossRoot + "/rollout-2000-01-01T00-00-00-cross.jsonl"
+            let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: now)!
+            func event(_ value: Int, _ date: Date) -> String {
+                let stamp = Fmt.isoFrac.string(from: date)
+                return "{\"timestamp\":\"\(stamp)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\(value),\"output_tokens\":0,\"total_tokens\":\(value)}}}}\n"
+            }
+            try event(100, yesterday).write(toFile: crossFile, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: crossFile)
+            let crossState = root.path + "/cross-state.json"
+            _ = TokenScanner.scan(root: crossRoot, statePath: crossState, now: now)
+            let fh = FileHandle(forWritingAtPath: crossFile)!
+            fh.seekToEndOfFile()
+            fh.write(Data("{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100}}}}\n".utf8))
+            fh.write(Data(event(140, now).utf8)); try fh.close()
+            try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: crossFile)
+            let cross = TokenScanner.scan(root: crossRoot, statePath: crossState, now: now)
+            try expect(cross.today.total == 40 && cross.seven.total == 140 && cross.thirty.total == 140 && cross.seven.files == 1,
+                       "cross-midnight cumulative delta misattributed")
+            // Old cache schema is rebuilt from events, not reused as a creation-day total.
+            let legacyState = root.path + "/legacy-scan-state.json"
+            try "{\"files\":{}}".write(toFile: legacyState, atomically: true, encoding: .utf8)
+            let migrated = TokenScanner.scan(root: crossRoot, statePath: legacyState, now: now)
+            try expect(migrated.today.total == 40 && migrated.thirty.total == 140,
+                       "legacy cache migration did not rebuild event buckets")
+            // Both archive and original can exist while compression completes.
+            let duplicate = crossFile + ".zst"
+            try embeddedFrame.write(to: URL(fileURLWithPath: duplicate))
+            let overlap = TokenScanner.scan(root: crossRoot, statePath: crossState, now: now)
+            try expect(overlap.thirty.total == 140 && overlap.thirty.files == 1,
+                       "compressed and plain overlap was counted twice")
+            let invalidState = root.path + "/invalid-v2-state.json"
+            let malformedCache: [String: Any] = ["version": 2, "files": [crossFile:
+                ["size": 1, "mtime": 0, "offset": 0, "previous": [100], "days": ["2000-01-01": [1]]]]]
+            try JSONSerialization.data(withJSONObject: malformedCache).write(to: URL(fileURLWithPath: invalidState))
+            let repaired = TokenScanner.scan(root: crossRoot, statePath: invalidState, now: now)
+            try expect(repaired.today.total == 40 && repaired.thirty.total == 140,
+                       "malformed v2 cache did not rebuild safely")
+            let crossAgain = TokenScanner.scan(root: crossRoot, statePath: crossState, now: now)
+            try expect(crossAgain.today.total == 40 && crossAgain.thirty.total == 140,
+                       "cross-midnight cache rescan changed totals")
 
             // 损坏 .zst：解不开的归档本轮跳过且不写状态条目，不阻塞其余会话统计
             let badRoot = root.path + "/codex-sessions-badzst"
@@ -3713,14 +4151,13 @@ enum CodexOfflineRegression {
                        "corrupt .zst archive was not skipped cleanly "
                        + "(got \(br.thirty.total)/\(br.thirty.files))")
 
-            // tail-read：>1MB 活跃文件尾部命中最后一条 token_count；
-            // token_count 仅在开头时尾部反查未命中 → 全量读兜底，两条路径数值都必须正确
+            // 大文件分块读取：候选事件位于文件开头和结尾时均应正确统计
             let tailRoot = root.path + "/codex-sessions-tail"
             try FileManager.default.createDirectory(
                 atPath: tailRoot + "/" + sesDayDir(sesNew), withIntermediateDirectories: true)
             let padding = String(repeating:
                 "{\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}\n",
-                count: 17_000)   // ~1.3MB，超过 1MB 尾部窗口
+                count: 17_000)   // ~1.3MB，超过单个读取块
             try (padding + sesUsage(1234)).write(
                 toFile: tailRoot + "/" + sesDayDir(sesNew)
                     + "/rollout-\(sesStamp(sesNew))-cccc.jsonl", atomically: true, encoding: .utf8)
@@ -3770,6 +4207,10 @@ enum CodexOfflineRegression {
                        + "(got \(s1.seven.input))")
             try expect(s1.thirty.input == 16100 && s1.thirty.output == 1610,
                        "external 30d window wrong (old-file skip or nested enumeration failed)")
+            try expect(s1.today.models["gpt-5.6-sol"]?.total == 110
+                       && s1.seven.models["gpt-5.6-sol"]?.total == 1210
+                       && s1.thirty.models["gpt-5.6-sol"]?.total == 17710,
+                       "external per-model window totals do not match aggregate totals")
 
             let handleA = try FileHandle(forWritingTo: URL(fileURLWithPath: fileA))
             _ = try handleA.seekToEnd()
@@ -3846,22 +4287,67 @@ enum CodexOfflineRegression {
                                                statePath: hStatePath, now: extBase)
             try expect(h1.today.input == 1000 && h1.today.output == 100 && h1.thirty.input == 1000,
                        "hermes first scan did not backfill OpenAI rows by last_seen (got \(h1.today.input))")
+            try expect(h1.today.models["gpt-6.1-sol"]?.total == 1100
+                       && h1.today.models.count == 1,
+                       "hermes model attribution included a non-OpenAI model or lost usage")
             try hexec("UPDATE session_model_usage SET input_tokens = 2500, last_seen = \(extBase.timeIntervalSince1970 - 1800) WHERE session_id = 's1'")
             let h2 = ExternalTokenScanner.scan(roots: [], hermesDB: hdbPath,
                                                statePath: hStatePath, now: extBase)
             // 回填 1000（base-3600）+ 差分 1500（base-1800）同属今天 → 2500
             try expect(h2.today.input == 2500 && h2.today.output == 100,
                        "hermes cumulative diff did not land in the right day bucket (got \(h2.today.input))")
+            let hFault = ExternalTokenScanner.scan(roots: [], hermesDB: hdbPath,
+                statePath: hStatePath, now: extBase, hermesFailAfterRows: 1)
+            try expect(hFault.error != nil && hFault.today.input == 2500,
+                       "failed sqlite step changed the committed snapshot")
+            try hexec("UPDATE session_model_usage SET input_tokens = 2600 WHERE session_id = 's1'")
+            let hRecovered = ExternalTokenScanner.scan(roots: [], hermesDB: hdbPath,
+                statePath: hStatePath, now: extBase)
+            try expect(hRecovered.today.input == 2600, "sqlite recovery double-counted")
             try hexec("UPDATE session_model_usage SET input_tokens = 10 WHERE session_id = 's1'")
             let h3 = ExternalTokenScanner.scan(roots: [], hermesDB: hdbPath,
                                                statePath: hStatePath, now: extBase)
-            try expect(h3.today.input == 2500 && h3.today.output == 100,
+            try expect(h3.today.input == 2600 && h3.today.output == 100,
                        "hermes counter reset produced negative or inflated usage")
             try hexec("DELETE FROM session_model_usage WHERE session_id = 's1'")
             let h4 = ExternalTokenScanner.scan(roots: [], hermesDB: hdbPath,
                                                statePath: hStatePath, now: extBase)
-            try expect(h4.today.input == 2500 && h4.thirty.input == 2500,
+            try expect(h4.today.input == 2600 && h4.thirty.input == 2600,
                        "deleted hermes row changed historical aggregation")
+
+            // Stable account identity survives token rotation; different workspace and
+            // incomplete identities are conservative boundaries.
+            func jwt(_ claims: [String: Any]) throws -> String {
+                let data = try JSONSerialization.data(withJSONObject: claims)
+                return "x." + data.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+                    .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "") + ".x"
+            }
+            let idJWT = try jwt(["sub": "user-a"])
+            func authIdentity(_ token: String, _ account: String?) -> String? {
+                CodexAuth.identity(CodexAuth.Snapshot(tokens: CodexAuth.Tokens(
+                    accessToken: token, refreshToken: nil, idToken: idJWT, email: nil, accountID: account)))
+            }
+            try expect(authIdentity("old", "workspace-a") == authIdentity("new", "workspace-a"),
+                       "same-account token rotation changed identity")
+            try expect(authIdentity("old", "workspace-a") != authIdentity("old", "workspace-b")
+                       && authIdentity("old", nil) != authIdentity("new", nil),
+                       "workspace or incomplete identity was mixed")
+
+            var isolated = UsageData()
+            isolated.planType = "old"; isolated.email = "old@example.test"; isolated.resetCredits = 1
+            isolated.fiveHour = QuotaWindow(usedPercent: 50, reset: nil)
+            isolated.resetCards = [ResetCard(expires: now, name: "old")]
+            isolated.quotaError = "old error"; isolated.resetCardsError = "old error"
+            AccountIsolation.clear(&isolated)
+            try expect(isolated.planType == nil && isolated.email == nil && isolated.resetCredits == nil
+                       && isolated.fiveHour == nil && isolated.resetCards == nil
+                       && isolated.quotaError == nil && isolated.resetCardsError == nil,
+                       "account switch retained account-bound data")
+            try expect(!AccountIsolation.accepts(capturedGeneration: 1, currentGeneration: 2,
+                       capturedIdentity: "a", currentIdentity: "b")
+                       && !AccountIsolation.accepts(capturedGeneration: 1, currentGeneration: 3,
+                       capturedIdentity: "a", currentIdentity: "a"),
+                       "late response accepted after account switch")
 
             let authPath = root.appendingPathComponent("auth.json").path
             func authDocument(_ access: String, _ refresh: String, _ id: String, _ marker: String) -> [String: Any] {
@@ -3959,7 +4445,7 @@ enum CodexOfflineRegression {
                        && Fmt.webURL("") == nil,
                        "non-web tibo link scheme was accepted")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/.zst archives/real-frame decode/tail-read, external usage model/parse/scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist)")
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/per-model attribution/model switching/.zst archives/real-frame decode/tail-read, external usage model/parse/per-model scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
