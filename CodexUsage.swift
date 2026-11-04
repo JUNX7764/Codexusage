@@ -3076,16 +3076,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func manualUpdateCheck() {
         panelController.setUpdateMessage("正在检查更新…")
         guard !visualPreview else {
-            panelController.setUpdateMessage("预览模式：未联网检查更新", dismissAfter: 5)
+            panelController.setUpdateMessage("预览模式：未联网检查更新", dismissAfter: 3)
             return
         }
         UpdateChecker.shared.check(force: true) { [weak self] result in
             guard let self = self else { return }
             switch result {
-            case .current: self.panelController.setUpdateMessage("当前已是最新版本", dismissAfter: 5)
-            case .available: self.panelController.setUpdateMessage("发现新版本，请点击上方更新提示", dismissAfter: 5)
-            case .failed: self.panelController.setUpdateMessage("检查失败，请稍后重试", dismissAfter: 5)
-            case .unknownVersion: self.panelController.setUpdateMessage("当前版本未知，无法比较", dismissAfter: 5)
+            case .current: self.panelController.setUpdateMessage("当前已是最新版本", dismissAfter: 3)
+            case .available: self.panelController.setUpdateMessage("发现新版本，请点击上方更新提示", dismissAfter: 3)
+            case .failed: self.panelController.setUpdateMessage("检查失败，请稍后重试", dismissAfter: 3)
+            case .unknownVersion: self.panelController.setUpdateMessage("当前版本未知，无法比较", dismissAfter: 3)
             }
             self.rebuildMenu()
         }
