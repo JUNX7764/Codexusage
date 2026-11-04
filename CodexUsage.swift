@@ -142,7 +142,7 @@ enum TiboFreshness {
 //
 // 架构与同机 GlmUsage 完全同构（单文件 / 纯 Foundation + AppKit / 无外部依赖）。
 // 数据源：
-//   额度  GET https://chatgpt.com/backend-api/wham/usage（每 30s，Bearer 凭证来自 ~/.codex/auth.json）
+//   额度  GET https://chatgpt.com/backend-api/wham/usage（每 10s，Bearer 凭证来自 ~/.codex/auth.json）
 //   重置卡 GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits（每 5 分钟，认证头同款）
 //   Tibo 重置动态 GET https://aihot.news/api/v1/codex-resets/recent（每 5 分钟，AIHOT 公开接口，匿名只读不经凭据）
 //   token 统计：本地增量扫描 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl（每 5 分钟）
@@ -2234,7 +2234,7 @@ final class UsagePanelController: NSObject {
     }
 
     private func refreshPanelLayout() {
-        // 就地重建时保持滚动位置并禁用隐式动画：每 30s 后台刷新重建面板内容不打扰阅读（KimiUsage 同款）
+        // 就地重建时保持滚动位置并禁用隐式动画：每 10s 后台刷新重建面板内容不打扰阅读（KimiUsage 同款）
         let previousOrigin = scrollView.contentView.bounds.origin
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -2545,8 +2545,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cycle = 0
     private let refreshGate = RefreshGate()
     private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
-    // token 扫描每 N 个刷新周期做一次（主循环 30s × 10 = 5 分钟；额度每轮都刷）
-    private let tokenEveryCycles = 10
+    // token 扫描每 N 个刷新周期做一次（主循环 10s × 30 = 5 分钟；额度每轮都刷）
+    private let tokenEveryCycles = 30
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
     // （与 GlmUsage 的静默保留旧数据不同，这是刻意改进：过期数据必须可见）
     private let quotaStaleAfter: TimeInterval = 600
@@ -2560,6 +2560,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var extLastOK: Date?
     private var lastAttemptAt = Date()
     private let launchAgentLabel = "com.local.codex-usage"
+    // 深浅主题切换重画（GlmUsage 同款）：菜单栏是彩色非模板图，不随系统明暗自动变色。
+    // KVO 即时重画；但 NSStatusBarButton.effectiveAppearance 深→浅方向有数十秒粘滞（浅色栏
+    // 残留旧色文字，点击才恢复），5s 对账兜底：按钮主题与系统主题不一致时轻推 isVisible
+    // 强制重解析（30s 限流防闪烁）。KVO 负责即时响应，对账负责兜底粘滞。
+    private var statusItemAppearanceObs: NSKeyValueObservation?
+    private var barThemeDark: Bool?
+    private var appearancePollTimer: Timer?
+    private var lastBarNudge: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[CodexUsage] launched, creating status item")
@@ -2578,13 +2586,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
         renderBar()
         refresh(tokens: true, manual: true)
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        attachBarAppearanceObserver()
+        appearancePollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.reconcileBarAppearance()
+        }
+        appearancePollTimer?.tolerance = 1
+        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.cycle += 1
             self.refresh(tokens: CodexRefreshSchedule.slowItemsDue(cycle: self.cycle,
                 every: self.tokenEveryCycles, manual: false))
         }
-        timer?.tolerance = 6
+        timer?.tolerance = 3
         // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 30 分钟；
         // 打开菜单也会触发一次（同一 interval 节流，不增加请求频率）
         updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateCheck.interval, repeats: true) { [weak self] _ in
@@ -2920,6 +2933,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // 菜单栏显示：5H / 7D 两行堆叠（剩余口径）；额度过期时第一行前缀 ⚠
+    private func attachBarAppearanceObserver() {
+        statusItemAppearanceObs = statusItem.button?.observe(\.effectiveAppearance) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.renderBarIfThemeChanged() }
+        }
+    }
+
+    /// 按钮/系统主题对账：粘滞（按钮仍报旧主题）时轻推状态栏项强制重解析，再按需重画
+    private func reconcileBarAppearance() {
+        guard let button = statusItem.button else { return }
+        let appDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let buttonDark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if buttonDark != appDark,
+           lastBarNudge.map({ Date().timeIntervalSince($0) >= 30 }) ?? true {
+            lastBarNudge = Date()
+            statusItem.isVisible = false
+            statusItem.isVisible = true
+            // isVisible 切换可能重建按钮实例，重新挂 KVO
+            attachBarAppearanceObserver()
+        }
+        renderBarIfThemeChanged()
+    }
+
+    /// 仅当按钮解析出的明暗主题与上次渲染快照不同时才重画（防止 setImage↔KVO 循环）
+    private func renderBarIfThemeChanged() {
+        guard let button = statusItem.button else { return }
+        let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        guard dark != barThemeDark else { return }
+        renderBar()
+    }
+
     private func renderBar() {
         let fiveRemaining = Fmt.remaining(usage.fiveHour?.usedPercent)
         let sevenRemaining = Fmt.remaining(usage.sevenDay?.usedPercent)
@@ -2930,6 +2973,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     value: Fmt.remainingPct(usage.sevenDay?.usedPercent),
                                     remaining: sevenRemaining)
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        barThemeDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2, appearance: appearance)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
@@ -3178,7 +3222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func onRefresh() { refresh(tokens: true, manual: true) }
 
-    // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤30s 也会兜底重建）
+    // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤10s 也会兜底重建）
     private func checkForUpdate() {
         guard !visualPreview else { return }
         UpdateChecker.shared.check { [weak self] _ in self?.updateUI() }
