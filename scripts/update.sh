@@ -128,7 +128,11 @@ case "$SHA256_URL" in
     *) echo "!! Release 返回了非预期的 SHA256 地址，已中止"; exit 1 ;;
 esac
 echo "==> 下载 ${RELEASE_TAG}（${ZIP_URL}）"
-if ! curl -fsSL --max-time 180 -o "${TMP}/CodexUsage.zip" "$ZIP_URL"; then
+DOWNLOAD_PROGRESS=--silent
+if [ -n "${UPDATE_PROGRESS_FILE:-}" ]; then
+    DOWNLOAD_PROGRESS=--progress-bar
+fi
+if ! curl -fL "$DOWNLOAD_PROGRESS" --max-time 180 -o "${TMP}/CodexUsage.zip" "$ZIP_URL" 2>"${UPDATE_PROGRESS_FILE:-/dev/null}"; then
     echo "!! 发布包下载失败，请稍后重试"
     exit 1
 fi

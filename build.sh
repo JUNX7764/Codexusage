@@ -55,7 +55,7 @@ esac
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $PLIST_VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CUBuildVersion string ${VERSION_DESCRIBE}" "$APP/Contents/Info.plist"
 
-# 就地更新脚本随包内置：app 菜单点击更新时由 Terminal 代跑（从 GitHub Releases 下载
+# 就地更新脚本随包内置：app 菜单点击更新时由后台作业运行（从 GitHub Releases 下载
 # 发布包替换，不依赖 clone 目录），见 CodexUsage.swift onUpdateApp
 cp "$DIR/scripts/update.sh" "$APP/Contents/Resources/update.sh"
 chmod +x "$APP/Contents/Resources/update.sh"

@@ -32,7 +32,7 @@ macOS 菜单栏常驻，一瞥即知 OpenAI Codex（ChatGPT）订阅的 5 小时
 
 需要 macOS 13+。安装：到 [Releases](https://github.com/JUNX7764/Codexusage/releases) 下载最新 `CodexUsage.dmg`，打开后把 CodexUsage 拖进 Applications（或 `~/Applications`）双击运行。首次打开如遇 Gatekeeper 提示，右键 → 打开。
 
-**更新**：发布新 Release 后（每 30 分钟检查一次，打开面板也会触发一次节流检查），面板最上方出现「⬆ 新版本可用，点击更新」，点击即自动下载替换并重启（zip 经 SHA256 校验后才替换）；也可以随时手动重跑安装步骤。更新检查和下载只认 `CodexUsage.zip` 与 `.sha256` 附件齐全的 Release；最新 Release 缺附件时自动选择最近的可安装版本，不会再对空 Release 发起必然 404 的下载。日常代码提交不会触发更新提示——只有正式发版才会。
+**更新**：发布新 Release 后（每 30 分钟检查一次，打开面板也会触发一次节流检查），面板最上方出现「⬆ 新版本可用，点击更新」，点击后在应用内显示下载进度与安装状态，完成后自动重启（zip 经 SHA256 校验后才替换）；也可以随时手动重跑安装步骤。更新检查和下载只认 `CodexUsage.zip` 与 `.sha256` 附件齐全的 Release；最新 Release 缺附件时自动选择最近的可安装版本，不会再对空 Release 发起必然 404 的下载。日常代码提交不会触发更新提示——只有正式发版才会。
 
 从源码构建（开发者）：
 

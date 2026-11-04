@@ -261,6 +261,15 @@ exit 0
         self.assertFalse(any(self.apps.glob(f".{APP_NAME}.update.*")))
         self.assertTrue(self.state.exists())
 
+    def test_progress_mode_keeps_verified_update_flow(self):
+        installed = self.prepare_update()
+        progress = self.base / "download-progress"
+        result = self.run_update(UPDATE_PROGRESS_FILE=str(progress))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        self.assertTrue(progress.exists())
+        self.assertTrue(any("--progress-bar" in line for line in self.log_lines() if line.startswith("curl")))
+
     def test_update_skips_empty_latest_release(self):
         installed = self.prepare_update()
         zip_url = f"https://github.com/{REPO}/releases/download/v2.0.0/{EXECUTABLE}.zip"

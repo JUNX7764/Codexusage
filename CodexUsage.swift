@@ -1424,6 +1424,99 @@ enum Fmt {
     }
 }
 
+
+// 更新任务由独立 launchd 作业执行，应用退出换包时作业仍可完成或回滚。
+final class UpdateProgressController: NSObject, NSWindowDelegate {
+    static let shared = UpdateProgressController()
+    private var window: NSWindow?
+    private var progress: NSProgressIndicator?
+    private var status: NSTextField?
+    private var timer: Timer?
+    private var directory: URL?
+
+    func start(script: String) {
+        if let window = window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        do {
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("usage-update-" + UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            directory = dir
+            let copiedScript = dir.appendingPathComponent("update.sh")
+            try FileManager.default.copyItem(atPath: script, toPath: copiedScript.path)
+            let wrapper = dir.appendingPathComponent("run.sh")
+            let wrapperText = """
+            #!/bin/bash
+            cd "$1" || exit 1
+            export UPDATE_PROGRESS_FILE="$1/progress"
+            /bin/bash "$1/update.sh" > "$1/log" 2>&1
+            result=$?
+            printf '%s' "$result" > "$1/result"
+            if [ "$result" -ne 0 ] && /usr/bin/grep -q '4/5' "$1/log"; then
+                /usr/bin/osascript -e 'display dialog "更新失败，已尝试恢复旧版本。请重新打开应用后重试。" with title "更新失败" buttons {"好"} default button 1 with icon caution' >/dev/null 2>&1
+            fi
+            if [ "$result" -eq 0 ]; then /bin/sleep 5; /bin/rm -rf "$1"; fi
+            /bin/launchctl remove "$2" >/dev/null 2>&1
+            exit "$result"
+            """
+            try wrapperText.write(to: wrapper, atomically: true, encoding: .utf8)
+            let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 370, height: 130), styleMask: [.titled], backing: .buffered, defer: false)
+            win.title = "软件更新"
+            win.isReleasedWhenClosed = false
+            win.delegate = self
+            let label = NSTextField(labelWithString: "正在准备更新…")
+            label.frame = NSRect(x: 24, y: 78, width: 322, height: 24)
+            let bar = NSProgressIndicator(frame: NSRect(x: 24, y: 43, width: 322, height: 18))
+            bar.style = .bar; bar.isIndeterminate = true; bar.startAnimation(nil)
+            win.contentView?.addSubview(label); win.contentView?.addSubview(bar)
+            status = label; progress = bar; window = win
+            win.center(); win.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+            let launch = Process()
+            launch.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            let jobLabel = "com.local.usage-update." + UUID().uuidString
+            launch.arguments = ["submit", "-l", jobLabel, "--", "/bin/bash", wrapper.path, dir.path, jobLabel]
+            launch.standardOutput = FileHandle.nullDevice; launch.standardError = FileHandle.nullDevice
+            try launch.run(); launch.waitUntilExit()
+            guard launch.terminationStatus == 0 else { throw NSError(domain: "Update", code: Int(launch.terminationStatus)) }
+            timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.refresh() }
+        } catch {
+            finishError("无法启动更新，请稍后重试。")
+        }
+    }
+
+    private func refresh() {
+        guard let dir = directory else { return }
+        let log = (try? String(contentsOf: dir.appendingPathComponent("log"), encoding: .utf8)) ?? ""
+        if log.contains("4/5") { status?.stringValue = "正在安装并重启…"; indeterminate() }
+        else if log.contains("3/5") { status?.stringValue = "正在准备安装…"; indeterminate() }
+        else if log.contains("2/5") { status?.stringValue = "正在校验更新…"; indeterminate() }
+        else if log.contains("下载 v") {
+            status?.stringValue = "正在下载更新…"
+            if let text = try? String(contentsOf: dir.appendingPathComponent("progress"), encoding: .utf8),
+               let regex = try? NSRegularExpression(pattern: #"([0-9]+(?:\.[0-9]+)?)%"#),
+               let match = regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).last,
+               let range = Range(match.range(at: 1), in: text), let value = Double(text[range]) {
+                progress?.stopAnimation(nil); progress?.isIndeterminate = false
+                progress?.minValue = 0; progress?.maxValue = 100; progress?.doubleValue = value
+                status?.stringValue = "正在下载更新… \(Int(value))%"
+            }
+        }
+        if let result = try? String(contentsOf: dir.appendingPathComponent("result"), encoding: .utf8), result != "0" {
+            let detail = log.components(separatedBy: .newlines).last(where: { $0.contains("!!") }) ?? "请检查网络后重试。"
+            finishError(detail.replacingOccurrences(of: "!! ", with: ""))
+        }
+    }
+    private func indeterminate() {
+        guard progress?.isIndeterminate == false else { return }
+        progress?.isIndeterminate = true; progress?.startAnimation(nil)
+    }
+    private func finishError(_ detail: String) {
+        timer?.invalidate(); timer = nil
+        window?.close(); window = nil
+        let alert = NSAlert(); alert.messageText = "更新失败"; alert.informativeText = detail
+        alert.addButton(withTitle: "好"); alert.runModal()
+        if let dir = directory { try? FileManager.default.removeItem(at: dir) }; directory = nil
+    }
+}
+
 // MARK: - 版本与更新检查（成熟项目惯例，Sparkle 生态同款语义：只认 GitHub Release，
 // 不认 main 分支 commit——日常 push 与用户无关，发布了更高版本才提示。
 // build.sh 打包时写 Info.plist 自定义键；就地更新脚本随包内置，见 Resources/update.sh）
@@ -3116,17 +3209,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // 更新横幅点击：唤起 Terminal 代跑 .app 内置 update.sh（从 GitHub Releases 下载最新
-    // 发布包 → 替换本 app → 重启）；脚本随包携带，不依赖 clone 目录。
-    // 内置脚本缺失（手工换包破坏 bundle）时退化为打开 Releases 页手动下载
     @objc private func onUpdateApp() {
-        if let script = Bundle.main.path(forResource: "update", ofType: "sh"),
-           let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
-            NSWorkspace.shared.open([URL(fileURLWithPath: script)], withApplicationAt: terminal,
-                configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
-            return
+        guard let script = Bundle.main.path(forResource: "update", ofType: "sh") else {
+            NSWorkspace.shared.open(UpdateCheck.releasesPage); return
         }
-        NSWorkspace.shared.open(UpdateCheck.releasesPage)
+        UpdateProgressController.shared.start(script: script)
     }
 
     // MARK: 开机自启（LaunchAgent，与 GlmUsage/KimiUsage 同款）
