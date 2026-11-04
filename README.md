@@ -28,7 +28,7 @@
 2. 打开安装包，将 CodexUsage 拖入“应用程序”，然后打开。
 3. 使用前请先在本机 Codex CLI 登录 ChatGPT 账号。应用会读取已有登录状态来查询额度。
 
-首次打开如遇系统安全提示，可在 Finder 中右键点击应用，选择“打开”。本应用使用 ad-hoc 签名。
+首次打开如遇“已损坏”或“无法验证开发者”提示：前往“系统设置 → 隐私与安全性”，点击底部“仍要打开”；或在终端执行 `xattr -d com.apple.quarantine /Applications/CodexUsage.app`。本应用使用 ad-hoc 签名，不影响功能。
 
 ## 更新
 
