@@ -2554,6 +2554,8 @@ final class UsagePanelController: NSObject {
         }
         guard rows(#selector(toggleCodexBucket(_:))).count == 3,
               rows(#selector(toggleExternalBucket(_:))).count == 3,
+              rows(#selector(toggleCodexBucket(_:))).allSatisfy({ $0.verifyHoverForPreview() }),
+              rows(#selector(toggleExternalBucket(_:))).allSatisfy({ $0.verifyHoverForPreview() }),
               detailCount() == 0 else { return false }
         for (index, expected) in [(0, 2), (1, 4), (2, 6)] {
             rows(#selector(toggleCodexBucket(_:)))[index].performClick(nil)
@@ -2698,6 +2700,8 @@ private final class TokenDetailRow: NSView {
 
 private final class TokenBucketRow: NSButton {
     let cells: TokenDetailRow
+    private var hovered = false { didSet { needsDisplay = true } }
+    override var wantsUpdateLayer: Bool { true }
 
     init(bucket: UsagePanelModel.TokenBucket, accent: PanelAccent, expanded: Bool,
          tag: Int, target: AnyObject, action: Selector) {
@@ -2708,6 +2712,8 @@ private final class TokenBucketRow: NSButton {
         title = ""
         isBordered = false
         isEnabled = !bucket.models.isEmpty
+        wantsLayer = true
+        layer?.cornerRadius = 5
         self.tag = tag
         self.target = target
         self.action = action
@@ -2723,9 +2729,36 @@ private final class TokenBucketRow: NSButton {
         setAccessibilityLabel(summary + (bucket.models.isEmpty ? "，无模型明细" : "，\(expanded ? "收起" : "展开")模型明细"))
     }
 
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(hovered && isEnabled ? 0.08 : 0).cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard isEnabled, let parent = superview else { return super.hitTest(point) }
         return bounds.contains(convert(point, from: parent)) ? self : nil
+    }
+
+    func verifyHoverForPreview() -> Bool {
+        updateTrackingAreas()
+        hovered = true; updateLayer()
+        let highlighted = layer?.backgroundColor?.alpha ?? 0
+        hovered = false; updateLayer()
+        let cleared = layer?.backgroundColor?.alpha ?? 0
+        return highlighted > 0 && cleared == 0 && !trackingAreas.isEmpty
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
