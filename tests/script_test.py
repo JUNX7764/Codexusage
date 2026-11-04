@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -152,6 +154,10 @@ exec "$REAL_CP" "$@"
 echo "mv $*" >> "$MOCK_LOG"
 if [ "${MOCK_MV_SWAP_FAIL:-0}" = 1 ]; then
     case "$1" in *"/new/"*) exit 44 ;; esac
+fi
+if [ "${MOCK_MV_BACKUP_FAIL:-0}" = 1 ] && [ "$1" = "$MOCK_TARGET" ]; then
+    echo "mv: Operation not permitted" >&2
+    exit 45
 fi
 exec "$REAL_MV" "$@"
 ''')
@@ -333,6 +339,33 @@ exit 0
         self.assertEqual(self.marker(installed), "old")
         self.assertTrue(self.state.exists())
         self.assertTrue(any("bootstrap" in line for line in self.log_lines()))
+
+    def test_permission_failure_preserves_original_and_reports_cause(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_MV_BACKUP_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertTrue(self.state.exists())
+        self.assertIn("无法移动当前应用", result.stdout)
+        self.assertIn("Operation not permitted", result.stdout)
+        self.assertFalse(any("/new/" in line for line in self.log_lines() if line.startswith("mv ")))
+
+    def test_app_update_wrapper_survives_parent_exit_and_keeps_failure_log(self):
+        source = (ROOT / "CodexUsage.swift").read_text()
+        wrapper = re.search(r'let wrapperText = """\n(.*?)\n\s*"""', source, re.S).group(1)
+        runner = self.base / "run.sh"
+        runner.write_text(textwrap.dedent(wrapper))
+        update = self.base / "update.sh"
+        update.write_text('#!/bin/bash\n/bin/sleep 0.2\nprintf "%s|%s\\n" "$1" "$2"\nexit 7\n')
+        parent = self.base / "parent.py"
+        parent.write_text('import subprocess, sys\nsubprocess.Popen(["/usr/bin/nohup", "/bin/bash", *sys.argv[1:]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n')
+        subprocess.run([os.sys.executable, str(parent), str(runner), str(self.base), "v2.0.0", "/Applications/An App.app"], check=True)
+        deadline = time.monotonic() + 5
+        while not (self.base / "result").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual((self.base / "result").read_text(), "7")
+        self.assertEqual((self.base / "log").read_text(), "v2.0.0|/Applications/An App.app\n")
+        self.assertNotIn("launchctl", wrapper)
 
     def test_unhealthy_new_app_rolls_back_and_restarts_old_app(self):
         installed = self.prepare_update()

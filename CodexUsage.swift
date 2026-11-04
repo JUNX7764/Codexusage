@@ -1552,7 +1552,8 @@ enum Fmt {
 }
 
 
-// 更新任务由独立 launchd 作业执行，应用退出换包时作业仍可完成或回滚。
+// 从应用直接启动更新子进程，保留 TCC 的责任应用归属。
+// nohup 与独立的临时脚本确保应用退出换包后，子进程仍能完成更新或回滚。
 final class UpdateProgressController: NSObject, NSWindowDelegate {
     static let shared = UpdateProgressController()
     private var window: NSWindow?
@@ -1574,14 +1575,18 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             #!/bin/bash
             cd "$1" || exit 1
             export UPDATE_PROGRESS_FILE="$1/progress"
-            /bin/bash "$1/update.sh" "$3" "$4" > "$1/log" 2>&1
+            /bin/bash "$1/update.sh" "$2" "$3" > "$1/log" 2>&1
             result=$?
             printf '%s' "$result" > "$1/result"
             if [ "$result" -ne 0 ] && /usr/bin/grep -q '4/5' "$1/log"; then
-                /usr/bin/osascript -e 'display dialog "更新失败，已尝试恢复旧版本。请重新打开应用后重试。" with title "更新失败" buttons {"好"} default button 1 with icon caution' >/dev/null 2>&1
+                detail=$(/usr/bin/grep '!!' "$1/log" | /usr/bin/tail -1)
+                /usr/bin/osascript - "${detail:-更新未完成，请查看日志。}" "$1/log" <<'APPLESCRIPT' >/dev/null 2>&1
+            on run argv
+                display dialog ((item 1 of argv) & return & return & "日志：" & (item 2 of argv)) with title "更新失败" buttons {"好"} default button 1 with icon caution
+            end run
+            APPLESCRIPT
             fi
             if [ "$result" -eq 0 ]; then /bin/sleep 5; /bin/rm -rf "$1"; fi
-            /bin/launchctl remove "$2" >/dev/null 2>&1
             exit "$result"
             """
             try wrapperText.write(to: wrapper, atomically: true, encoding: .utf8)
@@ -1597,12 +1602,12 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             status = label; progress = bar; window = win
             win.center(); win.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
             let launch = Process()
-            launch.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            let jobLabel = "com.local.usage-update." + UUID().uuidString
-            launch.arguments = ["submit", "-l", jobLabel, "--", "/bin/bash", wrapper.path, dir.path, jobLabel, targetTag, appPath]
+            launch.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
+            launch.arguments = ["/bin/bash", wrapper.path, dir.path, targetTag, appPath]
+            launch.currentDirectoryURL = dir
+            launch.standardInput = FileHandle.nullDevice
             launch.standardOutput = FileHandle.nullDevice; launch.standardError = FileHandle.nullDevice
-            try launch.run(); launch.waitUntilExit()
-            guard launch.terminationStatus == 0 else { throw NSError(domain: "Update", code: Int(launch.terminationStatus)) }
+            try launch.run()
             timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.refresh() }
         } catch {
             finishError("无法启动更新，请稍后重试。")
@@ -1639,8 +1644,9 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
         timer?.invalidate(); timer = nil
         window?.close(); window = nil
         let alert = NSAlert(); alert.messageText = "更新失败"; alert.informativeText = detail
+        if let dir = directory { alert.informativeText += "\n\n日志：\(dir.appendingPathComponent("log").path)" }
         alert.addButton(withTitle: "好"); alert.runModal()
-        if let dir = directory { try? FileManager.default.removeItem(at: dir) }; directory = nil
+        directory = nil
     }
 }
 

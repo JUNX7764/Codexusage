@@ -242,7 +242,10 @@ if [ -n "$(target_pids)" ]; then
     echo "!! 旧进程仍未退出，取消换包"
     exit 1
 fi
-mv "$INSTALLED" "$BACKUP"
+if ! mv "$INSTALLED" "$BACKUP"; then
+    echo "!! 无法移动当前应用：macOS 权限或文件占用阻止了替换。旧版本仍保留在 ${INSTALLED}"
+    exit 1
+fi
 mv "$STAGE" "$INSTALLED"
 if [ "$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${INSTALLED}/Contents/Info.plist")" != "$NEW_VERSION" ]; then
     echo "!! 安装后的版本校验失败"
