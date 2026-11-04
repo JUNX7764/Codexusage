@@ -1554,16 +1554,43 @@ enum Fmt {
 
 // 从应用直接启动更新子进程，保留 TCC 的责任应用归属。
 // nohup 与独立的临时脚本确保应用退出换包后，子进程仍能完成更新或回滚。
-final class UpdateProgressController: NSObject, NSWindowDelegate {
+// 进度在下拉面板内原位展示（更新按钮变进度行），不再弹独立窗口、不抢占焦点：
+// 任务与 UI 解耦，关闭面板不影响更新，重开面板时根据这里的状态恢复进度行；
+// 失败另用 alert 兜底，因为那一刻面板可能已经关闭。
+final class UpdateProgressController: NSObject {
     static let shared = UpdateProgressController()
-    private var window: NSWindow?
-    private var progress: NSProgressIndicator?
-    private var status: NSTextField?
+    static let didChangeNotification = Notification.Name("CodexUsage.UpdateProgress.didChange")
+
+    enum Phase: Equatable {
+        case idle, preparing, downloading, verifying, staging, installing, finished, failed
+    }
+
+    private(set) var phase: Phase = .idle
+    private(set) var fraction: Double = 0   // 仅 downloading 阶段有意义，0–100
+    /// 进行中（含安装重启阶段）；失败/结束后恢复为可点击的更新按钮
+    var isActive: Bool { [.preparing, .downloading, .verifying, .staging, .installing].contains(phase) }
+    var statusLine: String {
+        switch phase {
+        case .idle: return ""
+        case .preparing: return "正在准备更新…"
+        case .downloading: return "正在下载更新… \(Int(fraction))%"
+        case .verifying: return "正在校验更新…"
+        case .staging: return "正在准备安装…"
+        case .installing: return "正在安装并重启…"
+        case .finished: return "更新完成，正在重启…"
+        case .failed: return "更新失败"
+        }
+    }
+    /// 安装阶段的重启预告：用户需要知道应用即将自己退出，不是异常消失
+    var detailLine: String? {
+        phase == .installing ? "应用将自动退出并重启，无需手动操作" : nil
+    }
+
     private var timer: Timer?
     private var directory: URL?
 
     func start(script: String, targetTag: String, appPath: String) {
-        if let window = window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        guard !isActive else { return }   // 进度行已替换按钮，这里再兜底防重入
         do {
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("usage-update-" + UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -1590,17 +1617,9 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             exit "$result"
             """
             try wrapperText.write(to: wrapper, atomically: true, encoding: .utf8)
-            let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 370, height: 130), styleMask: [.titled], backing: .buffered, defer: false)
-            win.title = "软件更新"
-            win.isReleasedWhenClosed = false
-            win.delegate = self
-            let label = NSTextField(labelWithString: "正在准备更新…")
-            label.frame = NSRect(x: 24, y: 78, width: 322, height: 24)
-            let bar = NSProgressIndicator(frame: NSRect(x: 24, y: 43, width: 322, height: 18))
-            bar.style = .bar; bar.isIndeterminate = true; bar.startAnimation(nil)
-            win.contentView?.addSubview(label); win.contentView?.addSubview(bar)
-            status = label; progress = bar; window = win
-            win.center(); win.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+            phase = .preparing
+            fraction = 0
+            notify()
             let launch = Process()
             launch.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
             launch.arguments = ["/bin/bash", wrapper.path, dir.path, targetTag, appPath]
@@ -1614,39 +1633,108 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
         }
     }
 
+    private func notify() {
+        NotificationCenter.default.post(name: Self.didChangeNotification, object: self)
+    }
+
+    private func setPhase(_ newPhase: Phase, fraction newFraction: Double? = nil) {
+        let changed = phase != newPhase || (newFraction.map { $0 != fraction } ?? false)
+        phase = newPhase
+        if let newFraction = newFraction { fraction = newFraction }
+        if changed { notify() }
+    }
+
     private func refresh() {
         guard let dir = directory else { return }
         let log = (try? String(contentsOf: dir.appendingPathComponent("log"), encoding: .utf8)) ?? ""
-        if log.contains("4/5") { status?.stringValue = "正在安装并重启…"; indeterminate() }
-        else if log.contains("3/5") { status?.stringValue = "正在准备安装…"; indeterminate() }
-        else if log.contains("2/5") { status?.stringValue = "正在校验更新…"; indeterminate() }
+        if log.contains("4/5") || log.contains("5/5") { setPhase(.installing) }
+        else if log.contains("3/5") { setPhase(.staging) }
+        else if log.contains("2/5") { setPhase(.verifying) }
         else if log.contains("下载 v") {
-            status?.stringValue = "正在下载更新…"
+            var value: Double?
             if let text = try? String(contentsOf: dir.appendingPathComponent("progress"), encoding: .utf8),
                let regex = try? NSRegularExpression(pattern: #"([0-9]+(?:\.[0-9]+)?)%"#),
                let match = regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).last,
-               let range = Range(match.range(at: 1), in: text), let value = Double(text[range]) {
-                progress?.stopAnimation(nil); progress?.isIndeterminate = false
-                progress?.minValue = 0; progress?.maxValue = 100; progress?.doubleValue = value
-                status?.stringValue = "正在下载更新… \(Int(value))%"
+               let range = Range(match.range(at: 1), in: text) {
+                value = Double(text[range])
+            }
+            setPhase(.downloading, fraction: value)   // 百分比尚未写出时保留旧值
+        }
+        if let result = try? String(contentsOf: dir.appendingPathComponent("result"), encoding: .utf8) {
+            if result != "0" {
+                let detail = log.components(separatedBy: .newlines).last(where: { $0.contains("!!") }) ?? "请检查网络后重试。"
+                finishError(detail.replacingOccurrences(of: "!! ", with: ""))
+            } else {
+                // 正常路径下旧进程已被脚本替换重启，走不到这里；兜底停止轮询
+                timer?.invalidate(); timer = nil
+                setPhase(.finished)
             }
         }
-        if let result = try? String(contentsOf: dir.appendingPathComponent("result"), encoding: .utf8), result != "0" {
-            let detail = log.components(separatedBy: .newlines).last(where: { $0.contains("!!") }) ?? "请检查网络后重试。"
-            finishError(detail.replacingOccurrences(of: "!! ", with: ""))
-        }
     }
-    private func indeterminate() {
-        guard progress?.isIndeterminate == false else { return }
-        progress?.isIndeterminate = true; progress?.startAnimation(nil)
-    }
+
     private func finishError(_ detail: String) {
         timer?.invalidate(); timer = nil
-        window?.close(); window = nil
+        phase = .failed
+        notify()   // 先恢复面板里的更新按钮，再模态弹窗
         let alert = NSAlert(); alert.messageText = "更新失败"; alert.informativeText = detail
         if let dir = directory { alert.informativeText += "\n\n日志：\(dir.appendingPathComponent("log").path)" }
         alert.addButton(withTitle: "好"); alert.runModal()
         directory = nil
+    }
+
+    /// 视觉预览专用：不启动子进程，仅呈现进行中的进度行。
+    func simulateForPreview(phase previewPhase: Phase, fraction previewFraction: Double) {
+        phase = previewPhase
+        fraction = previewFraction
+    }
+}
+
+/// 下拉面板内的更新进度行：原位替换「新版本可用」按钮。
+/// 自身订阅进度通知刷新文本与进度条，避免每 0.25s 重建整个面板；
+/// 面板关闭后重开，rebuildContent 会新建本行并同步到当前进度。
+final class UpdateProgressRowView: NSView {
+    private let status = PanelUI.label("", size: 12, weight: .semibold, wrapping: false)
+    private let detail = PanelUI.label("", size: 10, color: .secondaryLabelColor)
+    private let bar = NSProgressIndicator()
+    private var observer: NSObjectProtocol?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        bar.style = .bar
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        let stack = PanelUI.stack(spacing: 6)
+        PanelUI.addFullWidth(status, to: stack)
+        PanelUI.addFullWidth(bar, to: stack)
+        PanelUI.addFullWidth(detail, to: stack)
+        addSubview(stack)
+        PanelUI.pin(stack, to: self)
+        observer = NotificationCenter.default.addObserver(
+            forName: UpdateProgressController.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.sync() }
+        sync()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit {
+        if let observer = observer { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    private func sync() {
+        let controller = UpdateProgressController.shared
+        status.stringValue = controller.statusLine
+        detail.stringValue = controller.detailLine ?? ""
+        detail.isHidden = controller.detailLine == nil
+        if controller.phase == .downloading {
+            if bar.isIndeterminate { bar.stopAnimation(nil) }
+            bar.isIndeterminate = false
+            bar.minValue = 0; bar.maxValue = 100
+            bar.doubleValue = controller.fraction
+        } else {
+            if !bar.isIndeterminate { bar.isIndeterminate = true }
+            bar.startAnimation(nil)
+        }
     }
 }
 
@@ -2368,7 +2456,10 @@ final class UsagePanelController: NSObject {
             stack.removeArrangedSubview(row)
             row.removeFromSuperview()
         }
-        if let update = model.updateItem {
+        // 更新进行中：原按钮位置换成进度行（重开面板也在此恢复）；空闲时才显示更新按钮
+        if UpdateProgressController.shared.isActive {
+            addContentRow(UpdateProgressRowView())
+        } else if let update = model.updateItem {
             let button = makeActionButton(update, .prominent)
             button.heightAnchor.constraint(equalToConstant: 30).isActive = true
             addContentRow(button)
@@ -2891,6 +2982,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var barThemeDark: Bool?
     private var appearancePollTimer: Timer?
     private var lastBarNudge: Date?
+    private var updateProgressObserver: NSObjectProtocol?
+    private var updateProgressWasActive = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[CodexUsage] launched, creating status item")
@@ -2908,6 +3001,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         rebuildMenu()
         renderBar()
+        // 面板内更新进度：状态翻转时重建内容（按钮↔进度行），进度百分比由进度行自刷；
+        // 菜单栏 toolTip 同步更新状态，面板关闭时更新也在后台继续
+        updateProgressObserver = NotificationCenter.default.addObserver(
+            forName: UpdateProgressController.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.updateProgressDidChange() }
         refresh(tokens: true, manual: true)
         attachBarAppearanceObserver()
         appearancePollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -2944,6 +3042,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if arguments.contains("--visual-preview-full") {
             usage.fiveHour = QuotaWindow(usedPercent: 0, reset: now + 18_000)
             usage.sevenDay = QuotaWindow(usedPercent: 0, reset: now + 604_800)
+        }
+        // 更新进度行预览：updating 为下载中 62%；updating-install 为安装重启阶段（含重启预告）
+        if arguments.contains("--visual-preview-updating-install") {
+            UpdateProgressController.shared.simulateForPreview(phase: .installing, fraction: 100)
+        } else if arguments.contains("--visual-preview-updating") {
+            UpdateProgressController.shared.simulateForPreview(phase: .downloading, fraction: 62)
         }
         usage.planType = "plus"
         usage.email = "preview@example.com"
@@ -3344,6 +3448,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         renderBar()
     }
 
+    /// 进度行自己刷新文本与百分比；这里只在「进行中」状态翻转时重建面板内容（按钮↔进度行），
+    /// 并刷新菜单栏 toolTip。失败时面板若开着，额外给一条可重试的提示。
+    private func updateProgressDidChange() {
+        let active = UpdateProgressController.shared.isActive
+        if active != updateProgressWasActive {
+            updateProgressWasActive = active
+            rebuildMenu()
+            if !active, UpdateProgressController.shared.phase == .failed {
+                panelController.setUpdateMessage("更新失败，请检查网络后重试", dismissAfter: 8)
+            }
+        }
+        renderBar()
+    }
+
     private func renderBar() {
         let fiveRemaining = Fmt.remaining(usage.fiveHour?.usedPercent)
         let sevenRemaining = Fmt.remaining(usage.sevenDay?.usedPercent)
@@ -3364,6 +3482,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + " · 外部最后成功 \(extLastOK.map { Fmt.time($0) } ?? "--")"
             + " · 重置卡最后成功 \(resetCardsLastOK.map { Fmt.time($0) } ?? "--")"
             + " · Tibo 最后成功 \(tiboLastOK.map { Fmt.time($0) } ?? "--")"
+        if UpdateProgressController.shared.isActive {
+            statusItem.button?.toolTip = (statusItem.button?.toolTip ?? "")
+                + " · \(UpdateProgressController.shared.statusLine)"
+        }
         if !visualPreview {
             writeStatus(line1: "\(line1.label) \(line1.value)", line2: "\(line2.label) \(line2.value)")
         }

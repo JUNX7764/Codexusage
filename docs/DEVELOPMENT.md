@@ -28,6 +28,8 @@ python3 -m unittest discover -s tests -p '*_test.py'
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-states
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-empty
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-update
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-updating
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-updating-install
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-narrow
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-models
 

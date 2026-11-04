@@ -116,7 +116,7 @@ body: grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann&refresh_to
 
 **面板视觉与交互**：`NSPanel + NSVisualEffectView`（`.popover / behindWindow / active`），叠加 90% 不透明 `windowBackgroundColor` 底层与 16px 圆角，目标宽度 330pt（窄屏自适应）；系统“减少透明度”开启时改为完全纯色。卡片使用中性 surface 与 hairline separator，布局采用 4px 网格。最大高度为可用屏幕的 85%；标题与两行底部操作区固定，中间内容进入 `NSScrollView`；底部第一行显示最近尝试刷新与版本，第二行显示立即刷新、开机自启和退出。支持状态栏图标开关、点击外部关闭、Esc 关闭、`R` 刷新、`Q` 退出与 Tibo 链接。两个用量区可分别折叠，启动默认展开，折叠后错误提示仍显示。点击版本号强制检查 Release，面板内反馈检查中、最新、可更新、失败或版本未知。
 
-**视觉预览**：`--visual-preview`（绿/红）、`--visual-preview-normal`（当前色/橙）、`--visual-preview-dark`（深色）、`--visual-preview-long`（长内容）、`--visual-preview-states`（失败/过期）、`--visual-preview-empty`（空数据）、`--visual-preview-update`（更新横幅）、`--visual-preview-narrow`（320px 与长版本号）使用固定假数据，不联网、不写真实 `status.json`。追加 `--visual-preview-models` 展开全部模型明细。`--visual-preview-output=<path>` 仅捕捉面板并保存 PNG，可搭配 `--visual-preview-scroll-end` 检查底部；追加 `--visual-preview-events` 自动验证周期行展开/收起、刷新状态、Esc、外部点击与 R 刷新后退出。
+**视觉预览**：`--visual-preview`（绿/红）、`--visual-preview-normal`（当前色/橙）、`--visual-preview-dark`（深色）、`--visual-preview-long`（长内容）、`--visual-preview-states`（失败/过期）、`--visual-preview-empty`（空数据）、`--visual-preview-update`（更新横幅）、`--visual-preview-updating`（面板内下载进度 62%）、`--visual-preview-updating-install`（安装重启阶段）、`--visual-preview-narrow`（320px 与长版本号）使用固定假数据，不联网、不写真实 `status.json`。追加 `--visual-preview-models` 展开全部模型明细。`--visual-preview-output=<path>` 仅捕捉面板并保存 PNG，可搭配 `--visual-preview-scroll-end` 检查底部；追加 `--visual-preview-events` 自动验证周期行展开/收起、刷新状态、Esc、外部点击与 R 刷新后退出。
 
 **--once 自检模式**：拉一次额度 + 全量扫一次 token，打印摘要后退出（照 GlmUsage 的 --once 风格）。**输出严禁包含任何 token/密钥值。**
 
@@ -256,6 +256,7 @@ Codex CLI 的额度与 token 统计只覆盖本机会话；Proma 等外部 Agent
 - 判据是 **Release 版本号不是 commit hash**：已装 `CUBuildVersion` vs `api.github.com/repos/JUNX7764/Codexusage/releases/latest` 的 `tag_name`（匿名只读、ETag/304、30 分钟一查，打开菜单也触发一次同 interval 节流检查；GitHub 匿名限额 60 次/小时/IP，实际 2 次/小时且 304 不耗配额）。失败或从未发过版（404）静默不提示、保留旧结论。
 - 版本比较：`v` 前缀与 `-dirty`/`-g<hash>` 等破折号尾巴剥离，逐段数值比较（1.10 > 1.9），短侧补 0（1.2 == 1.2.0）；任一侧无法解析 = 不提示。日常 commit / push 不触发横幅，发版才触发。
 - 最新 Release 版本更高 → 菜单最上方横幅「⬆ 新版本可用，点击更新」；拿不到远端（断网等）→ 不出横幅。
+- 点击横幅后**面板内原位显示进度行**（不弹独立窗口、不抢占焦点）：准备 → 下载（百分比）→ 校验 → 暂存 → 安装重启（附「应用将自动退出并重启」预告）。更新由 nohup 子进程执行，关闭面板不中断，重开面板按 `UpdateProgressController` 状态恢复进度行；进度行自订阅通知刷新，仅进行中状态翻转时重建面板内容。失败保留 alert 与日志路径兜底（面板可能已关闭），面板内恢复可点击横幅并提示可重试。
 
 ### 发布（scripts/release.sh）
 
