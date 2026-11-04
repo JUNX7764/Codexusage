@@ -29,6 +29,7 @@ python3 -m unittest discover -s tests -p '*_test.py'
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-empty
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-update
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-narrow
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-models
 
 # 面板本地截图：只捕捉面板；scroll-end 可先滚动到底部
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-output=/tmp/codex-panel.png
@@ -52,3 +53,9 @@ python3 -m unittest discover -s tests -p '*_test.py'
 | `scripts/release.sh` | 发布脚本（本地 tag → 构建与测试 → 资产校验 → 推 tag → GitHub Release） |
 | `tests/script_test.py` | 更新、发布、签名故障的离线回归测试 |
 | `PLAN.md` | 开发规格（数据源已实测、解析规则、UI 规格、验收标准） |
+
+## 用量与更新的校验边界
+
+Codex 会话的今日、近 7 日和近 30 日统计按 `token_count` 事件的本地日期，累计值按同一会话前后差额入账，并按最近一条 `turn_context.payload.model` 归入对应模型；没有模型信息的旧记录归为「未知模型」。缺少事件时间的旧记录使用文件名日期；包含模型维度的缓存升级后首次扫描会重建，外部用量缓存同步升级为 v5。未修改文件复用缓存，活跃明文会话只读取新增内容；压缩归档发生变化时重新解压。文件名与修改时间都早于窗口的未缓存冷文件不读取。
+
+更新脚本接收已确认的 release tag 和正在运行的应用路径，校验包身份、构建版本和实际安装版本后仅处理目标进程。离线脚本测试使用临时应用、伪造进程和网络命令；它不能替代真实安装环境中的更新与回滚验收。
