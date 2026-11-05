@@ -2288,14 +2288,7 @@ final class ResetCardSectionView: PanelCardView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-final class UsagePanel: NSPanel {
-    var onCancel: (() -> Void)?
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
-    override func cancelOperation(_ sender: Any?) { onCancel?() }
-}
-
-final class UsagePanelController: NSObject {
+final class UsagePanelController: NSObject, NSPopoverDelegate {
     var onCheckUpdate: (() -> Void)?
     private var codexExpanded = true
     private var externalExpanded = true
@@ -2304,9 +2297,10 @@ final class UsagePanelController: NSObject {
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
     var previewWidth: CGFloat?
-    var isOpen: Bool { panel.isVisible }
+    var isOpen: Bool { popover.isShown }
 
-    private let panel: UsagePanel
+    private let popover = NSPopover()
+    private let contentController = NSViewController()
     private let effect = NSVisualEffectView()
     private let solid = PanelSolidBackgroundView()
     private let headerContainer = NSView()
@@ -2321,19 +2315,15 @@ final class UsagePanelController: NSObject {
     private var panelWidth = UsagePanelController.maximumWidth
 
     override init() {
-        panel = UsagePanel(contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 320),
-            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         super.init()
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.isFloatingPanel = true
-        panel.hidesOnDeactivate = false
-        panel.isReleasedWhenClosed = false
-        panel.level = .popUpMenu
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.onCancel = { [weak self] in self?.close() }
         configureContent()
+        popover.contentViewController = contentController
+        popover.behavior = .transient
+        popover.animates = false
+        popover.delegate = self
+        if CommandLine.arguments.contains("--visual-preview-dark") {
+            popover.appearance = NSAppearance(named: .darkAqua)
+        }
     }
 
     deinit {
@@ -2342,7 +2332,8 @@ final class UsagePanelController: NSObject {
     }
 
     private func configureContent() {
-        guard let container = panel.contentView else { return }
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 320))
+        contentController.view = container
         container.wantsLayer = true
         container.layer?.cornerRadius = 16
         container.layer?.masksToBounds = true
@@ -2604,7 +2595,7 @@ final class UsagePanelController: NSObject {
 
     /// 视觉回归专用：真实滚动到底部并确认 clip view 位置发生变化。
     func scrollToEndForPreview() -> Bool {
-        panel.contentView?.layoutSubtreeIfNeeded()
+        contentController.view.layoutSubtreeIfNeeded()
         scrollView.layoutSubtreeIfNeeded()
         stack.layoutSubtreeIfNeeded()
         guard let document = scrollView.documentView else { return false }
@@ -2637,7 +2628,7 @@ final class UsagePanelController: NSObject {
         }
         func detailCount() -> Int { details().count }
         func numericColumnsAligned() -> Bool {
-            panel.contentView?.layoutSubtreeIfNeeded()
+            contentController.view.layoutSubtreeIfNeeded()
             stack.layoutSubtreeIfNeeded()
             let summary = rows(#selector(toggleCodexBucket(_:)))[0].cells
             guard let detail = details().first else { return false }
@@ -2673,14 +2664,84 @@ final class UsagePanelController: NSObject {
         return expandedCodexBuckets == [0, 2] && expandedExternalBuckets == [0, 2] && detailCount() == 8
     }
 
-    /// 固定假数据预览的本地截图，只包含面板，不读取或捕捉其他窗口。
+    /// 截取完整系统窗口，包含 Popover 箭头与阴影。
     func savePreviewImage(to path: String) -> Bool {
-        guard let view = panel.contentView else { return false }
-        view.layoutSubtreeIfNeeded()
-        guard let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return false }
-        view.cacheDisplay(in: view.bounds, to: image)
-        guard let data = image.representation(using: .png, properties: [:]) else { return false }
-        return (try? data.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil
+        guard let window = contentController.view.window else { return false }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        task.arguments = ["-x", "-l", String(window.windowNumber), path]
+        do { try task.run(); task.waitUntilExit(); return task.terminationStatus == 0 && FileManager.default.fileExists(atPath: path) }
+        catch { return false }
+    }
+
+    /// 在真实 Popover 上逐步检查尺寸、锚点和窗口/视图身份。
+    func verifyPopoverGeometryForPreview(outputDirectory: String) {
+        func fail(_ message: String) { fputs("CodexUsage popover geometry: FAIL \(message)\n", stderr); exit(1) }
+        guard popover.isShown, let window = contentController.view.window,
+              let button = anchorButton, let buttonWindow = button.window else { return fail("opening") }
+        let controller = popover.contentViewController
+        let document = scrollView.documentView
+        let top = window.frame.maxY
+        let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        var height = window.frame.height
+        func rows() -> [TokenBucketRow] {
+            func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+            return descendants(stack).compactMap { $0 as? TokenBucketRow }.filter { $0.action == #selector(toggleCodexBucket(_:)) }.sorted { $0.tag < $1.tag }
+        }
+        func snapshot(_ name: String) {
+            guard savePreviewImage(to: "\(outputDirectory)/\(name).png") else { return fail("screenshot \(name)") }
+        }
+        func check(_ name: String, direction: CGFloat) {
+            guard popover.isShown, contentController.view.window === window,
+                  popover.contentViewController === controller, scrollView.documentView === document else { return fail("identity \(name)") }
+            let frame = window.frame
+            guard abs(frame.maxY - top) < 1, frame.minX <= buttonRect.midX, frame.maxX >= buttonRect.midX else { return fail("anchor \(name)") }
+            guard (frame.height - height) * direction > 0.5 else { return fail("height \(name): \(height) -> \(frame.height)") }
+            if let screen = buttonWindow.screen { guard frame.minX >= screen.frame.minX - 1 && frame.maxX <= screen.frame.maxX + 1 else { return fail("screen edge") } }
+            print("CODEX_POPOVER_GEOMETRY \(name) height=\(frame.height) top=\(frame.maxY) window=\(window.windowNumber)")
+            height = frame.height
+        }
+        print("CODEX_POPOVER_GEOMETRY initial height=\(height) top=\(top) window=\(window.windowNumber)")
+        snapshot("before")
+        guard let row = rows().first else { return fail("row missing") }
+        row.performClick(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            check("expanded", direction: 1); snapshot("expanded")
+            guard let row = rows().first else { return fail("expanded row missing") }
+            row.performClick(nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                check("collapsed", direction: -1); snapshot("collapsed")
+                print("CodexUsage popover geometry: PASS")
+                exit(0)
+            }
+        }
+    }
+
+    func verifyNonzeroScrollForPreview() -> Bool {
+        guard let model = model else { return false }
+        let didScroll = scrollToEndForPreview()
+        print("CODEX_POPOVER_SCROLL setup=\(didScroll) offset=\(scrollView.contentView.bounds.origin.y) document=\(stack.frame.height) viewport=\(scrollView.contentView.bounds.height)")
+        guard didScroll else { return false }
+        let before = scrollView.contentView.bounds.origin.y
+        guard abs(before) > 1 else { return false }
+        update(model: model)
+        scrollView.layoutSubtreeIfNeeded()
+        let after = scrollView.contentView.bounds.origin.y
+        guard abs(after - before) < 1 && isOpen else { return false }
+        let clip = scrollView.contentView
+        func row(_ view: NSView) -> TokenBucketRow? {
+            if let button = view as? TokenBucketRow, button.action == #selector(toggleCodexBucket(_:)), button.tag == 0 { return button }
+            for child in view.subviews { if let found = row(child) { return found } }
+            return nil
+        }
+        guard let bucket = row(stack) else { return false }
+        bucket.performClick(nil)
+        let expanded = clip.bounds.origin.y
+        guard abs(expanded - after) < 1, isOpen, let bucket = row(stack) else { return false }
+        bucket.performClick(nil)
+        let collapsed = clip.bounds.origin.y
+        print("CODEX_POPOVER_SCROLL before=\(before) refresh=\(after) expanded=\(expanded) collapsed=\(collapsed)")
+        return abs(collapsed - before) < 1 && isOpen
     }
 
     func toggle(anchoredTo button: NSStatusBarButton) {
@@ -2695,8 +2756,8 @@ final class UsagePanelController: NSObject {
         let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         solid.opacity = reduceTransparency ? 1 : 0.9
         effect.isHidden = reduceTransparency
-        installMonitors()
-        panel.makeKeyAndOrderFront(nil)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        if popover.isShown { installMonitors() }
         scrollView.contentView.scroll(to: .zero)
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
@@ -2705,24 +2766,21 @@ final class UsagePanelController: NSObject {
         let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
         let visible = screen.visibleFrame
         let desiredWidth = min(previewWidth ?? Self.maximumWidth, visible.width - 24)
-        var frame = panel.frame
-        frame.size.width = desiredWidth
-        panel.setFrame(frame, display: false)
         if desiredWidth != panelWidth {
             panelWidth = desiredWidth
             rebuildContent()
         }
-        panel.contentView?.layoutSubtreeIfNeeded()
+        contentController.view.frame.size.width = desiredWidth
+        contentController.view.layoutSubtreeIfNeeded()
         stack.layoutSubtreeIfNeeded()
         let chromeHeight = headerContainer.fittingSize.height + footerContainer.fittingSize.height
         let fittingHeight = max(chromeHeight + stack.fittingSize.height, 240)
         let maximumHeight = max(240, visible.height * 0.85)
-        let height = min(fittingHeight, maximumHeight)
-        let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
-        let x = max(visible.minX + 8, min(buttonRect.midX - panelWidth / 2, visible.maxX - panelWidth - 8))
-        let y = max(visible.minY + 8, buttonRect.minY - height - 4)
-        panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: height), display: false)
-        panel.contentView?.layoutSubtreeIfNeeded()
+        let desiredSize = NSSize(width: panelWidth, height: min(fittingHeight, maximumHeight))
+        contentController.preferredContentSize = desiredSize
+        popover.contentSize = desiredSize
+        contentController.view.layoutSubtreeIfNeeded()
+        scrollView.layoutSubtreeIfNeeded()
     }
 
     private func installMonitors() {
@@ -2742,7 +2800,7 @@ final class UsagePanelController: NSObject {
                 if event.keyCode == 53 { self.close(); return nil }
                 return event
             }
-            if event.window === self.panel || event.window === self.anchorButton?.window { return event }
+            if event.window === self.contentController.view.window || event.window === self.anchorButton?.window { return event }
             self.close()
             return event
         }
@@ -2754,11 +2812,14 @@ final class UsagePanelController: NSObject {
     }
 
     func close() {
-        guard panel.isVisible else { return }
-        panel.orderOut(nil)
+        popover.performClose(nil)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
         removeMonitors()
         anchorButton = nil
     }
+
 }
 
 private final class TokenDetailRow: NSView {
@@ -3057,7 +3118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ResetCard(expires: now + 29 * 86_400, name: "全额重置卡")
         ]
         if arguments.contains("--visual-preview-long") {
-            usage.resetCards = (0..<30).map {
+            usage.resetCards = (0..<100).map {
                 ResetCard(expires: now + TimeInterval($0 + 3) * 86_400, name: "全额重置卡 \($0 + 1)")
             }
         }
@@ -3153,6 +3214,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     print("CodexUsage visual preview image: \(path)")
                     exit(0)
                 }
+            } else if let argument = arguments.first(where: { $0.hasPrefix("--visual-preview-popover-test=") }) {
+                let directory = String(argument.dropFirst("--visual-preview-popover-test=".count))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    self.panelController.verifyPopoverGeometryForPreview(outputDirectory: directory)
+                }
             } else if arguments.contains("--visual-preview-events") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     self.runVisualPanelEventTest()
@@ -3177,7 +3243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusButton.performClick(nil)
         guard panelController.isOpen else { return fail("status button did not reopen panel") }
         if CommandLine.arguments.contains("--visual-preview-long")
-            && !panelController.scrollToEndForPreview() {
+            && !panelController.verifyNonzeroScrollForPreview() {
             return fail("long content did not scroll")
         }
         guard panelController.verifyTokenBucketInteractionsForPreview() else {
