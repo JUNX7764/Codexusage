@@ -2313,7 +2313,12 @@ final class ResetCardSectionView: PanelCardView {
         header.addArrangedSubview(PanelUI.symbol("calendar", size: 15, color: PanelAccent.codex.color))
         header.addArrangedSubview(PanelUI.label("重置卡", size: 13, weight: .semibold, wrapping: false))
         if let title = model.useTitle {
-            let button = NSButton(title: title, target: target, action: action)
+            let button = PanelActionButton(frame: .zero)
+            button.title = title
+            button.target = target
+            button.action = action
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 6
             button.isBordered = false
             button.focusRingType = .none
             button.image = NSImage(systemSymbolName: "ticket.fill", accessibilityDescription: nil)?
@@ -3755,8 +3760,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else if let cards = usage.resetCards,
                       cards.contains(where: { $0.usable && $0.expires > Date() }) {
                 resetSection?.useTitle = resetUseInFlight ? "使用中…" : "使用重置卡"
-                resetSection?.useEnabled = !visualPreview && !resetUseInFlight && !resetCardsStale
-                    && usage.resetCardsError == nil && (accountIdentity?.hasPrefix("account:") == true)
+                resetSection?.useEnabled = !resetUseInFlight && !resetCardsStale
+                    && usage.resetCardsError == nil && (visualPreview || accountIdentity?.hasPrefix("account:") == true)
             }
             if resetCardsStale {
                 resetSection?.notices.append(notice(
