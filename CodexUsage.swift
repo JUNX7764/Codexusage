@@ -1433,19 +1433,27 @@ enum StackImage {
         return result
     }
 
-    static func make(line1: Line, line2: Line) -> NSImage {
+    static func make(line1: Line, line2: Line, appearance: NSAppearance? = nil) -> NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
         let s1 = attributed(line1, font: font)
         let s2 = attributed(line2, font: font)
         let w = max(ceil(s1.size().width), ceil(s2.size().width)) + 2
-        // 不钉死绘制外观：全部使用动态颜色（labelColor / RemainingColorTier 动态包装），
-        // 由系统在每条菜单栏上绘制时按该栏外观解析——双屏两条栏底色不同也能各自正确
-        let img = NSImage(size: NSSize(width: w, height: 21), flipped: false) { _ in
+        let draw = {
             s1.draw(at: NSPoint(x: 1, y: 10.5))
             s2.draw(at: NSPoint(x: 1, y: 0.5))
+        }
+        let img = NSImage(size: NSSize(width: w, height: 21), flipped: false) { _ in
+            // 正常时不钉死绘制外观，由系统按每条菜单栏各自解析动态颜色，兼容双屏不同底色。
+            // 显式外观仅供离线像素测试使用，生产渲染始终跟随菜单栏自身外观。
+            if let appearance = appearance {
+                appearance.performAsCurrentDrawingAppearance(draw)
+            } else {
+                draw()
+            }
             return true
         }
-        img.isTemplate = false   // 保留百分比的柔彩色；动态色由系统按各屏菜单栏外观解析
+        img.isTemplate = false   // 保留百分比的柔彩色
+        img.cacheMode = .never   // 小图直接重绘，避免菜单栏外观变化后复用旧颜色位图
         return img
     }
 }
@@ -3036,13 +3044,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastAttemptAt = Date()
     private let launchAgentLabel = "com.local.codex-usage"
     // 深浅主题切换重画（GlmUsage 同款）：菜单栏是彩色非模板图，不随系统明暗自动变色。
-    // KVO 即时重画；但 NSStatusBarButton.effectiveAppearance 深→浅方向有数十秒粘滞（浅色栏
-    // 残留旧色文字，点击才恢复），5s 对账兜底：按钮主题与系统主题不一致时轻推 isVisible
-    // 强制重解析（30s 限流防闪烁）。KVO 负责即时响应，对账负责兜底粘滞。
+    // setImage 也会再次触发 KVO 通知，用明暗主题快照去重防止 renderBar↔KVO 反馈循环。
     private var statusItemAppearanceObs: NSKeyValueObservation?
     private var barThemeDark: Bool?
+    // 菜单栏可因深色壁纸、双屏或全屏而与 App 外观合法地不同，不能用 App 外观覆盖菜单栏。
+    // 每 5s 对账，不一致时仅重建不缓存的动态颜色图片，不切换 isVisible、不钉死绘制外观。
     private var appearancePollTimer: Timer?
-    private var lastBarNudge: Date?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
 
@@ -3490,26 +3497,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 按钮/系统主题对账：粘滞（按钮仍报旧主题）时轻推状态栏项强制重解析，再按需重画
+    private func isDark(_ appearance: NSAppearance) -> Bool {
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+
+    /// 外观不一致既可能是按钮粘滞，也可能是深色壁纸或双屏的正常状态。
+    /// 因此只重建不缓存的动态颜色图片，让实际菜单栏绘制上下文决定颜色。
     private func reconcileBarAppearance() {
-        guard let button = statusItem.button else { return }
-        let appDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let buttonDark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        if buttonDark != appDark,
-           lastBarNudge.map({ Date().timeIntervalSince($0) >= 30 }) ?? true {
-            lastBarNudge = Date()
-            statusItem.isVisible = false
-            statusItem.isVisible = true
-            // isVisible 切换可能重建按钮实例，重新挂 KVO
-            attachBarAppearanceObserver()
+        guard let button = statusItem?.button else { return }
+        let appDark = isDark(NSApp.effectiveAppearance)
+        let buttonDark = isDark(button.effectiveAppearance)
+        if buttonDark != appDark {
+            renderBar()
+        } else {
+            renderBarIfThemeChanged()
         }
-        renderBarIfThemeChanged()
     }
 
     /// 仅当按钮解析出的明暗主题与上次渲染快照不同时才重画（防止 setImage↔KVO 循环）
     private func renderBarIfThemeChanged() {
-        guard let button = statusItem.button else { return }
-        let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        guard let button = statusItem?.button else { return }
+        let dark = isDark(button.effectiveAppearance)
         guard dark != barThemeDark else { return }
         renderBar()
     }
@@ -3538,7 +3546,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     value: Fmt.remainingPct(usage.sevenDay?.usedPercent),
                                     remaining: sevenRemaining)
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
-        barThemeDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        barThemeDark = isDark(appearance)
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
@@ -3935,10 +3943,38 @@ enum CodexOfflineRegression {
                 try expect(green.map { $0.greenComponent > $0.redComponent
                                       && $0.greenComponent > $0.blueComponent } == true,
                            "green tier did not resolve to green for \(name.rawValue)")
-                let image = StackImage.make(line1: previewLine, line2: previewLine)
-                try expect(!image.isTemplate && image.size.width > 0 && image.tiffRepresentation != nil,
-                           "menu bar color image did not render for \(name.rawValue)")
+                let image = StackImage.make(line1: previewLine, line2: previewLine, appearance: appearance)
+                try expect(!image.isTemplate && image.cacheMode == .never
+                           && image.size.width > 0 && image.tiffRepresentation != nil,
+                           "menu bar uncached color image did not render for \(name.rawValue)")
             }
+
+            // 外观重绘必须真正改变文字颜色：浅色外观画深字，深色外观画浅字。
+            func neutralInkCount(_ image: NSImage, white: Bool) -> Int {
+                guard let data = image.tiffRepresentation,
+                      let bitmap = NSBitmapImageRep(data: data) else { return 0 }
+                var count = 0
+                for y in 0..<bitmap.pixelsHigh {
+                    for x in 0..<bitmap.pixelsWide {
+                        guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB),
+                              color.alphaComponent > 0.8 else { continue }
+                        let channels = [color.redComponent, color.greenComponent, color.blueComponent]
+                        let brightness = (channels[0] + channels[1] + channels[2]) / 3
+                        let grayscale = channels.allSatisfy { abs($0 - brightness) < 0.02 }
+                        if grayscale && (white ? brightness > 0.8 : brightness < 0.2) { count += 1 }
+                    }
+                }
+                return count
+            }
+            let neutralLine = StackImage.Line(label: "5H", value: "50%", remaining: 50)
+            let lightImage = StackImage.make(line1: neutralLine, line2: neutralLine,
+                                             appearance: NSAppearance(named: .aqua)!)
+            let darkImage = StackImage.make(line1: neutralLine, line2: neutralLine,
+                                            appearance: NSAppearance(named: .darkAqua)!)
+            try expect(neutralInkCount(lightImage, white: false) > 0,
+                       "light appearance override did not draw dark menu bar text")
+            try expect(neutralInkCount(darkImage, white: true) > 0,
+                       "dark appearance override did not draw light menu bar text")
 
             let missing = Fetcher.parseUsage([:], now: now, email: nil)
             try expect(missing.fiveHour == nil && missing.fiveHourError != nil, "missing 5H was not rejected")

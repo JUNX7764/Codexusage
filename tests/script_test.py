@@ -532,6 +532,14 @@ echo "build" >> "$MOCK_LOG"
         self.assertFalse(any(line.startswith("git tag") for line in self.log_lines()))
         self.assertFalse(any(line.startswith("git push") for line in self.log_lines()))
 
+    def test_menu_bar_appearance_never_hides_status_item(self):
+        source = (ROOT / "CodexUsage.swift").read_text()
+        self.assertNotIn("statusItem.isVisible = false", source)
+        self.assertNotIn("lastBarNudge", source)
+        self.assertIn("img.cacheMode = .never", source)
+        render_bar = source.split("private func renderBar() {", 1)[1].split("\n    }", 1)[0]
+        self.assertNotIn("appearance:", render_bar)
+
     def test_codesign_failure_blocks_build(self):
         project = self.base / "build-project"
         (project / "scripts").mkdir(parents=True)
