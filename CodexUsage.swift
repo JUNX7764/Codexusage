@@ -288,6 +288,8 @@ struct QuotaData {
 struct ResetCard {
     var expires: Date    // 过期时间（expires_at）
     var name: String     // 展示名：title 含 "Full reset" → "全额重置卡"，否则用原文
+    var id: String? = nil
+    var usable: Bool = false
 }
 
 /// AIHOT「Tibo 重置监控」的一条事件（GET aihot.news/api/v1/codex-resets/recent，匿名只读）。
@@ -604,9 +606,52 @@ enum Fetcher {
             let title = (c["title"] as? String) ?? ""
             let name = title.contains("Full reset") ? "全额重置卡"
                 : (title.isEmpty ? "额度重置卡" : title)
-            cards.append(ResetCard(expires: exp, name: name))
+            let id = (c["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let usable = status == "available" && (c["reset_type"] as? String) == "codex_rate_limits"
+                && (c["is_supported_by_plan"] as? Bool) != false && !(id ?? "").isEmpty
+            cards.append(ResetCard(expires: exp, name: name, id: id, usable: usable))
         }
         return (cards.sorted { $0.expires < $1.expires }, nil)
+    }
+
+    enum ResetUseResult: Equatable {
+        case success, nothingToReset, noCredit, unknown
+    }
+
+    static func resetUseRequest(auth: CodexAuth.Snapshot, cardID: String, key: String) -> URLRequest? {
+        guard !cardID.isEmpty, !key.isEmpty, let url = URL(string: resetCreditsURL + "/consume") else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(auth.tokens.accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("codex-1", forHTTPHeaderField: "OpenAI-Beta")
+        req.setValue("Codex Desktop", forHTTPHeaderField: "originator")
+        req.setValue("CodexUsage/1.0", forHTTPHeaderField: "User-Agent")
+        if let account = auth.tokens.accountID, !account.isEmpty { req.setValue(account, forHTTPHeaderField: "ChatGPT-Account-ID") }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["redeem_request_id": key, "credit_id": cardID])
+        return req.httpBody == nil ? nil : req
+    }
+
+    static func parseResetUseResponse(status: Int?, data: Data?) -> ResetUseResult {
+        guard status == 200, let data = data,
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let code = obj["code"] as? String else { return .unknown }
+        switch code {
+        case "reset", "already_redeemed": return .success
+        case "nothing_to_reset": return .nothingToReset
+        case "no_credit": return .noCredit
+        default: return .unknown
+        }
+    }
+
+    static func useResetCard(auth: CodexAuth.Snapshot, cardID: String, key: String,
+                             completion: @escaping (ResetUseResult) -> Void) {
+        guard let req = resetUseRequest(auth: auth, cardID: cardID, key: key) else { completion(.unknown); return }
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            guard error == nil else { completion(.unknown); return }
+            completion(parseResetUseResponse(status: (response as? HTTPURLResponse)?.statusCode, data: data))
+        }.resume()
     }
 
     /// Tibo 重置动态（AIHOT v1 公开接口，匿名只读、无需凭据）。每 5 分钟轮询一次并带上
@@ -1899,6 +1944,8 @@ struct UsagePanelModel {
         var emptyText: String?
         var rows: [ResetRow]
         var notices: [Notice]
+        var useTitle: String? = nil
+        var useEnabled: Bool = false
     }
     struct TiboRow {
         var text: String
@@ -2260,12 +2307,20 @@ final class QuotaWindowView: NSView {
 }
 
 final class ResetCardSectionView: PanelCardView {
-    init(model: UsagePanelModel.ResetSection) {
+    init(model: UsagePanelModel.ResetSection, target: AnyObject, action: Selector) {
         super.init(padding: 8)
         let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
         header.addArrangedSubview(PanelUI.symbol("calendar", size: 15, color: PanelAccent.codex.color))
         header.addArrangedSubview(PanelUI.label("重置卡", size: 13, weight: .semibold, wrapping: false))
         header.addArrangedSubview(PanelUI.spacer())
+        if let title = model.useTitle {
+            let button = NSButton(title: title, target: target, action: action)
+            button.bezelStyle = .rounded
+            button.font = NSFont.systemFont(ofSize: 11)
+            button.isEnabled = model.useEnabled
+            button.setAccessibilityLabel(title)
+            header.addArrangedSubview(button)
+        }
         if let count = model.count {
             header.addArrangedSubview(PanelUI.label("×\(count)", size: 12, weight: .semibold,
                 color: PanelAccent.codex.color, wrapping: false, monospacedDigits: true))
@@ -2298,6 +2353,7 @@ final class ResetCardSectionView: PanelCardView {
 
 final class UsagePanelController: NSObject, NSPopoverDelegate {
     var onCheckUpdate: (() -> Void)?
+    var onUseReset: (() -> Void)?
     private var codexExpanded = true
     private var externalExpanded = true
     private var expandedCodexBuckets: Set<Int> = []
@@ -2468,7 +2524,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         addContentRow(quotaHeading)
         for quota in model.quotas { addContentRow(QuotaWindowView(model: quota, compact: panelWidth < 400)) }
         if let reset = model.resetCards {
-            addContentRow(ResetCardSectionView(model: reset))
+            addContentRow(ResetCardSectionView(model: reset, target: self, action: #selector(requestUseReset)))
         }
         if let tibo = model.tibo {
             addContentRow(makeTiboSection(tibo))
@@ -2517,6 +2573,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return result
     }
     @objc fileprivate func requestUpdateCheck() { onCheckUpdate?() }
+    @objc fileprivate func requestUseReset() { onUseReset?() }
     func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
         updateMessageDismissal?.cancel()
         updateMessageDismissal = nil
@@ -3039,6 +3096,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var resetCardsLastOK: Date?
     private var tiboLastOK: Date?
     private var extLastOK: Date?
+    private var resetUseInFlight = false
+    private let pendingResetKey = "pendingResetRedemptionV1"
     private var accountIdentity: String?
     private var accountGeneration = 0
     private var lastAttemptAt = Date()
@@ -3063,6 +3122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
+        panelController.onUseReset = { [weak self] in self?.beginUseReset() }
         if visualPreview {
             configureVisualPreview()
             return
@@ -3120,7 +3180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.planType = "plus"
         usage.email = "preview@example.com"
         usage.resetCards = [
-            ResetCard(expires: now + 172_800, name: "全额重置卡"),
+            ResetCard(expires: now + 172_800, name: "全额重置卡", id: "preview-1", usable: true),
             ResetCard(expires: now + 28 * 86_400, name: "全额重置卡"),
             ResetCard(expires: now + 29 * 86_400, name: "全额重置卡")
         ]
@@ -3676,7 +3736,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     notices: [notice("重置卡获取失败：\(short)（Codex 登录态可能过期，运行 codex login 后重试）", .error)])
             }
         }
+        if resetSection == nil && UserDefaults.standard.dictionary(forKey: pendingResetKey) != nil {
+            resetSection = UsagePanelModel.ResetSection(count: nil, emptyText: nil, rows: [], notices: [])
+        }
         if resetSection != nil {
+            let pending = UserDefaults.standard.dictionary(forKey: pendingResetKey)
+            if pending != nil {
+                resetSection?.useTitle = "核对上次使用"
+                resetSection?.useEnabled = !visualPreview && !resetUseInFlight
+                    && pending?["identity"] as? String == accountIdentity
+                resetSection?.notices.append(notice("上次结果未知，重试可能消耗一张卡。", .warning))
+            } else if let cards = usage.resetCards,
+                      cards.contains(where: { $0.usable && $0.expires > Date() }) {
+                resetSection?.useTitle = resetUseInFlight ? "使用中…" : "使用重置卡"
+                resetSection?.useEnabled = !visualPreview && !resetUseInFlight && !resetCardsStale
+                    && usage.resetCardsError == nil && (accountIdentity?.hasPrefix("account:") == true)
+            }
             if resetCardsStale {
                 resetSection?.notices.append(notice(
                     "⚠️ 重置卡数据已过期 · 最后成功 \(resetCardsLastOK.map { Fmt.dayTime($0) } ?? "--")", .warning))
@@ -3807,6 +3882,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             loginItem: loginItem,
             quitItem: quitItem)
         panelController.update(model: model)
+    }
+
+    private func beginUseReset() {
+        guard !visualPreview, !resetUseInFlight else { return }
+        synchronizeAccount()
+        guard let auth = CodexAuth.load(), let identity = CodexAuth.identity(auth),
+              identity == accountIdentity, identity.hasPrefix("account:") else {
+            panelController.setUpdateMessage("无法确认当前账户，请重新登录后再试", dismissAfter: 5); return
+        }
+        let defaults = UserDefaults.standard
+        let pending = defaults.dictionary(forKey: pendingResetKey)
+        let cardID: String
+        let key: String
+        let detail: String
+        if let pending = pending {
+            guard pending["identity"] as? String == identity,
+                  let oldID = pending["cardID"] as? String, !oldID.isEmpty,
+                  let oldKey = pending["key"] as? String, !oldKey.isEmpty else {
+                panelController.setUpdateMessage("另一账户有待确认的用卡请求，请切回原账户核对", dismissAfter: 7); return
+            }
+            cardID = oldID; key = oldKey
+            detail = "上次使用结果未知。将使用原请求重试；如果上次未成功，此次可能消耗一张卡。"
+        } else {
+            guard !resetCardsStale, usage.resetCardsError == nil,
+                  let cards = usage.resetCards else { return }
+            let eligible = cards.filter { $0.usable && $0.expires > Date() }
+            guard let card = eligible.min(by: { $0.expires < $1.expires }), let id = card.id else { return }
+            cardID = id; key = UUID().uuidString
+            detail = "剩余 \(eligible.count) 张，优先使用 \(Fmt.expires(card.expires)) 到期的卡。\n使用后立即重置对应额度，操作不可撤销。"
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = pending == nil ? "使用一张重置卡？" : "核对上次用卡结果？"
+        alert.informativeText = detail
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: pending == nil ? "使用" : "核对")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        // Confirmation may have been open while the user switched accounts.
+        guard CodexAuth.identity(CodexAuth.load()) == identity else {
+            synchronizeAccount(); updateUI(); return
+        }
+        if pending == nil {
+            defaults.set(["identity": identity, "cardID": cardID, "key": key], forKey: pendingResetKey)
+            guard defaults.synchronize() else {
+                panelController.setUpdateMessage("无法保存请求状态，未使用重置卡", dismissAfter: 7); return
+            }
+        }
+        resetUseInFlight = true
+        rebuildMenu()
+        Fetcher.useResetCard(auth: auth, cardID: cardID, key: key) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.resetUseInFlight = false
+                if result != .unknown { defaults.removeObject(forKey: self.pendingResetKey); defaults.synchronize() }
+                let message: String
+                switch result {
+                case .success: message = "重置卡已使用，正在刷新额度"
+                case .nothingToReset: message = "当前没有可重置的额度窗口"
+                case .noCredit: message = "该重置卡已不可用，请核对卡数"
+                case .unknown: message = "使用结果未知，请核对上次使用；不要重复发起新请求"
+                }
+                self.synchronizeAccount()
+                if self.accountIdentity == identity {
+                    self.accountGeneration += 1 // Discard card/quota reads started before redemption finished.
+                    self.usage.resetCards = nil
+                    self.resetCardsLastOK = nil
+                    self.panelController.setUpdateMessage(message, dismissAfter: result == .unknown ? 15 : 6)
+                }
+                self.updateUI()
+                self.refresh(tokens: true, manual: true)
+                if result == .success {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                        self?.refresh(tokens: true, manual: true)
+                    }
+                }
+            }
+        }
     }
 
     @objc private func onRefresh() { refresh(tokens: true, manual: true) }
@@ -4035,7 +4188,7 @@ enum CodexOfflineRegression {
                        "60s/300s/manual refresh schedule is incorrect")
 
             let cardPayload: [String: Any] = ["credits": [
-                ["status": "available", "expires_at": now.addingTimeInterval(3_600).timeIntervalSince1970,
+                ["id": "fixture-card", "reset_type": "codex_rate_limits", "status": "available", "expires_at": now.addingTimeInterval(3_600).timeIntervalSince1970,
                  "title": "Full reset (Weekly + 5 hr)"],
                 ["status": "available", "expires_at": now.addingTimeInterval(-1).timeIntervalSince1970,
                  "title": "expired by time"],
@@ -4047,6 +4200,26 @@ enum CodexOfflineRegression {
                 throw Failure(description: "valid card list failed: \(cardsResult.error ?? "unknown")")
             }
             try expect(cards.count == 1 && cards[0].name == "全额重置卡", "expired/used reset cards counted as available")
+            try expect(cards[0].usable && cards[0].id == "fixture-card", "eligible card lost its ID")
+            let fixtureAuth = CodexAuth.Snapshot(tokens: CodexAuth.Tokens(accessToken: "fixture-token", refreshToken: nil, idToken: nil, email: nil, accountID: "fixture-account"))
+            guard let request = Fetcher.resetUseRequest(auth: fixtureAuth, cardID: "fixture-card", key: "fixture-key"),
+                  let body = request.httpBody,
+                  let payload = try JSONSerialization.jsonObject(with: body) as? [String: String] else {
+                throw Failure(description: "reset request construction failed")
+            }
+            try expect(request.httpMethod == "POST" && request.url?.absoluteString.hasSuffix("/wham/rate-limit-reset-credits/consume") == true
+                       && payload["credit_id"] == "fixture-card" && payload["redeem_request_id"] == "fixture-key"
+                       && request.value(forHTTPHeaderField: "ChatGPT-Account-ID") == "fixture-account", "reset request contract changed")
+            func resetResponse(_ code: String) -> Data { Data("{\"code\":\"\(code)\"}".utf8) }
+            try expect(Fetcher.parseResetUseResponse(status: 200, data: resetResponse("reset")) == .success
+                       && Fetcher.parseResetUseResponse(status: 200, data: resetResponse("already_redeemed")) == .success
+                       && Fetcher.parseResetUseResponse(status: 200, data: resetResponse("nothing_to_reset")) == .nothingToReset
+                       && Fetcher.parseResetUseResponse(status: 200, data: resetResponse("no_credit")) == .noCredit
+                       && Fetcher.parseResetUseResponse(status: 500, data: resetResponse("reset")) == .unknown
+                       && Fetcher.parseResetUseResponse(status: 200, data: resetResponse("future")) == .unknown
+                       && Fetcher.parseResetUseResponse(status: nil, data: nil) == .unknown, "reset response safety classification changed")
+            let unknownCard = Fetcher.parseResetCards(["credits": [["id": "future", "status": "available", "reset_type": "other", "expires_at": now.addingTimeInterval(3600).timeIntervalSince1970]]], now: now)
+            try expect(unknownCard.cards?.first?.usable == false, "unknown card type became usable")
             try expect(CodexFreshness.availableCards(cards + [
                 ResetCard(expires: now.addingTimeInterval(-1), name: "stale cache")
             ], now: now).count == 1, "expired cached card counted as usable")
