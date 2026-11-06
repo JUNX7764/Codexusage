@@ -9,7 +9,7 @@
 
 **本地统计会话用量，不上传会话记录。**
 
-<img src="docs/images/codex-usage.png" width="330" alt="CodexUsage 面板：剩余额度、重置卡和用量统计" />
+<img src="docs/images/codex-usage-v1.0.17.png" width="330" alt="CodexUsage 面板：剩余额度、重置卡和用量统计" />
 
 *截图使用演示数据。*
 
