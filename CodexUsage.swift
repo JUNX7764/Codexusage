@@ -2216,6 +2216,29 @@ private enum PanelUI {
     }
 }
 
+private final class PanelSectionDividerView: NSView {
+    static let thickness: CGFloat = 0.5
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        alphaValue = 0.55
+        heightAnchor.constraint(equalToConstant: Self.thickness).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.separatorColor.cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
 final class PanelSolidBackgroundView: NSView {
     var opacity: CGFloat = 0.9 { didSet { needsDisplay = true } }
     override var wantsUpdateLayer: Bool { true }
@@ -2731,6 +2754,16 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         view.widthAnchor.constraint(equalToConstant: panelWidth - 32).isActive = true
     }
 
+    private func addSectionDivider() {
+        guard let previous = stack.arrangedSubviews.last else { return }
+        let line = PanelSectionDividerView(frame: .zero)
+        // 细线与两侧留白合计仍为原有的 8pt，不因区隔增加窗口高度。
+        let halfGap = (stack.spacing - PanelSectionDividerView.thickness) / 2
+        stack.setCustomSpacing(halfGap, after: previous)
+        addContentRow(line)
+        stack.setCustomSpacing(halfGap, after: line)
+    }
+
     private func rebuildContent() {
         guard let model = model else { return }
         installChrome(model: model)
@@ -2759,7 +2792,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         addContentRow(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
             expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
             bucketAction: #selector(toggleCodexBucket(_:))))
+        addSectionDivider()
         addContentRow(makeDailySection(model))
+        addSectionDivider()
         addContentRow(makeToolSection(model))
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
@@ -2989,6 +3024,30 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         refreshPanelLayout()
     }
 
+    /// 板块细线必须居中放在原有间距中，不能增加展开或折叠面板的高度。
+    func verifySectionDividersForPreview() -> Bool {
+        stack.layoutSubtreeIfNeeded()
+        let rows = stack.arrangedSubviews
+        let indices = rows.indices.filter { rows[$0] is PanelSectionDividerView }
+        guard indices.count == 2, indices[0] > 0, indices[1] + 1 < rows.count,
+              rows[indices[0] - 1] is TokenSectionView, indices[1] == indices[0] + 2 else { return false }
+        return indices.allSatisfy { index in
+            let line = rows[index], previous = rows[index - 1], next = rows[index + 1]
+            let before = abs(line.frame.midY - previous.frame.midY) - (line.frame.height + previous.frame.height) / 2
+            let after = abs(next.frame.midY - line.frame.midY) - (next.frame.height + line.frame.height) / 2
+            let valid = abs(line.frame.height - 0.5) < 0.01
+                && abs(line.alphaValue - 0.55) < 0.01
+                && abs(line.frame.width - (panelWidth - 32)) < 0.01
+                && abs(line.frame.minX - previous.frame.minX) < 0.01
+                && abs(before - after) < 0.51
+                && abs(before + line.frame.height + after - stack.spacing) < 0.51
+            if !valid {
+                print("CODEX_SECTION_DIVIDER index=\(index) height=\(line.frame.height) alpha=\(line.alphaValue) width=\(line.frame.width) x=\(line.frame.minX) previousX=\(previous.frame.minX) before=\(before) after=\(after)")
+            }
+            return valid
+        }
+    }
+
     /// 面板事件回归：核对模型行、工具周期和简析开合状态。
     func verifyTokenBucketInteractionsForPreview() -> Bool {
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
@@ -3026,7 +3085,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         dailyButtons()[0].performClick(nil)
         guard !dailyExpanded, descendants(stack).compactMap({ $0 as? DailyUsageChart }).isEmpty else { return false }
         update(model: model)
-        guard !dailyExpanded, toolPeriod == 1, externalExpanded, expandedCodexBuckets == [0, 2], dailyButtons().count == 2 else { return false }
+        guard !dailyExpanded, toolPeriod == 1, externalExpanded, expandedCodexBuckets == [0, 2],
+              dailyButtons().count == 2, verifySectionDividersForPreview() else { return false }
         guard window.makeFirstResponder(dailyButtons()[1]) else { return false }
         window.sendEvent(space)
         return dailyExpanded && descendants(stack).compactMap({ $0 as? DailyUsageChart }).count == 1
@@ -3034,7 +3094,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     func prepareReopenStateForPreview() { if dailyExpanded { toggleDaily() } }
     func verifyReopenStateForPreview() -> Bool {
-        let intact = !dailyExpanded && externalExpanded && toolPeriod == 1 && expandedCodexBuckets == [0, 2]
+        let intact = !dailyExpanded && externalExpanded && toolPeriod == 1
+            && expandedCodexBuckets == [0, 2] && verifySectionDividersForPreview()
         if !dailyExpanded { toggleDaily() }
         return intact
     }
@@ -3680,6 +3741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panelController.toggle(anchoredTo: button)
         }
         guard panelController.isOpen else { return fail("preview panel did not open") }
+        guard panelController.verifySectionDividersForPreview() else { return fail("section divider layout or spacing failed") }
         guard let statusButton = statusItem.button else { return fail("status button missing") }
         statusButton.performClick(nil)
         guard !panelController.isOpen else { return fail("status button did not close panel") }
@@ -3692,6 +3754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard panelController.verifyTokenBucketInteractionsForPreview() else {
             return fail("token bucket expansion, collapse, or refresh state failed")
         }
+        guard panelController.verifySectionDividersForPreview() else { return fail("section dividers changed after interactions") }
         guard panelController.verifyChartInteractionsForPreview() else { return fail("chart hover or keyboard navigation failed") }
         panelController.prepareReopenStateForPreview()
         guard let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
@@ -3724,7 +3787,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.postEvent(refresh, atStart: false)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     guard self.panelController.isOpen else { return fail("refresh action closed the panel") }
-                    print("CodexUsage visual event test: PASS (status button toggle, model rows, tool periods, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
+                    print("CodexUsage visual event test: PASS (section dividers, status button toggle, model rows, tool periods, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
                     exit(0)
                 }
             }
