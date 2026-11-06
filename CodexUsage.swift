@@ -2506,6 +2506,46 @@ private final class PanelDisclosureButton: NSButton {
     }
 }
 
+private enum PanelSectionHeading {
+    static func make(title: String, symbol: String, color: NSColor, expanded: Bool,
+                     target: AnyObject, action: Selector, accessory: NSView? = nil,
+                     toolTip: String? = nil) -> NSStackView {
+        let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+        row.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        let iconBox = NSView()
+        iconBox.translatesAutoresizingMaskIntoConstraints = false
+        let icon = PanelUI.symbol(symbol, size: 14, color: color)
+        iconBox.addSubview(icon)
+        NSLayoutConstraint.activate([
+            iconBox.widthAnchor.constraint(equalToConstant: 20),
+            iconBox.heightAnchor.constraint(equalToConstant: 20),
+            icon.centerXAnchor.constraint(equalTo: iconBox.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: iconBox.centerYAnchor)
+        ])
+        row.addArrangedSubview(iconBox)
+        let label = PanelDisclosureButton(title: title, target: target, action: action)
+        label.isBordered = false
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.contentTintColor = .labelColor
+        label.toolTip = toolTip
+        let accessibility = "\(expanded ? "收起" : "展开")\(title)"
+        label.setAccessibilityLabel(accessibility)
+        row.addArrangedSubview(label)
+        row.addArrangedSubview(PanelUI.spacer())
+        if let accessory = accessory { row.addArrangedSubview(accessory) }
+        let baseImage = NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil)!
+        let image = baseImage.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)) ?? baseImage
+        let toggle = PanelDisclosureButton(image: image, target: target, action: action)
+        toggle.isBordered = false
+        toggle.contentTintColor = .secondaryLabelColor
+        toggle.setAccessibilityLabel(accessibility)
+        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        toggle.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        row.addArrangedSubview(toggle)
+        return row
+    }
+}
+
 private final class ToolPeriodButton: NSButton {
     private let selectedPeriod: Bool
     override var acceptsFirstResponder: Bool { true }
@@ -2727,19 +2767,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private func makeDailySection(_ model: UsagePanelModel) -> NSView {
         let root = PanelUI.stack(spacing: 4)
-        let heading = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
-        heading.addArrangedSubview(PanelUI.symbol("chart.bar.fill", size: 14, color: PanelAccent.codex.color))
-        let title = PanelDisclosureButton(title: "用量简析", target: self, action: #selector(toggleDaily))
-        title.isBordered = false; title.font = .systemFont(ofSize: 12, weight: .semibold); title.contentTintColor = .labelColor
-        title.setAccessibilityLabel(dailyExpanded ? "收起用量简析" : "展开用量简析")
-        title.toolTip = "官方账号累计和每日 Token；覆盖范围与源时区尚未确认"
-        heading.addArrangedSubview(title); heading.addArrangedSubview(PanelUI.spacer())
-        let toggle = PanelDisclosureButton(image: NSImage(systemSymbolName: dailyExpanded ? "chevron.up" : "chevron.down", accessibilityDescription: "用量简析")!, target: self, action: #selector(toggleDaily))
-        toggle.isBordered = false; toggle.contentTintColor = .secondaryLabelColor
-        toggle.setAccessibilityLabel(dailyExpanded ? "收起用量简析" : "展开用量简析")
-        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        toggle.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        heading.addArrangedSubview(toggle)
+        let heading = PanelSectionHeading.make(title: "用量简析", symbol: "chart.bar.fill",
+            color: PanelAccent.codex.color, expanded: dailyExpanded, target: self,
+            action: #selector(toggleDaily), toolTip: "官方账号累计和每日 Token；覆盖范围与源时区尚未确认")
         PanelUI.addFullWidth(heading, to: root)
         guard dailyExpanded else { return root }
         let total = PanelUI.label(Fmt.tokensAbbr(model.official?.lifetime), size: 19, weight: .semibold, monospacedDigits: true)
@@ -2780,25 +2810,16 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private func makeToolSection(_ model: UsagePanelModel) -> NSView {
         let root = PanelUI.stack(spacing: 5)
-        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
-        header.addArrangedSubview(PanelUI.symbol("list.bullet", size: 14, color: PanelAccent.codex.color))
-        let title = PanelDisclosureButton(title: "工具明细", target: self, action: #selector(toggleExternal))
-        title.isBordered = false; title.font = .systemFont(ofSize: 12, weight: .semibold); title.contentTintColor = .labelColor
-        title.setAccessibilityLabel(externalExpanded ? "收起工具明细" : "展开工具明细")
-        header.addArrangedSubview(title)
-        header.addArrangedSubview(PanelUI.spacer())
-        if externalExpanded {
+        let periods: NSStackView? = externalExpanded ? PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 4) : nil
+        if let periods = periods {
             for (index, label) in ["今天", "7天", "30天"].enumerated() {
-                header.addArrangedSubview(ToolPeriodButton(title: label, index: index, selected: index == toolPeriod,
-                                                          target: self, action: #selector(selectToolPeriod(_:))))
+                periods.addArrangedSubview(ToolPeriodButton(title: label, index: index, selected: index == toolPeriod,
+                                                           target: self, action: #selector(selectToolPeriod(_:))))
             }
         }
-        let toggle = PanelDisclosureButton(image: NSImage(systemSymbolName: externalExpanded ? "chevron.up" : "chevron.down", accessibilityDescription: "工具明细")!, target: self, action: #selector(toggleExternal))
-        toggle.isBordered = false; toggle.contentTintColor = .secondaryLabelColor
-        toggle.setAccessibilityLabel(externalExpanded ? "收起工具明细" : "展开工具明细")
-        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        toggle.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        header.addArrangedSubview(toggle)
+        let header = PanelSectionHeading.make(title: "工具明细", symbol: "list.bullet",
+            color: PanelAccent.codex.color, expanded: externalExpanded, target: self,
+            action: #selector(toggleExternal), accessory: periods)
         PanelUI.addFullWidth(header, to: root)
         guard externalExpanded else { return root }
         let items = model.tools[toolPeriod]
@@ -3327,18 +3348,8 @@ private final class TokenSectionView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 3)
-        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
-        header.addArrangedSubview(PanelUI.symbol(model.accent.symbol, size: 14, color: model.accent.color))
-        header.addArrangedSubview(PanelUI.label(model.title, size: 12, weight: .semibold, wrapping: false))
-        header.addArrangedSubview(PanelUI.spacer())
-        let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: expanded ? "折叠用量" : "展开用量")!, target: target, action: action)
-        toggle.isBordered = false
-        toggle.contentTintColor = .secondaryLabelColor
-        toggle.toolTip = expanded ? "折叠" : "展开"
-        toggle.setAccessibilityLabel(expanded ? "折叠\(model.title)" : "展开\(model.title)")
-        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        header.addArrangedSubview(toggle)
+        let header = PanelSectionHeading.make(title: model.title, symbol: model.accent.symbol,
+            color: model.accent.color, expanded: expanded, target: target, action: action)
         PanelUI.addFullWidth(header, to: root)
         if expanded {
             let tableHeader = TokenDetailRow(values: ["周期", "总量", "输入", "输出"], header: true, accent: model.accent)
