@@ -8,6 +8,11 @@ final class DailyUsageChart: NSView {
     private let days: [(String, OfficialUsageSnapshot.Day)]
     var selectedIndexForPreview: Int? { selection }
     var selectedTextForPreview: String { hover.stringValue }
+    var hoverWithinBoundsForPreview: Bool {
+        !hover.isHidden && hover.frame.minX >= bounds.minX && hover.frame.maxX <= bounds.maxX
+            && hover.frame.minY >= bounds.minY && hover.frame.maxY <= bounds.maxY
+            && hover.hitTest(.zero) == nil
+    }
     private var selection: Int? { didSet { needsDisplay = true; updateAccessibility() } }
     private let hover = ChartHoverLabel(labelWithString: "")
     private let orange = NSColor(srgbRed: 0.72, green: 0.39, blue: 0.22, alpha: 1)
@@ -30,10 +35,11 @@ final class DailyUsageChart: NSView {
         days = entries
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        heightAnchor.constraint(equalToConstant: 83).isActive = true
+        heightAnchor.constraint(equalToConstant: 61).isActive = true
         hover.font = .systemFont(ofSize: 10, weight: .medium)
         hover.backgroundColor = .controlBackgroundColor
         hover.drawsBackground = true
+        hover.cell?.lineBreakMode = .byTruncatingTail
         hover.isHidden = true
         addSubview(hover)
         setAccessibilityElement(true)
@@ -77,14 +83,17 @@ final class DailyUsageChart: NSView {
         let text = "\(day.0) · \(value)"
         hover.stringValue = text
         hover.sizeToFit()
-        hover.frame.origin = NSPoint(x: min(max(0, CGFloat(index) * bounds.width / CGFloat(days.count)), max(0, bounds.width - hover.frame.width)), y: 0)
+        hover.frame.size.width = min(hover.frame.width, bounds.width)
+        // Keep the overlay on the opposite side where possible; it does not affect layout or hit testing.
+        let selectedX = (CGFloat(index) + 0.5) * bounds.width / CGFloat(days.count)
+        hover.frame.origin = NSPoint(x: selectedX < bounds.midX ? bounds.width - hover.frame.width : 0, y: 0)
         hover.isHidden = false
         setAccessibilityValue(text)
     }
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard !days.isEmpty else {
-            ("暂无每日数据" as NSString).draw(at: NSPoint(x: 4, y: 36), withAttributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+            ("暂无每日数据" as NSString).draw(at: NSPoint(x: 4, y: 17), withAttributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
             return
         }
         let maxValue = max(1, days.compactMap { item -> Double? in
@@ -93,22 +102,22 @@ final class DailyUsageChart: NSView {
         let width = bounds.width / CGFloat(days.count)
         for (index, day) in days.enumerated() {
             let x = CGFloat(index) * width
-            if index == selection { NSColor.labelColor.withAlphaComponent(0.07).setFill(); NSRect(x: x, y: 17, width: width, height: 53).fill() }
+            if index == selection { NSColor.labelColor.withAlphaComponent(0.07).setFill(); NSRect(x: x, y: 0, width: width, height: 46).fill() }
             let dayValue: Double?
             switch day.1 { case .reported(let value): dayValue = value; case .inferredZero: dayValue = 0; case .missing: dayValue = nil }
             if let value = dayValue {
                 orange.setFill()
-                let height = CGFloat(value / maxValue) * 46
-                NSBezierPath(roundedRect: NSRect(x: x + 1, y: 68 - height, width: max(1, width - 2), height: max(value == 0 ? 1 : 2, height)), xRadius: 1, yRadius: 1).fill()
+                let height = max(value == 0 ? 1 : 2, CGFloat(value / maxValue) * 46)
+                NSBezierPath(roundedRect: NSRect(x: x + 1, y: 46 - height, width: max(1, width - 2), height: height), xRadius: 1, yRadius: 1).fill()
             } else {
-                NSColor.tertiaryLabelColor.setFill(); NSRect(x: x + 2, y: 67, width: max(1, width - 4), height: 1).fill()
+                NSColor.tertiaryLabelColor.setFill(); NSRect(x: x + 2, y: 45, width: max(1, width - 4), height: 1).fill()
             }
         }
         let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor]
         for index in [0, 15, 29] where index < days.count {
             let text = String(days[index].0.suffix(5)) as NSString
             let x = min(max(0, CGFloat(index) * width - text.size(withAttributes: attributes).width / 2), bounds.width - text.size(withAttributes: attributes).width)
-            text.draw(at: NSPoint(x: x, y: 71), withAttributes: attributes)
+            text.draw(at: NSPoint(x: x, y: 49), withAttributes: attributes)
         }
     }
 }

@@ -2269,6 +2269,27 @@ final class PanelActionButton: NSButton {
     override func mouseExited(with event: NSEvent) { hovered = false }
 }
 
+private enum PanelSurface {
+    static var fill: NSColor { NSColor.labelColor.withAlphaComponent(0.035) }
+}
+
+private final class PanelComparisonStack: NSStackView {
+    override var wantsUpdateLayer: Bool { true }
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        orientation = .horizontal; alignment = .centerY; spacing = 4
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true; layer?.cornerRadius = 6
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance { layer?.backgroundColor = PanelSurface.fill.cgColor }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance(); needsDisplay = true
+    }
+}
+
 class PanelCardView: NSView {
     let contentStack = PanelUI.stack(spacing: 4)
 
@@ -2292,7 +2313,7 @@ class PanelCardView: NSView {
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
+            layer?.backgroundColor = PanelSurface.fill.cgColor
             layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.09).cgColor
         }
     }
@@ -2729,11 +2750,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         totalRow.addArrangedSubview(PanelUI.spacer())
         PanelUI.addFullWidth(totalRow, to: root)
         PanelUI.addFullWidth(DailyUsageChart(snapshot: model.official), to: root)
-        let end = model.official?.days.keys.sorted().last.map { String($0.suffix(5)) } ?? "--"
-        PanelUI.addFullWidth(PanelUI.label("近 30 天 · 截至 \(end)", size: 10, color: .secondaryLabelColor), to: root)
-        let comparison = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
-        comparison.wantsLayer = true; comparison.layer?.cornerRadius = 6
-        comparison.layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.09).cgColor
+        let comparison = PanelComparisonStack()
         let compared = UsageComparison.evaluate(snapshot: model.official, now: Date())
         func comparisonColor(_ value: UsageComparison.Value) -> NSColor {
             if case .percent(let amount) = value { return amount < 0 ? .systemGreen : PanelAccent.codex.color }
@@ -3012,7 +3029,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             guard let event = NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [], timestamp: 0,
                     windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 0, pressure: 0) else { return false }
             chart.mouseMoved(with: event)
-            return chart.selectedIndexForPreview == index
+            return chart.selectedIndexForPreview == index && chart.hoverWithinBoundsForPreview
         }
         guard move(0), chart.selectedTextForPreview.contains("暂无数据"),
               move(1), chart.selectedTextForPreview.contains("0 Token"),
@@ -3023,6 +3040,19 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                 characters: "\u{F702}", charactersIgnoringModifiers: "\u{F702}", isARepeat: false, keyCode: 123) else { return false }
         window.sendEvent(key)
         return chart.selectedIndexForPreview == 28
+    }
+
+    /// 固定假数据截图：显示指定日列的浮层并检查其不越界。
+    func showChartHoverForPreview(index: Int) -> Bool {
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+        guard (0..<30).contains(index), let chart = descendants(stack).compactMap({ $0 as? DailyUsageChart }).first,
+              let window = chart.window else { return false }
+        chart.scrollToVisible(chart.bounds)
+        let point = chart.convert(NSPoint(x: chart.bounds.width * (CGFloat(index) + 0.5) / 30, y: 23), to: nil)
+        guard let event = NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [], timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 0, pressure: 0) else { return false }
+        chart.mouseMoved(with: event)
+        return chart.selectedIndexForPreview == index && chart.hoverWithinBoundsForPreview
     }
 
     /// 截取完整系统窗口，包含 Popover 箭头与阴影。
@@ -3602,6 +3632,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                     if arguments.contains("--visual-preview-scroll-end") {
                         _ = self.panelController.scrollToEndForPreview()
+                    }
+                    let hoverPrefix = "--visual-preview-hover-index="
+                    if let arg = arguments.first(where: { $0.hasPrefix(hoverPrefix) }) {
+                        guard let index = Int(arg.dropFirst(hoverPrefix.count)), self.panelController.showChartHoverForPreview(index: index) else {
+                            fputs("CodexUsage visual preview: invalid or out-of-bounds chart overlay\n", stderr); exit(1)
+                        }
                     }
                     guard self.panelController.savePreviewImage(to: path) else {
                         fputs("CodexUsage visual preview: failed to save image\n", stderr)
@@ -4504,7 +4540,9 @@ enum CodexOfflineRegression {
             let comparisons = UsageComparison.evaluate(snapshot: complete, now: compareNow)
             try expect(comparisons.0.value.text == "+18%" && comparisons.1.value.text == "−6%", "complete comparison mismatch")
             try expect(comparisons.0.description.contains("2026-11-05 对比 2026-11-04") && comparisons.0.description.contains("官方账号用量"), "daily range or source incorrect")
-            try expect(comparisons.1.description.contains("2026-10-30 至 2026-11-05") && comparisons.1.description.contains("2026-10-23 至 2026-10-29"), "weekly range incorrect")
+            try expect(comparisons.1.description.contains("2026-10-30 至 2026-11-05") && comparisons.1.description.contains("2026-10-23 至 2026-10-29")
+                       && comparisons.1.description.contains("两组7日总量比较")
+                       && comparisons.1.description.contains("（最近7日总量−前7日总量）÷前7日总量×100%"), "weekly range or formula incorrect")
             let yearBoundary = OfficialUsageSnapshot(lifetime: nil, days: ["2026-01-02": 1], fetchedAt: compareNow)
             let boundary = UsageComparison.evaluate(snapshot: yearBoundary, now: compareNow)
             try expect(boundary.0.description.contains("2026-01-02 对比 2026-01-01") && boundary.1.description.contains("2025-12-20 至 2025-12-26"), "cross-year dates incorrect")
@@ -4568,6 +4606,14 @@ enum CodexOfflineRegression {
                        "out-of-range or fractional card count was accepted")
             try expect(CodexNumber.nonnegativeInteger(0) == 0,
                        "valid zero card count was rejected")
+
+            for appearanceName in [NSAppearance.Name.aqua, .darkAqua] {
+                let card = PanelCardView(); let strip = PanelComparisonStack()
+                card.appearance = NSAppearance(named: appearanceName); strip.appearance = NSAppearance(named: appearanceName)
+                card.updateLayer(); strip.updateLayer()
+                try expect(card.layer?.backgroundColor == strip.layer?.backgroundColor,
+                           "comparison background diverged from card background")
+            }
 
             let tiers: [(Int?, RemainingColorTier)] = [
                 (nil, .normal), (0, .red), (19, .red), (20, .orange), (39, .orange),

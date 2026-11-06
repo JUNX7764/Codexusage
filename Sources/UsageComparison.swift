@@ -24,9 +24,11 @@ enum UsageComparison {
     }
     static func evaluate(snapshot: OfficialUsageSnapshot?, now: Date) -> (Item, Item) {
         let source = "来源：官方账号用量"
+        let weeklyFormula = "两组7日总量比较：（最近7日总量−前7日总量）÷前7日总量×100%"
         func unavailable(_ reason: String) -> (Item, Item) {
-            let item = Item(value: .insufficient, description: source + "；" + reason)
-            return (item, item)
+            let daily = Item(value: .insufficient, description: source + "；" + reason)
+            let weekly = Item(value: .insufficient, description: source + "；" + reason + "；" + weeklyFormula)
+            return (daily, weekly)
         }
         guard let snapshot = snapshot else { return unavailable("尚未取得数据") }
         guard let end = snapshot.days.keys.sorted().last else { return unavailable("尚未取得每日数据") }
@@ -36,7 +38,7 @@ enum UsageComparison {
         guard let date = formatter.date(from: end), formatter.string(from: date) == end else { return unavailable("源日期无效") }
         let dates = (0..<14).map { formatter.string(from: date.addingTimeInterval(-Double($0) * 86400)) }
         let dailyRange = "\(dates[0]) 对比 \(dates[1])"
-        let weeklyRange = "\(dates[6]) 至 \(dates[0]) 对比 \(dates[13]) 至 \(dates[7])"
+        let weeklyRange = "\(dates[6]) 至 \(dates[0]) 对比 \(dates[13]) 至 \(dates[7])；\(weeklyFormula)"
         let age = now.timeIntervalSince(snapshot.fetchedAt)
         let ageReason: String? = age < 0 ? "查询时间异常" : (age > 1800 ? "查询结果已过期" : nil)
         func item(_ range: String, indexes: Range<Int>, current: Range<Int>, prior: Range<Int>) -> Item {
