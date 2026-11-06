@@ -274,6 +274,7 @@ struct QuotaWindow {
 
 /// fetchQuota 的一次结果（error 非 nil 表示本次失败，UI 保留旧数据并标注）
 struct QuotaData {
+    var fiveHourNotApplicable = false
     var fiveHour: QuotaWindow?
     var sevenDay: QuotaWindow?
     var planType: String?
@@ -317,6 +318,7 @@ enum TiboFetchOutcome {
 }
 
 struct UsageData {
+    var fiveHourNotApplicable = false
     var fiveHour: QuotaWindow?
     var sevenDay: QuotaWindow?
     var planType: String?
@@ -343,6 +345,7 @@ struct UsageData {
 
 enum AccountIsolation {
     static func clear(_ usage: inout UsageData) {
+        usage.fiveHourNotApplicable = false
         usage.fiveHour = nil; usage.sevenDay = nil; usage.planType = nil
         usage.resetCredits = nil; usage.resetCards = nil; usage.email = nil
         usage.quotaError = nil; usage.fiveHourError = nil; usage.sevenDayError = nil
@@ -520,7 +523,8 @@ enum Fetcher {
             out.resetCredits = CodexNumber.nonnegativeInteger(raw)
         }
         var byCode: [String: (used: Double, reset: Date?)] = [:]
-        var errors = ["5h": "missing or invalid 5H used_percent", "7d": "missing or invalid 7D used_percent"]
+        var errors = ["5h": "暂未提供", "7d": "暂未提供"]
+        var sawFiveHourField = false
 
         // 旧格式（当前实际返回）：rate_limit.primary_window → 5h，secondary_window → 7d，
         // used_percent 直接是已用百分比；limit_window_seconds 用于校验窗口类型
@@ -531,6 +535,7 @@ enum Fetcher {
                 var code = fallback
                 if abs(seconds - 18000) <= 60 { code = "5h" }
                 else if abs(seconds - 604800) <= 3600 { code = "7d" }
+                if code == "5h" { sawFiveHourField = true }
                 if let used = CodexNumber.finite(w["used_percent"]), (0...100).contains(used) {
                     byCode[code] = (used, resetDate(w, now: now))
                     errors[code] = ""
@@ -544,6 +549,7 @@ enum Fetcher {
         if let limits = usageNode["limits"] as? [[String: Any]] {
             for e in limits {
                 guard let code = e["window"] as? String, code == "5h" || code == "7d" else { continue }
+                if code == "5h" { sawFiveHourField = true }
                 guard let used = CodexNumber.finite(e["used"]), used >= 0,
                       let limit = CodexNumber.finite(e["limit"]), limit > 0,
                       used <= limit else {
@@ -555,8 +561,23 @@ enum Fetcher {
             }
         }
 
+        // Pro capability fallback is deliberately restricted to a valid, explicitly timed
+        // 7-day legacy window and an absent/null other window. Unknown or malformed
+        // structures are not evidence that the 5-hour window is inapplicable.
+        if let rl = obj["rate_limit"] as? [String: Any],
+           ["pro", "prolite"].contains((out.planType ?? "").lowercased()),
+           !sawFiveHourField, byCode["5h"] == nil, byCode["7d"] != nil {
+            let windows = [rl["primary_window"], rl["secondary_window"]]
+            let present = windows.compactMap { $0 as? [String: Any] }
+            if present.count == 1, let seconds = CodexNumber.finite(present[0]["limit_window_seconds"]),
+               abs(seconds - 604800) <= 3600,
+               let used = CodexNumber.finite(present[0]["used_percent"]), (0...100).contains(used),
+               windows.allSatisfy({ $0 == nil || $0 is NSNull || $0 is [String: Any] }) {
+                out.fiveHourNotApplicable = true
+            }
+        }
         if let v = byCode["5h"] { out.fiveHour = QuotaWindow(usedPercent: v.used, reset: v.reset) }
-        else { out.fiveHourError = errors["5h"] }
+        else if !out.fiveHourNotApplicable { out.fiveHourError = errors["5h"] }
         if let v = byCode["7d"] { out.sevenDay = QuotaWindow(usedPercent: v.used, reset: v.reset) }
         else { out.sevenDayError = errors["7d"] }
         if out.fiveHour == nil && out.sevenDay == nil {
@@ -1478,14 +1499,14 @@ enum StackImage {
         return result
     }
 
-    static func make(line1: Line, line2: Line, appearance: NSAppearance? = nil) -> NSImage {
+    static func make(line1: Line, line2: Line?, appearance: NSAppearance? = nil) -> NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
         let s1 = attributed(line1, font: font)
-        let s2 = attributed(line2, font: font)
-        let w = max(ceil(s1.size().width), ceil(s2.size().width)) + 2
+        let s2 = line2.map { attributed($0, font: font) }
+        let w = max(ceil(s1.size().width), ceil(s2?.size().width ?? 0)) + 2
         let draw = {
-            s1.draw(at: NSPoint(x: 1, y: 10.5))
-            s2.draw(at: NSPoint(x: 1, y: 0.5))
+            s1.draw(at: NSPoint(x: 1, y: s2 == nil ? 5.5 : 10.5))
+            s2?.draw(at: NSPoint(x: 1, y: 0.5))
         }
         let img = NSImage(size: NSSize(width: w, height: 21), flipped: false) { _ in
             // 正常时不钉死绘制外观，由系统按每条菜单栏各自解析动态颜色，兼容双屏不同底色。
@@ -3475,11 +3496,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let now = Date()
         fiveHourLastOK = CodexFreshness.updated(fiveHourLastOK, succeeded: r.fiveHour != nil, at: now)
         sevenDayLastOK = CodexFreshness.updated(sevenDayLastOK, succeeded: r.sevenDay != nil, at: now)
-        usage.fiveHour = QuotaMerge.preferred(r.fiveHour, old: usage.fiveHour)
+        if r.fiveHourNotApplicable {
+            usage.fiveHour = nil
+            fiveHourLastOK = nil
+            usage.fiveHourNotApplicable = true
+        } else {
+            usage.fiveHour = QuotaMerge.preferred(r.fiveHour, old: usage.fiveHour)
+            if r.fiveHour != nil || (r.error == nil && r.fiveHourError != nil) {
+                usage.fiveHourNotApplicable = false
+            }
+        }
         usage.sevenDay = QuotaMerge.preferred(r.sevenDay, old: usage.sevenDay)
         usage.planType = r.planType ?? usage.planType
         usage.resetCredits = r.resetCredits ?? usage.resetCredits
-        usage.fiveHourError = r.fiveHour == nil ? (r.fiveHourError ?? r.error) : nil
+        usage.fiveHourError = r.fiveHourNotApplicable ? nil : (r.fiveHour == nil ? (r.fiveHourError ?? r.error) : nil)
         usage.sevenDayError = r.sevenDay == nil ? (r.sevenDayError ?? r.error) : nil
         usage.quotaError = r.error
         usage.email = r.email ?? usage.email
@@ -3622,10 +3652,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     remaining: sevenRemaining)
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
         barThemeDark = isDark(appearance)
-        statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
+        statusItem.button?.image = usage.fiveHourNotApplicable
+            ? StackImage.make(line1: line2, line2: nil) : StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
-        statusItem.button?.toolTip = "Codex 用量 · 5H成功 \(fiveHourLastOK.map { Fmt.time($0) } ?? "--")"
+        statusItem.button?.toolTip = "Codex 用量"
+            + (usage.fiveHourNotApplicable ? "" : " · 5H成功 \(fiveHourLastOK.map { Fmt.time($0) } ?? "--")")
             + " · 7D成功 \(sevenDayLastOK.map { Fmt.time($0) } ?? "--")"
             + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
             + " · 外部最后成功 \(extLastOK.map { Fmt.time($0) } ?? "--")"
@@ -3717,17 +3749,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 notices.append(notice(text, .warning))
             }
             if let error = error {
-                var text = "刷新失败：\(error)"
+                var text = error == "暂未提供" ? error : "刷新失败：\(error)"
                 if !stale, let last = last { text += " · 最后成功 \(Fmt.dayTime(last))" }
-                notices.append(notice(text, .error))
+                notices.append(notice(text, error == "暂未提供" ? .info : .error))
             }
             return UsagePanelModel.Quota(title: label, resetText: resetText,
                 remaining: Fmt.remaining(window?.usedPercent), notices: notices)
         }
-        let quotas = [
-            quota("5 小时窗口", usage.fiveHour, isFive: true),
-            quota("7 天窗口", usage.sevenDay, isFive: false)
-        ]
+        var quotas: [UsagePanelModel.Quota] = []
+        if !usage.fiveHourNotApplicable { quotas.append(quota("5 小时窗口", usage.fiveHour, isFive: true)) }
+        quotas.append(quota("7 天窗口", usage.sevenDay, isFive: false))
 
         var resetSection: UsagePanelModel.ResetSection?
         if let storedCards = usage.resetCards {
@@ -4190,6 +4221,33 @@ enum CodexOfflineRegression {
             ]], now: now, email: nil)
             try expect(legacy.fiveHour?.usedPercent == 15 && legacy.sevenDay?.usedPercent == 64,
                        "valid legacy windows did not parse")
+
+            // Synthetic compatibility fixtures; these are not captured Pro responses.
+            for plan in ["pro", "prolite"] {
+                let one = Fetcher.parseUsage(["plan_type": plan, "rate_limit": [
+                    "primary_window": NSNull(),
+                    "secondary_window": ["used_percent": 45, "limit_window_seconds": 604800]
+                ]], now: now, email: nil)
+                try expect(one.fiveHourNotApplicable && one.fiveHourError == nil && one.sevenDay != nil,
+                           "recognized single-window plan not handled")
+                let invalid = Fetcher.parseUsage(["plan_type": plan, "rate_limit": [
+                    "primary_window": ["used_percent": "bad", "limit_window_seconds": 18000],
+                    "secondary_window": ["used_percent": 45, "limit_window_seconds": 604800]
+                ]], now: now, email: nil)
+                try expect(!invalid.fiveHourNotApplicable && invalid.fiveHourError != nil,
+                           "invalid 5H hidden by plan")
+                let valid = Fetcher.parseUsage(["plan_type": plan, "rate_limit": [
+                    "primary_window": ["used_percent": 10, "limit_window_seconds": 18000],
+                    "secondary_window": ["used_percent": 45, "limit_window_seconds": 604800]
+                ]], now: now, email: nil)
+                try expect(!valid.fiveHourNotApplicable && valid.fiveHour != nil,
+                           "valid 5H hidden by plan")
+            }
+            let unknownPlan = Fetcher.parseUsage(["plan_type": "unknown", "rate_limit": [
+                "secondary_window": ["used_percent": 45, "limit_window_seconds": 604800]
+            ]], now: now, email: nil)
+            try expect(!unknownPlan.fiveHourNotApplicable && unknownPlan.fiveHourError == "暂未提供",
+                       "unknown capability interpreted as not applicable")
 
             let old5 = QuotaWindow(usedPercent: 20, reset: nil)
             try expect(QuotaMerge.preferred(nil, old: old5)?.usedPercent == 20,
