@@ -2134,6 +2134,8 @@ enum PanelAccent {
 }
 
 private enum PanelUI {
+    static let separatorHeight: CGFloat = 1
+
     static func stack(orientation: NSUserInterfaceLayoutOrientation = .vertical,
                       alignment: NSLayoutConstraint.Attribute = .width,
                       spacing: CGFloat = 8) -> NSStackView {
@@ -2199,7 +2201,7 @@ private enum PanelUI {
         let line = NSBox()
         line.boxType = .separator
         line.translatesAutoresizingMaskIntoConstraints = false
-        line.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        line.heightAnchor.constraint(equalToConstant: separatorHeight).isActive = true
         return line
     }
 
@@ -2213,29 +2215,6 @@ private enum PanelUI {
             }
             return label(notice.text, size: 11, color: color)
         }
-    }
-}
-
-private final class PanelSectionDividerView: NSView {
-    static let thickness: CGFloat = 0.5
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        translatesAutoresizingMaskIntoConstraints = false
-        wantsLayer = true
-        alphaValue = 0.55
-        heightAnchor.constraint(equalToConstant: Self.thickness).isActive = true
-    }
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override var wantsUpdateLayer: Bool { true }
-    override func updateLayer() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = NSColor.separatorColor.cgColor
-        }
-    }
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        needsDisplay = true
     }
 }
 
@@ -2754,16 +2733,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         view.widthAnchor.constraint(equalToConstant: panelWidth - 32).isActive = true
     }
 
-    private func addSectionDivider() {
-        guard let previous = stack.arrangedSubviews.last else { return }
-        let line = PanelSectionDividerView(frame: .zero)
-        // 细线与两侧留白合计仍为原有的 8pt，不因区隔增加窗口高度。
-        let halfGap = (stack.spacing - PanelSectionDividerView.thickness) / 2
-        stack.setCustomSpacing(halfGap, after: previous)
-        addContentRow(line)
-        stack.setCustomSpacing(halfGap, after: line)
-    }
-
     private func rebuildContent() {
         guard let model = model else { return }
         installChrome(model: model)
@@ -2792,9 +2761,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         addContentRow(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
             expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
             bucketAction: #selector(toggleCodexBucket(_:))))
-        addSectionDivider()
+        addContentRow(PanelUI.separator())
         addContentRow(makeDailySection(model))
-        addSectionDivider()
+        addContentRow(PanelUI.separator())
         addContentRow(makeToolSection(model))
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
@@ -3024,25 +2993,27 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         refreshPanelLayout()
     }
 
-    /// 板块细线必须居中放在原有间距中，不能增加展开或折叠面板的高度。
+    /// 板块线与页脚样式一致，线上下分别保留完整堆栈间距，展开／折叠时均保持。
     func verifySectionDividersForPreview() -> Bool {
         stack.layoutSubtreeIfNeeded()
         let rows = stack.arrangedSubviews
-        let indices = rows.indices.filter { rows[$0] is PanelSectionDividerView }
-        guard indices.count == 2, indices[0] > 0, indices[1] + 1 < rows.count,
+        let indices = rows.indices.filter { (rows[$0] as? NSBox)?.boxType == .separator }
+        guard let reference = footerContainer.subviews.compactMap({ $0 as? NSBox }).first(where: { $0.boxType == .separator }),
+              indices.count == 2, indices[0] > 0, indices[1] + 1 < rows.count,
               rows[indices[0] - 1] is TokenSectionView, indices[1] == indices[0] + 2 else { return false }
         return indices.allSatisfy { index in
             let line = rows[index], previous = rows[index - 1], next = rows[index + 1]
             let before = abs(line.frame.midY - previous.frame.midY) - (line.frame.height + previous.frame.height) / 2
             let after = abs(next.frame.midY - line.frame.midY) - (next.frame.height + line.frame.height) / 2
-            let valid = abs(line.frame.height - 0.5) < 0.01
-                && abs(line.alphaValue - 0.55) < 0.01
+            // NSBox 的 frame 包含系统内边距，直接与同窗页脚线比较，避免误当作描画线宽。
+            let valid = abs(line.frame.height - reference.frame.height) < 0.01
+                && line.alphaValue == 1 && line.alphaValue == reference.alphaValue
                 && abs(line.frame.width - (panelWidth - 32)) < 0.01
                 && abs(line.frame.minX - previous.frame.minX) < 0.01
                 && abs(before - after) < 0.51
-                && abs(before + line.frame.height + after - stack.spacing) < 0.51
+                && abs(before + line.frame.height + after - (2 * stack.spacing + PanelUI.separatorHeight)) < 0.51
             if !valid {
-                print("CODEX_SECTION_DIVIDER index=\(index) height=\(line.frame.height) alpha=\(line.alphaValue) width=\(line.frame.width) x=\(line.frame.minX) previousX=\(previous.frame.minX) before=\(before) after=\(after)")
+                print("CODEX_SECTION_DIVIDER index=\(index) height=\(line.frame.height) referenceHeight=\(reference.frame.height) alpha=\(line.alphaValue) width=\(line.frame.width) x=\(line.frame.minX) previousX=\(previous.frame.minX) before=\(before) after=\(after)")
             }
             return valid
         }
