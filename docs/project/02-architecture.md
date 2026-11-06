@@ -5,7 +5,7 @@
 
 ## 1. 应用形态
 
-CodexUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 Swift Package 和第三方包管理依赖。当前 Swift 实现集中在 `CodexUsage.swift`，zstd 解码通过 `vendor/` 下的 C 源码和桥接层编译进主二进制。
+CodexUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 Swift Package 和第三方包管理依赖。主入口和现有功能位于 `CodexUsage.swift`，新统计模块位于 `Sources/`，zstd 解码通过 `vendor/` 下的 C 源码和桥接层编译进主二进制。
 
 应用身份保持为：
 
@@ -20,7 +20,10 @@ CodexUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 
 | `CodexAuth` | 读取 Codex CLI 登录态；401 续期时合并并原子写回 `auth.json` |
 | `Fetcher` | 额度、重置卡、重置卡使用和 OAuth 请求 |
 | `TokenScanner` | 增量读取 Codex JSONL / zstd 会话并统计模型用量 |
-| `ExternalTokenScanner` | 只读扫描 Proma、Claude Code 和 Hermes 的外部模型用量 |
+| `ExternalTokenScanner` | 只读扫描 Proma、Claude Code 和 Hermes，并从去重后的缓存归属工具 |
+| `OfficialUsageReader` | 原生只读获取账号累计和日桶，并核对身份快照 |
+| `DailyUsageChart` / `UsageComparison` | 日图交互和受数据完整性约束的比较计算 |
+| `UsageAttribution` | 处理重叠来源路径的唯一归属 |
 | `TiboDisplay` 与相关模型 | AIHOT 重置动态的解析、排序和展示 |
 | `UpdateChecker` | 检查 GitHub Release 及更新资产 |
 | `UpdateProgressController` | 启动后台更新并恢复、展示进度 |
@@ -28,7 +31,7 @@ CodexUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 
 | `AppDelegate` | 生命周期、刷新调度、账户隔离、自启和状态聚合 |
 | `CodexOfflineRegression` | 使用临时目录和假数据的离线自检 |
 
-单文件是当前实现状态，不是必须永久维持的架构目标。后续拆分时应优先分离凭据、网络、扫描、更新和 UI，并保留合法入口及现有测试能力。
+主入口保留 top-level 形式；构建时在独立临时目录创建合法 `main.swift`，同 `Sources/` 编译。
 
 ## 3. 主要数据流
 
@@ -43,6 +46,10 @@ CodexUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 
 Codex / 外部工具会话与数据库 → 只读增量扫描 → 本地缓存 → 今日、近 7 日、近 30 日及模型汇总。
 
 原始会话来源保持只读。缓存和诊断状态仅写入 `~/Library/Application Support/CodexUsage`，不上传会话正文。
+
+### 官方账号用量
+
+认证快照与工作区 ID → OpenAI profile 只读请求 → 账号代际及凭据检查 → 缓存 → 累计和日图。查询不触发凭据续期；源时区与缺失日期含义未确认时，比较项降级为数据不足。
 
 ### 自动更新
 

@@ -56,6 +56,8 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-updating
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-updating-install
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-narrow
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-pro
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-tools
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-models
 ```
 
@@ -71,7 +73,10 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 | 文件 | 说明 |
 |---|---|
-| `CodexUsage.swift` | 当前全部 Swift 源码；包含 AppKit UI、数据层、更新控制和离线自检 |
+| `CodexUsage.swift` | 入口、AppKit UI、原有数据层、更新控制和离线自检 |
+| `Sources/OfficialUsage.swift` | 账号用量只读请求、账号快照校验和严格解析 |
+| `Sources/DailyUsageView.swift` | 日期图表、悬停／键盘查看和工具占比条 |
+| `Sources/UsageAttribution.swift` / `UsageComparison.swift` | 来源归属及比较计算 |
 | `vendor/zstddeclib.c` | 上游 zstd v1.5.7 单文件解码源，许可见 `vendor/zstd-LICENSE` |
 | `vendor/zstd_bridge.c` / `.h` | zstd 解码的 C 桥接层 |
 | `build.sh` | 编译、打包和 ad-hoc 签名 |
@@ -85,6 +90,10 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ## 用量与更新的校验边界
 
 Codex 会话按 `token_count` 事件的本地日期统计，累计值按同一会话前后差额入账，并按最近一条 `turn_context.payload.model` 归入模型；缺少模型信息的旧记录归为「未知模型」。缺少事件时间的旧记录使用文件名日期。未修改文件复用缓存，活跃明文会话只读取新增内容，压缩归档发生变化时重新解压。
+
+官方用量通过 `GET /backend-api/wham/profiles/me` 只读请求，使用已有认证快照及 `ChatGPT-Account-ID`，查询本身不续期；401 等待额度链路按既有规则处理。请求结果接受前后核对账号身份和凭据，失败保留同账号上次成功值。官方数据及本机扫描随约五分钟调度，鼠标与控件交互只使用缓存。官方日期口径未确认时比较始终显示数据不足；测试用完整虚构日桶验证计算。
+
+构建时在专属临时目录生成合法 `main.swift` 并编译 `Sources/`；真实只读能力可通过 `--official-usage-check` 检查，该命令联网且只输出成功或失败类别，不输出个人用量。
 
 更新脚本接收已确认的 Release 标签和正在运行的应用路径，校验包身份、构建版本和实际安装版本后仅处理目标进程。离线脚本测试使用临时应用、伪造进程和网络命令，**不能替代真实安装环境中的更新、回滚和面板点击验收**。
 
