@@ -1528,6 +1528,7 @@ enum Fmt {
     }
     private static let timeFmt = zhFormatter("HH:mm")
     private static let dayTimeFmt = zhFormatter("MM-dd HH:mm")
+    private static let quotaResetFmt = zhFormatter("MM-dd EEE HH:mm")
     private static let dayOnlyFmt = zhFormatter("MM-dd")
     private static let expiresTodayFmt = zhFormatter("'今天' HH:mm")
     private static let expiresTomorrowFmt = zhFormatter("'明天' HH:mm")
@@ -1540,6 +1541,9 @@ enum Fmt {
     static func dayTime(_ d: Date?) -> String {
         guard let d = d else { return "" }
         return dayTimeFmt.string(from: d)
+    }
+    static func quotaReset(_ d: Date) -> String {
+        quotaResetFmt.string(from: d)
     }
     static func day(_ d: Date?) -> String {
         guard let d = d else { return "" }
@@ -3704,7 +3708,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let error = isFive ? usage.fiveHourError : usage.sevenDayError
             var resetText = "暂无数据"
             if let window = window {
-                resetText = window.reset.map { Fmt.dayTime($0) } ?? "时间未知"
+                resetText = window.reset.map { Fmt.quotaReset($0) } ?? "时间未知"
             }
             var notices: [UsagePanelModel.Notice] = []
             if stale {
@@ -4070,6 +4074,16 @@ enum CodexOfflineRegression {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
             let now = Date(timeIntervalSince1970: 1_800_000_000)
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = .current
+            let weekdays = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+            for (offset, weekday) in weekdays.enumerated() {
+                let date = calendar.date(from: DateComponents(year: 2026, month: 11, day: 8 + offset, hour: 6, minute: 15))!
+                let expected = String(format: "11-%02d %@ 06:15", 8 + offset, weekday)
+                try expect(Fmt.quotaReset(date) == expected, "quota reset weekday or local time is incorrect")
+                try expect(Fmt.dayTime(date) == String(format: "11-%02d 06:15", 8 + offset),
+                           "machine-readable date format changed")
+            }
             try expect(Fmt.tokensAbbr(20_000) == "20K" && Fmt.tokensAbbr(300_000) == "300K"
                        && Fmt.tokensAbbr(1_500_000) == "1.5M" && Fmt.tokensAbbr(nil) == "--",
                        "token abbreviation scale or missing value is incorrect")
