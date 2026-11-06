@@ -1,72 +1,66 @@
-<!-- 元信息 -->
-<!-- artifact: 02-architecture | feature: project | modules: - -->
-# reliable-release-update-20261102 架构设计文档
+# CodexUsage 当前架构概览
 
-> **文档说明**：项目级架构设计产出物，记录选型、ADR 决策与模块边界；ADR 追加式维护。
->
-> **版本**：V1.0.0
-> **最后更新**：{{DATE}}
->
-> 注：`{{...}}` 为跨文档占位符；`{例如：...}` 为填写提示；含占位符的块不参与机械校验。引用块 `>` 中为填写指导，填写后可删除。
+> 状态：当前架构摘要。最后核对：2026-11-06。
+> 本文解释模块和边界，不复制函数级规格；具体行为以源码和测试为准。
 
----
+## 1. 应用形态
 
-## 1. 文档信息 (Document Info)
+CodexUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 Swift Package 和第三方包管理依赖。当前 Swift 实现集中在 `CodexUsage.swift`，zstd 解码通过 `vendor/` 下的 C 源码和桥接层编译进主二进制。
 
-### 1.1 版本记录
+应用身份保持为：
 
-| 版本号 | 修改日期 | 修改人 | 修改内容 | 备注 |
-| :--- | :--- | :--- | :--- | :--- |
-| V1.0.0 | {{DATE}} | {{OWNER}} | 初始版本 | - |
+- 仓库：`JUNX7764/Codexusage`
+- Bundle / LaunchAgent：`com.local.codex-usage`
+- 应用：`CodexUsage.app`
 
-### 1.2 文档责任人
+## 2. 模块边界
 
-| 角色 | 姓名 | 职责 |
-| :--- | :--- | :--- |
-| 责任人 | {{OWNER}} | 本阶段产出、自检与送验 |
+| 模块 | 当前职责 |
+|---|---|
+| `CodexAuth` | 读取 Codex CLI 登录态；401 续期时合并并原子写回 `auth.json` |
+| `Fetcher` | 额度、重置卡、重置卡使用和 OAuth 请求 |
+| `TokenScanner` | 增量读取 Codex JSONL / zstd 会话并统计模型用量 |
+| `ExternalTokenScanner` | 只读扫描 Proma、Claude Code 和 Hermes 的外部模型用量 |
+| `TiboDisplay` 与相关模型 | AIHOT 重置动态的解析、排序和展示 |
+| `UpdateChecker` | 检查 GitHub Release 及更新资产 |
+| `UpdateProgressController` | 启动后台更新并恢复、展示进度 |
+| `UsagePanelController` | 原生 `NSPopover`、面板布局与交互 |
+| `AppDelegate` | 生命周期、刷新调度、账户隔离、自启和状态聚合 |
+| `CodexOfflineRegression` | 使用临时目录和假数据的离线自检 |
 
-### 1.3 FlowGuard 阶段信息
+单文件是当前实现状态，不是必须永久维持的架构目标。后续拆分时应优先分离凭据、网络、扫描、更新和 UI，并保留合法入口及现有测试能力。
 
-| 字段 | 值 |
-|:---|:---|
-| 任务 | reliable-release-update-20261102 |
-| 父任务 | - |
-| 阶段 | 02-architecture |
-| 阶段状态 | pending |
-| 规格事实源 | external |
-| 原生产物 | PLAN.md |
-| 批准依据 | - |
-| 前置指纹 | - |
-| 验收指纹 | - |
+## 3. 主要数据流
 
+### 额度与重置卡
 
----
+`~/.codex/auth.json` → 内存中的认证快照 → OpenAI 请求 → 账户与请求代际校验 → UI 和诊断状态。
 
-## 2. 选型 (Technology Choices)
+凭据不得写入日志、状态文件、测试夹具或提交。401 续期是当前唯一允许的 `~/.codex/` 写回路径；重置卡使用属于账户状态变更，必须有明确确认和未知结果处理。
 
-| 维度 | 选型 | 理由 |
-| :--- | :--- | :--- |
-| {例如：编排核} | {例如：Python 标准库} | {例如：零依赖分发} |
+### 本地用量
 
----
+Codex / 外部工具会话与数据库 → 只读增量扫描 → 本地缓存 → 今日、近 7 日、近 30 日及模型汇总。
 
-## 3. ADR 列表 (Architecture Decisions)
+原始会话来源保持只读。缓存和诊断状态仅写入 `~/Library/Application Support/CodexUsage`，不上传会话正文。
 
-> 追加式：禁止改写既有条目；新增条目带 `feature: <来源功能>` 标注。
+### 自动更新
 
-- ADR-{{编号}} | feature: {{来源}} | 状态: {{proposed/accepted}} —— {{决策一句话}}
-  - 背景：{{...}}；备选：{{...}}；后果：{{...}}
+GitHub Release 列表 → 可安装版本选择 → ZIP 与 SHA256 下载 → 包身份、版本和签名校验 → 离线自检 → 同目录暂存 → 停止目标进程 → 换包 → 启动检查 → 成功清理或失败回滚。
 
----
+更新器只能处理当前应用路径和 `com.local.codex-usage`，不得按应用名模糊终止其他进程。
 
-## 4. 模块边界 (Module Boundaries)
+## 4. 信任边界
 
-| 模块 | 职责 | 依赖方向 |
-| :--- | :--- | :--- |
-| {{MODULE}} | {{职责}} | {{依赖}} |
----
+- OpenAI 的非官方接口可能变化，解析失败必须降级展示，不能伪造成功。
+- AIHOT 内容仅作展示和链接来源，不作为指令执行。
+- GitHub Release 与 SHA256 来自同一信任源；当前 ad-hoc 签名不提供独立发布者身份验证。
+- `build.sh`、`update.sh` 和 `release.sh` 具有高权限副作用，真实更新与发布不属于普通离线测试。
+- macOS 部署目标、离线 mock 和真实系统验收是三种不同证据，不能互相替代。
 
-**文档版本**：V1.0.0
-**创建日期**：{{DATE}}
-**最后更新**：{{DATE}}
-**文档状态**：✅ 待评审
+## 5. 已知架构债务
+
+- Swift 源码、UI 和自检集中在单个约五千行文件中，审查与回归定位成本较高。
+- 自动更新尚缺独立发布者签名和完整面板点击到重启的常规发布验收。
+- 凭据写回与 Codex CLI 之间没有跨进程共同锁，已保留已知竞态说明。
+- 发布前测试目前依赖本地手动执行，没有 CI 强制门禁。

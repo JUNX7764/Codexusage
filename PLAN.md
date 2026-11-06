@@ -1,4 +1,8 @@
-# CodexUsage v1.0.0 开发规划（任务书）
+# CodexUsage v1.0.0 开发规划（历史任务书）
+
+> **文档状态：历史资料，2026-11-06 标记。**
+> 本文保留初始需求、实测数据和设计演进，不再作为当前行为的事实源。文中的刷新周期、缓存版本、面板类型、更新流程和“已完成／已部署”等表述只反映当时状态。
+> 当前用户说明见 `README.md`；当前构建、测试和发布说明见 `docs/DEVELOPMENT.md` 与 `docs/project/`。判断现状必须核对源码与测试。
 
 单文件 Swift 菜单栏应用，监控 OpenAI Codex 订阅（ChatGPT Plus 的 Codex 额度）用量，架构与同机的 GlmUsage 完全同构。目标：替代 Electron 版 CodexMeter 的核心功能，内存 ~80MB（CodexMeter 实际独占 250–350MB）。
 

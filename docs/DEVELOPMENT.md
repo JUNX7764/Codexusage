@@ -1,12 +1,31 @@
 # CodexUsage 开发说明
 
+> **当前工程事实源**。构建、测试、发布或权限行为发生变化时，应在同一个提交中更新本文。
+> 最后核对：2026-11-06。
+
+## 文档入口与效力
+
+| 文档 | 用途 | 当前效力 |
+|---|---|---|
+| `README.md` | 功能、安装、更新与隐私说明 | 面向用户的当前说明 |
+| `docs/DEVELOPMENT.md` | 构建、测试、发布和验证边界 | 面向维护者的当前说明 |
+| `docs/project/02-architecture.md` | 模块、数据流和信任边界 | 当前架构概览，细节以源码为准 |
+| `docs/project/07-standards.md` | 修改、测试、凭据和文档约定 | 当前维护约定 |
+| `docs/project/10-release.md` | 发布资产、门禁和回滚边界 | 当前发布清单 |
+| `PLAN.md` | 初始任务书及历次设计记录 | **历史资料，不代表当前行为** |
+| `VISUAL_OPTIMIZATION_PLAN.md`、`docs/features/` | 已完成专项的实施记录 | **历史资料，不代表当前行为** |
+
+判断当前行为时，优先级为：**源码与测试 → 本文及 `docs/project/` → 用户 README → 历史计划**。文档与代码冲突时，先修正文档，不得用历史计划证明现状。
+
+## 构建
+
 需要 macOS 13 或更新版本、Apple Silicon 和 Xcode Command Line Tools。
 
 ```bash
 ./build.sh
 ```
 
-发布正式版本前确认工作区干净且 HEAD 已推送至 main，然后运行 `scripts/release.sh v1.2.3`。脚本构建并校验发布资产后推送 tag 并创建或补全 GitHub Release。
+`build.sh` 会重建项目内的 `CodexUsage.app`，替换已有构建产物，并执行 ad-hoc 签名验证。版本号来自 `git describe`；多文件拆分后必须保留合法的 top-level 入口，并同步调整构建脚本。
 
 ## 调试与自检
 
@@ -17,10 +36,16 @@
 # 脚本回归：PATH mock 故障注入，不操作真实 app、LaunchAgent 或 GitHub
 python3 -m unittest discover -s tests -p '*_test.py'
 
-# 真实自检：读取本机凭据、联网拉一次数据后退出
-./CodexUsage.app/Contents/MacOS/CodexUsage --once
+# Shell 语法检查
+bash -n build.sh scripts/update.sh scripts/release.sh
 
-# 固定假数据视觉预览：不联网、不写真实 status.json
+# 真实自检：读取本机凭据、联网拉一次数据后退出；不属于离线测试
+./CodexUsage.app/Contents/MacOS/CodexUsage --once
+```
+
+固定假数据视觉预览不联网，也不写真实 `status.json`：
+
+```bash
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-normal
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-dark
@@ -32,12 +57,13 @@ python3 -m unittest discover -s tests -p '*_test.py'
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-updating-install
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-narrow
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-models
+```
 
-# 面板本地截图：只捕捉面板；scroll-end 可先滚动到底部
+面板截图与事件回归：
+
+```bash
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-output=/tmp/codex-panel.png
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-dark --visual-preview-scroll-end --visual-preview-output=/tmp/codex-panel-bottom.png
-
-# 面板事件回归：Esc / 外部点击 / R 刷新，自动验证并退出
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-events
 ```
 
@@ -45,23 +71,45 @@ python3 -m unittest discover -s tests -p '*_test.py'
 
 | 文件 | 说明 |
 |---|---|
-| `CodexUsage.swift` | 全部源码（单文件 AppKit 菜单栏应用） |
-| `vendor/zstddeclib.c` | 上游 zstd v1.5.7 单文件解码源（BSD-3-Clause，许可见 `vendor/zstd-LICENSE`），用于进程内解压 `.zst` 会话归档 |
-| `vendor/zstd_bridge.c` / `.h` | zstd 解码的 C 桥接层（供 Swift 调用） |
-| `build.sh` | 编译 + 打包 + ad-hoc 签名脚本 |
-| `Info.plist` | App Bundle 配置（LSUIElement = 菜单栏常驻） |
-| `scripts/icon_gen.swift` | 图标生成脚本（缺 icns 时 build.sh 自动调用） |
-| `scripts/update.sh` | 就地更新脚本（从 Release 下载替换；build.sh 随包内置进 .app Resources） |
-| `scripts/release.sh` | 发布脚本（本地 tag → 构建与测试 → 资产校验 → 推 tag → GitHub Release） |
-| `tests/script_test.py` | 更新、发布、签名故障的离线回归测试 |
-| `PLAN.md` | 开发规格（数据源已实测、解析规则、UI 规格、验收标准） |
+| `CodexUsage.swift` | 当前全部 Swift 源码；包含 AppKit UI、数据层、更新控制和离线自检 |
+| `vendor/zstddeclib.c` | 上游 zstd v1.5.7 单文件解码源，许可见 `vendor/zstd-LICENSE` |
+| `vendor/zstd_bridge.c` / `.h` | zstd 解码的 C 桥接层 |
+| `build.sh` | 编译、打包和 ad-hoc 签名 |
+| `Info.plist` | App Bundle 身份、最低系统版本和菜单栏常驻配置 |
+| `scripts/icon_gen.swift` | 图标生成脚本；缺少 icns 时由构建脚本调用 |
+| `scripts/update.sh` | 从 Release 下载、校验、暂存、替换并重启应用 |
+| `scripts/release.sh` | 创建标签、构建、自检、打包并创建或补全 GitHub Release |
+| `tests/script_test.py` | 更新、发布和签名故障的离线回归测试 |
+| `PLAN.md` | 历史任务书，不作为当前规格 |
 
 ## 用量与更新的校验边界
 
-Codex 会话的今日、近 7 日和近 30 日统计按 `token_count` 事件的本地日期，累计值按同一会话前后差额入账，并按最近一条 `turn_context.payload.model` 归入对应模型；没有模型信息的旧记录归为「未知模型」。缺少事件时间的旧记录使用文件名日期；包含模型维度的缓存升级后首次扫描会重建，外部用量缓存同步升级为 v5。未修改文件复用缓存，活跃明文会话只读取新增内容；压缩归档发生变化时重新解压。文件名与修改时间都早于窗口的未缓存冷文件不读取。
+Codex 会话按 `token_count` 事件的本地日期统计，累计值按同一会话前后差额入账，并按最近一条 `turn_context.payload.model` 归入模型；缺少模型信息的旧记录归为「未知模型」。缺少事件时间的旧记录使用文件名日期。未修改文件复用缓存，活跃明文会话只读取新增内容，压缩归档发生变化时重新解压。
 
-更新脚本接收已确认的 release tag 和正在运行的应用路径，校验包身份、构建版本和实际安装版本后仅处理目标进程。离线脚本测试使用临时应用、伪造进程和网络命令；它不能替代真实安装环境中的更新与回滚验收。
+更新脚本接收已确认的 Release 标签和正在运行的应用路径，校验包身份、构建版本和实际安装版本后仅处理目标进程。离线脚本测试使用临时应用、伪造进程和网络命令，**不能替代真实安装环境中的更新、回滚和面板点击验收**。
 
-更新进程由应用通过 `Process` + `nohup` 直接启动，输入输出关闭并切到独立临时目录；应用退出后任务继续执行，同时保留 macOS TCC 的责任应用归属。不要改回 `launchctl submit` 启动裸 shell：2026-11-04 的真实故障日志显示其责任进程变成 `/bin/bash`，换包的 `mv` 被拒绝（`Operation not permitted`）。失败日志保留在系统临时目录的 `usage-update-*/log`。
+更新进程由应用通过 `Process` + `nohup` 启动，输入输出关闭并切到独立临时目录；应用退出后任务继续执行，同时保留 macOS TCC 的责任应用归属。不要改回 `launchctl submit` 启动裸 shell：2026-11-04 的真实故障日志显示其责任进程变成 `/bin/bash`，换包的 `mv` 被拒绝（`Operation not permitted`）。失败日志保留在系统临时目录的 `usage-update-*/log`。
 
-2026-11-04 验证：24 项脚本测试（23 通过、1 项条件跳过）、构建、签名验证、离线自检通过。另将源码中的更新控制器单独编译为原生测试应用，在 Documents 下实际下载 GitHub v1.0.12 包并完成 v1.0.11 → v1.0.12 替换、旧进程退出及新进程驻留；此项验证覆盖真实权限与重启链路，未覆盖面板按钮点击。
+## 发布前必须执行
+
+```bash
+git status --short
+./build.sh
+./CodexUsage.app/Contents/MacOS/CodexUsage --self-test
+python3 -m unittest discover -s tests -p '*_test.py'
+bash -n build.sh scripts/update.sh scripts/release.sh
+```
+
+确认工作区干净、HEAD 已推送至 `main` 后，再运行：
+
+```bash
+scripts/release.sh v1.2.3
+```
+
+`release.sh` 会执行构建、二进制自检、签名与资产校验，但**不会自动运行上面的 Python 脚本回归，也不代表真实更新验收已经完成**。完整发布边界见 `docs/project/10-release.md`。
+
+## 已记录的验证证据与限制
+
+- 2026-11-04：24 项脚本测试（23 通过、1 项条件跳过）、构建、签名验证和离线自检通过。另用原生测试应用实际完成 v1.0.11 → v1.0.12 下载、替换、旧进程退出及新进程驻留；未覆盖面板按钮点击。
+- 2026-11-06：当前构建的离线自检通过；25 项脚本测试为 24 通过、1 项条件跳过；三个 Shell 脚本语法检查通过。
+- 尚无证据表明所有版本都在 macOS 13、14、15 或干净用户环境完成实机验收。部署目标为 macOS 13 不等同于完成兼容性验证。
