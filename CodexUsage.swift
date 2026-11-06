@@ -2119,7 +2119,7 @@ enum PanelAccent {
         NSColor(name: nil) { appearance in
             let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             switch self {
-            case .codex: return Self.rgb(dark ? 0xE5A37D : 0xB46539)
+            case .codex: return RemainingColorTier.orange.color(for: appearance)
             case .external: return Self.rgb(dark ? 0x86BDE8 : 0x2B6F9E)
             }
         }
@@ -2783,7 +2783,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         let comparison = PanelComparisonStack()
         let compared = UsageComparison.evaluate(snapshot: model.official, now: Date())
         func comparisonColor(_ value: UsageComparison.Value) -> NSColor {
-            if case .percent(let amount) = value { return amount < 0 ? .systemGreen : PanelAccent.codex.color }
+            if case .percent(let amount) = value { return amount < 0 ? RemainingColorTier.green.color() : PanelAccent.codex.color }
             if case .fromZero = value { return PanelAccent.codex.color }
             return .secondaryLabelColor
         }

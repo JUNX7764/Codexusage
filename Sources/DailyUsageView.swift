@@ -15,7 +15,7 @@ final class DailyUsageChart: NSView {
     }
     private var selection: Int? { didSet { needsDisplay = true; updateAccessibility() } }
     private let hover = ChartHoverLabel(labelWithString: "")
-    private let orange = NSColor(srgbRed: 0.72, green: 0.39, blue: 0.22, alpha: 1)
+    private var orange: NSColor { PanelAccent.codex.color }
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
 
