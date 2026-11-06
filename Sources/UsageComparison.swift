@@ -12,46 +12,50 @@ enum UsageComparison {
             }
         }
     }
+    struct Item {
+        let value: Value
+        let description: String
+    }
     static func compare(_ current: Double, _ prior: Double) -> Value {
         guard current.isFinite, prior.isFinite, current >= 0, prior >= 0 else { return .insufficient }
         if prior == 0 { return current == 0 ? .unchanged : .fromZero(current) }
         if current == prior { return .unchanged }
         return .percent((current - prior) / prior * 100)
     }
-    /// The source date is a calendar label; UTC is used only for date arithmetic.
-    static func descriptions(snapshot: OfficialUsageSnapshot?, semanticsConfirmed: Bool) -> (String, String) {
+    static func evaluate(snapshot: OfficialUsageSnapshot?, now: Date) -> (Item, Item) {
         let source = "来源：官方账号用量"
-        let caveat = semanticsConfirmed ? "" : "；源日期时区及缺失日期含义尚未确认"
-        guard let end = snapshot?.days.keys.sorted().last else {
-            let text = source + "；暂无源日期" + caveat
-            return (text, text)
+        func unavailable(_ reason: String) -> (Item, Item) {
+            let item = Item(value: .insufficient, description: source + "；" + reason)
+            return (item, item)
         }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)!
-        formatter.calendar = Calendar(identifier: .gregorian)
+        guard let snapshot = snapshot else { return unavailable("尚未取得数据") }
+        guard let end = snapshot.days.keys.sorted().last else { return unavailable("尚未取得每日数据") }
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)!; formatter.calendar = Calendar(identifier: .gregorian)
         formatter.dateFormat = "yyyy-MM-dd"; formatter.isLenient = false
-        guard let date = formatter.date(from: end), formatter.string(from: date) == end else {
-            let text = source + "；源日期无效" + caveat
-            return (text, text)
+        guard let date = formatter.date(from: end), formatter.string(from: date) == end else { return unavailable("源日期无效") }
+        let dates = (0..<14).map { formatter.string(from: date.addingTimeInterval(-Double($0) * 86400)) }
+        let dailyRange = "\(dates[0]) 对比 \(dates[1])"
+        let weeklyRange = "\(dates[6]) 至 \(dates[0]) 对比 \(dates[13]) 至 \(dates[7])"
+        let age = now.timeIntervalSince(snapshot.fetchedAt)
+        let ageReason: String? = age < 0 ? "查询时间异常" : (age > 1800 ? "查询结果已过期" : nil)
+        func item(_ range: String, indexes: Range<Int>, current: Range<Int>, prior: Range<Int>) -> Item {
+            let prefix = source + "；" + range
+            if let ageReason = ageReason { return Item(value: .insufficient, description: prefix + "；" + ageReason) }
+            let missing = indexes.filter { snapshot.day(dates[$0]) == .missing }.map { dates[$0] }
+            guard missing.isEmpty else { return Item(value: .insufficient, description: prefix + "；缺少日期：" + missing.joined(separator: "、")) }
+            func total(_ range: Range<Int>) -> Double {
+                range.reduce(0.0) { sum, index in
+                    if case .reported(let amount) = snapshot.day(dates[index]) { return sum + amount }
+                    return sum
+                }
+            }
+            let value = compare(total(current), total(prior))
+            let inferred = indexes.contains { snapshot.day(dates[$0]) == .inferredZero }
+            let note = value == .insufficient ? "；数值无效" : (inferred ? "；范围内无活动记录日期按 0 计" : "")
+            return Item(value: value, description: prefix + note)
         }
-        func day(_ offset: Int) -> String {
-            formatter.string(from: date.addingTimeInterval(-Double(offset) * 86400))
-        }
-        return ("\(source)；\(day(0)) 对比 \(day(1))\(caveat)",
-                "\(source)；\(day(6)) 至 \(day(0)) 对比 \(day(13)) 至 \(day(7))\(caveat)")
-    }
-    static func calculate(snapshot: OfficialUsageSnapshot?, semanticsConfirmed: Bool, now: Date) -> (Value, Value) {
-        guard semanticsConfirmed, let snapshot = snapshot, now.timeIntervalSince(snapshot.fetchedAt) <= 1800,
-              now >= snapshot.fetchedAt, let end = snapshot.days.keys.sorted().last else { return (.insufficient, .insufficient) }
-        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(secondsFromGMT: 0)!
-        f.calendar = Calendar(identifier: .gregorian); f.dateFormat = "yyyy-MM-dd"; f.isLenient = false
-        guard let date = f.date(from: end), f.string(from: date) == end else { return (.insufficient, .insufficient) }
-        let values = (0..<14).map { snapshot.days[f.string(from: date.addingTimeInterval(-Double($0) * 86400))] }
-        let daily: Value = values[0].flatMap { current in values[1].map { compare(current, $0) } } ?? .insufficient
-        guard values.allSatisfy({ $0 != nil }) else { return (daily, .insufficient) }
-        let current = values[0..<7].compactMap { $0 }.reduce(0,+)
-        let prior = values[7..<14].compactMap { $0 }.reduce(0,+)
-        return (daily, compare(current, prior))
+        return (item(dailyRange, indexes: 0..<2, current: 0..<1, prior: 1..<2),
+                item(weeklyRange, indexes: 0..<14, current: 0..<7, prior: 7..<14))
     }
 }

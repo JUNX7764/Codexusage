@@ -1,9 +1,21 @@
 import Foundation
 
 struct OfficialUsageSnapshot {
+    enum SparsePolicy { case unknown, officialActivity }
+    enum Day: Equatable { case reported(Double), inferredZero, missing }
     var lifetime: Double?
     var days: [String: Double]
     var fetchedAt: Date
+    var sparsePolicy: SparsePolicy = .unknown
+
+    /// The official client renders absent dates as zero. Restrict that behavior to
+    /// the range bounded by actual returned dates; never extrapolate beyond it.
+    func day(_ date: String) -> Day {
+        if let value = days[date] { return .reported(value) }
+        guard sparsePolicy == .officialActivity, let first = days.keys.min(), let last = days.keys.max(),
+              date >= first, date <= last else { return .missing }
+        return .inferredZero
+    }
 }
 
 enum OfficialUsageReader {
@@ -29,7 +41,8 @@ enum OfficialUsageReader {
             }
         }
         guard lifetime != nil || !days.isEmpty else { return nil }
-        return OfficialUsageSnapshot(lifetime: lifetime, days: days, fetchedAt: now)
+        return OfficialUsageSnapshot(lifetime: lifetime, days: days, fetchedAt: now,
+                                     sparsePolicy: buckets != nil && !days.isEmpty ? .officialActivity : .unknown)
     }
 
     static func request(expected: CodexAuth.Snapshot?) -> URLRequest? {

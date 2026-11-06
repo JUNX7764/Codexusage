@@ -336,7 +336,6 @@ struct UsageData {
     var tokens30d: TokenScanner.Stats?
     var externalTools: [String: [ExternalTokenScanner.Stats]] = [:]
     var sourceStatus: [String: UsageSourceStatus] = [:]
-    var sourceLastOK: [String: Date] = [:]
     var official: OfficialUsageSnapshot?
     var officialError: String?
     var extToday: ExternalTokenScanner.Stats?    // 外部用量（OpenAI 模型 · 非 Codex CLI）
@@ -2088,9 +2087,6 @@ struct UsagePanelModel {
     var official: OfficialUsageSnapshot?
     var officialError: String?
     var tools: [[(name: String, total: Double?, input: Double?, output: Double?, status: UsageSourceStatus)]]
-    var sourceStatus: [String: UsageSourceStatus]
-    var sourceLastOK: [String: Date]
-    var demoComparisons: Bool
     var notices: [Notice]
     var lastAttempt: String
     var version: String
@@ -2489,16 +2485,44 @@ private final class PanelDisclosureButton: NSButton {
     }
 }
 
+private final class ToolPeriodButton: NSButton {
+    private let selectedPeriod: Bool
+    override var acceptsFirstResponder: Bool { true }
+    override var wantsUpdateLayer: Bool { true }
+    init(title: String, index: Int, selected: Bool, target: AnyObject, action: Selector) {
+        selectedPeriod = selected
+        super.init(frame: .zero)
+        self.title = title; tag = index; self.target = target; self.action = action
+        isBordered = false; wantsLayer = true; layer?.cornerRadius = 5
+        translatesAutoresizingMaskIntoConstraints = false
+        font = .systemFont(ofSize: 10, weight: selected ? .semibold : .regular)
+        contentTintColor = selected ? PanelAccent.codex.color : .secondaryLabelColor
+        setAccessibilityRole(.radioButton)
+        setAccessibilityLabel("工具明细，\(title)")
+        setAccessibilityValue(selected ? 1 : 0)
+        widthAnchor.constraint(equalToConstant: index == 2 ? 42 : 37).isActive = true
+        heightAnchor.constraint(equalToConstant: 24).isActive = true
+    }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = selectedPeriod ? PanelAccent.codex.color.withAlphaComponent(0.14).cgColor : NSColor.clear.cgColor
+        }
+    }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49 || event.keyCode == 36 { performClick(nil) } else { super.keyDown(with: event) }
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 final class UsagePanelController: NSObject, NSPopoverDelegate {
     var onCheckUpdate: (() -> Void)?
     var onUseReset: (() -> Void)?
     private var codexExpanded = true
     private var externalExpanded = false
+    private var dailyExpanded = true
     private var toolPeriod = 0
-    private var scopeExpanded = false
     private var savedScrollOrigin = NSPoint.zero
     private var expandedCodexBuckets: Set<Int> = []
-    private var expandedExternalBuckets: Set<Int> = []
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
     var previewWidth: CGFloat?
@@ -2674,19 +2698,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         addContentRow(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
             expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
             bucketAction: #selector(toggleCodexBucket(_:))))
-        if codexExpanded {
-            let scope = NSButton(title: "统计范围", target: self, action: #selector(toggleScope))
-            scope.isBordered = false; scope.contentTintColor = .secondaryLabelColor
-            scope.font = .systemFont(ofSize: 10); scope.alignment = .left
-            scope.toolTip = "查看本机统计来源及读取状态"; addContentRow(scope)
-            if scopeExpanded {
-                let lines = ["本机 OpenAI 模型记录，可能包含 API、不同账号，不能证明订阅归属。", "Codex JSONL / zstd；Proma 会话；Claude Code OpenAI 模型；Hermes SQLite 差分。", "Hermes 历史日期可能为推定；未发现不代表未安装。"]
-                    + model.sourceStatus.keys.sorted().map { name in
-                        "\(name)：\(model.sourceStatus[name]!.text) · 最后成功 \(model.sourceLastOK[name].map { Fmt.dayTime($0) } ?? "--")"
-                    }
-                addContentRow(PanelUI.label(lines.joined(separator: "\n"), size: 10, color: .secondaryLabelColor))
-            }
-        }
         addContentRow(makeDailySection(model))
         addContentRow(makeToolSection(model))
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
@@ -2697,31 +2708,42 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         let root = PanelUI.stack(spacing: 4)
         let heading = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
         heading.addArrangedSubview(PanelUI.symbol("chart.bar.fill", size: 14, color: PanelAccent.codex.color))
-        let title = PanelUI.label("每日用量", size: 12, weight: .semibold)
+        let title = PanelDisclosureButton(title: "用量简析", target: self, action: #selector(toggleDaily))
+        title.isBordered = false; title.font = .systemFont(ofSize: 12, weight: .semibold); title.contentTintColor = .labelColor
+        title.setAccessibilityLabel(dailyExpanded ? "收起用量简析" : "展开用量简析")
         title.toolTip = "官方账号累计和每日 Token；覆盖范围与源时区尚未确认"
         heading.addArrangedSubview(title); heading.addArrangedSubview(PanelUI.spacer())
+        let toggle = PanelDisclosureButton(image: NSImage(systemSymbolName: dailyExpanded ? "chevron.up" : "chevron.down", accessibilityDescription: "用量简析")!, target: self, action: #selector(toggleDaily))
+        toggle.isBordered = false; toggle.contentTintColor = .secondaryLabelColor
+        toggle.setAccessibilityLabel(dailyExpanded ? "收起用量简析" : "展开用量简析")
+        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        toggle.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        heading.addArrangedSubview(toggle)
         PanelUI.addFullWidth(heading, to: root)
+        guard dailyExpanded else { return root }
         let total = PanelUI.label(Fmt.tokensAbbr(model.official?.lifetime), size: 19, weight: .semibold, monospacedDigits: true)
         total.toolTip = model.official?.lifetime.map { String(format: "%.0f Token", $0) } ?? "暂无累计数据"
-        PanelUI.addFullWidth(total, to: root)
-        PanelUI.addFullWidth(PanelUI.label("累计 Token", size: 10, color: .secondaryLabelColor), to: root)
+        let totalRow = PanelUI.stack(orientation: .horizontal, alignment: .firstBaseline, spacing: 7)
+        totalRow.addArrangedSubview(total)
+        totalRow.addArrangedSubview(PanelUI.label("累计 Token", size: 10, color: .secondaryLabelColor, wrapping: false))
+        totalRow.addArrangedSubview(PanelUI.spacer())
+        PanelUI.addFullWidth(totalRow, to: root)
         PanelUI.addFullWidth(DailyUsageChart(snapshot: model.official), to: root)
         let end = model.official?.days.keys.sorted().last.map { String($0.suffix(5)) } ?? "--"
         PanelUI.addFullWidth(PanelUI.label("近 30 天 · 截至 \(end)", size: 10, color: .secondaryLabelColor), to: root)
         let comparison = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
         comparison.wantsLayer = true; comparison.layer?.cornerRadius = 6
         comparison.layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.09).cgColor
-        let compared = UsageComparison.calculate(snapshot: model.official, semanticsConfirmed: model.demoComparisons, now: Date())
+        let compared = UsageComparison.evaluate(snapshot: model.official, now: Date())
         func comparisonColor(_ value: UsageComparison.Value) -> NSColor {
             if case .percent(let amount) = value { return amount < 0 ? .systemGreen : PanelAccent.codex.color }
             if case .fromZero = value { return PanelAccent.codex.color }
             return .secondaryLabelColor
         }
-        let left = PanelUI.label("较昨日  " + compared.0.text, size: 11, color: comparisonColor(compared.0), wrapping: false)
-        let right = PanelUI.label("较前7天  " + compared.1.text, size: 11, color: comparisonColor(compared.1), wrapping: false)
-        let descriptions = UsageComparison.descriptions(snapshot: model.official, semanticsConfirmed: model.demoComparisons)
-        left.toolTip = descriptions.0; right.toolTip = descriptions.1
-        left.setAccessibilityHelp(descriptions.0); right.setAccessibilityHelp(descriptions.1)
+        let left = PanelUI.label("较昨日  " + compared.0.value.text, size: 11, color: comparisonColor(compared.0.value), wrapping: false)
+        let right = PanelUI.label("较前7天  " + compared.1.value.text, size: 11, color: comparisonColor(compared.1.value), wrapping: false)
+        left.toolTip = compared.0.description; right.toolTip = compared.1.description
+        left.setAccessibilityHelp(compared.0.description); right.setAccessibilityHelp(compared.1.description)
         left.alignment = .center; right.alignment = .center
         left.setContentHuggingPriority(.init(1), for: .horizontal)
         right.setContentHuggingPriority(.init(1), for: .horizontal)
@@ -2741,21 +2763,27 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private func makeToolSection(_ model: UsagePanelModel) -> NSView {
         let root = PanelUI.stack(spacing: 5)
-        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
         header.addArrangedSubview(PanelUI.symbol("list.bullet", size: 14, color: PanelAccent.codex.color))
-        header.addArrangedSubview(PanelUI.label("工具明细", size: 12, weight: .semibold))
+        let title = PanelDisclosureButton(title: "工具明细", target: self, action: #selector(toggleExternal))
+        title.isBordered = false; title.font = .systemFont(ofSize: 12, weight: .semibold); title.contentTintColor = .labelColor
+        title.setAccessibilityLabel(externalExpanded ? "收起工具明细" : "展开工具明细")
+        header.addArrangedSubview(title)
         header.addArrangedSubview(PanelUI.spacer())
-        header.addArrangedSubview(PanelUI.symbol(externalExpanded ? "chevron.up" : "chevron.down", size: 11))
-        let toggle = PanelDisclosureButton(title: "", target: self, action: #selector(toggleExternal))
-        toggle.isBordered = false; toggle.translatesAutoresizingMaskIntoConstraints = false
+        if externalExpanded {
+            for (index, label) in ["今天", "7天", "30天"].enumerated() {
+                header.addArrangedSubview(ToolPeriodButton(title: label, index: index, selected: index == toolPeriod,
+                                                          target: self, action: #selector(selectToolPeriod(_:))))
+            }
+        }
+        let toggle = PanelDisclosureButton(image: NSImage(systemSymbolName: externalExpanded ? "chevron.up" : "chevron.down", accessibilityDescription: "工具明细")!, target: self, action: #selector(toggleExternal))
+        toggle.isBordered = false; toggle.contentTintColor = .secondaryLabelColor
         toggle.setAccessibilityLabel(externalExpanded ? "收起工具明细" : "展开工具明细")
-        toggle.addSubview(header); PanelUI.pin(header, to: toggle)
-        toggle.heightAnchor.constraint(greaterThanOrEqualToConstant: 24).isActive = true
-        PanelUI.addFullWidth(toggle, to: root)
+        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        toggle.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        header.addArrangedSubview(toggle)
+        PanelUI.addFullWidth(header, to: root)
         guard externalExpanded else { return root }
-        let segment = NSSegmentedControl(labels: ["今天", "7 天", "30 天"], trackingMode: .selectOne, target: self, action: #selector(selectToolPeriod(_:)))
-        segment.selectedSegment = toolPeriod
-        PanelUI.addFullWidth(segment, to: root)
         let items = model.tools[toolPeriod]
         let total = items.reduce(0.0) { $0 + ($1.total ?? 0) }
         if !items.contains(where: { ($0.total ?? 0) > 0 }) {
@@ -2774,7 +2802,18 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         return root
     }
-    @objc private func selectToolPeriod(_ sender: NSSegmentedControl) { toolPeriod = sender.selectedSegment; refreshPanelLayout() }
+    @objc private func selectToolPeriod(_ sender: NSButton) {
+        guard (0..<3).contains(sender.tag) else { return }
+        let restoreFocus = sender.window?.firstResponder === sender
+        toolPeriod = sender.tag
+        refreshPanelLayout()
+        if restoreFocus {
+            func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+            if let button = descendants(stack).compactMap({ $0 as? ToolPeriodButton }).first(where: { $0.tag == toolPeriod }) {
+                button.window?.makeFirstResponder(button)
+            }
+        }
+    }
 
     private func refreshPanelLayout() {
         // 就地重建时保持滚动位置并禁用隐式动画：每 10s 后台刷新重建面板内容不打扰阅读（KimiUsage 同款）
@@ -2791,15 +2830,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         CATransaction.commit()
     }
-    @objc private func toggleScope() { scopeExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleCodex() { codexExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleExternal() { externalExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleDaily() { dailyExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleCodexBucket(_ sender: NSButton) {
         expandedCodexBuckets = toggledBucket(sender.tag, expanded: expandedCodexBuckets)
-        refreshPanelLayout()
-    }
-    @objc private func toggleExternalBucket(_ sender: NSButton) {
-        expandedExternalBuckets = toggledBucket(sender.tag, expanded: expandedExternalBuckets)
         refreshPanelLayout()
     }
     private func toggledBucket(_ index: Int, expanded: Set<Int>) -> Set<Int> {
@@ -2910,13 +2945,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     func expandToolsForPreview() { externalExpanded = true }
+    func collapseDailyForPreview() { dailyExpanded = false }
     func expandAllTokenBucketsForPreview() {
         expandedCodexBuckets = [0, 1, 2]
-        expandedExternalBuckets = [0, 1, 2]
         refreshPanelLayout()
     }
 
-    /// 面板事件回归：逐一点击两个板块的三个周期行，并核对真实明细行数量与刷新后的状态。
+    /// 面板事件回归：核对模型行、工具周期和简析开合状态。
     func verifyTokenBucketInteractionsForPreview() -> Bool {
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         func rows() -> [TokenBucketRow] {
@@ -2935,9 +2970,35 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         update(model: model)
         guard expandedCodexBuckets == [0, 2] else { return false }
         toggleExternal()
-        guard externalExpanded, let segment = descendants(stack).compactMap({ $0 as? NSSegmentedControl }).first else { return false }
-        segment.selectedSegment = 2; selectToolPeriod(segment)
-        return toolPeriod == 2 && externalExpanded
+        func periods() -> [ToolPeriodButton] { descendants(stack).compactMap { $0 as? ToolPeriodButton }.sorted { $0.tag < $1.tag } }
+        guard externalExpanded, periods().count == 3 else { return false }
+        periods()[2].performClick(nil)
+        guard toolPeriod == 2, externalExpanded, expandedCodexBuckets == [0, 2], periods()[2].accessibilityValue() as? Int == 1 else { return false }
+        guard window.makeFirstResponder(periods()[1]) else { return false }
+        window.sendEvent(space)
+        guard toolPeriod == 1, externalExpanded, expandedCodexBuckets == [0, 2] else { return false }
+        toggleExternal()
+        guard !externalExpanded, periods().isEmpty, toolPeriod == 1 else { return false }
+        toggleExternal()
+        guard externalExpanded, periods().count == 3, periods()[1].accessibilityValue() as? Int == 1 else { return false }
+        func dailyButtons() -> [PanelDisclosureButton] {
+            descendants(stack).compactMap { $0 as? PanelDisclosureButton }.filter { $0.action == #selector(toggleDaily) }
+        }
+        guard dailyButtons().count == 2 else { return false }
+        dailyButtons()[0].performClick(nil)
+        guard !dailyExpanded, descendants(stack).compactMap({ $0 as? DailyUsageChart }).isEmpty else { return false }
+        update(model: model)
+        guard !dailyExpanded, toolPeriod == 1, externalExpanded, expandedCodexBuckets == [0, 2], dailyButtons().count == 2 else { return false }
+        guard window.makeFirstResponder(dailyButtons()[1]) else { return false }
+        window.sendEvent(space)
+        return dailyExpanded && descendants(stack).compactMap({ $0 as? DailyUsageChart }).count == 1
+    }
+
+    func prepareReopenStateForPreview() { if dailyExpanded { toggleDaily() } }
+    func verifyReopenStateForPreview() -> Bool {
+        let intact = !dailyExpanded && externalExpanded && toolPeriod == 1 && expandedCodexBuckets == [0, 2]
+        if !dailyExpanded { toggleDaily() }
+        return intact
     }
 
     func verifyChartInteractionsForPreview() -> Bool {
@@ -2955,6 +3016,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         guard move(0), chart.selectedTextForPreview.contains("暂无数据"),
               move(1), chart.selectedTextForPreview.contains("0 Token"),
+              move(2), chart.selectedTextForPreview.contains("无活动记录"),
               move(29), chart.selectedTextForPreview.contains("Token") else { return false }
         guard window.makeFirstResponder(chart), let key = NSEvent.keyEvent(with: .keyDown, location: .zero,
                 modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
@@ -3474,8 +3536,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if arguments.contains("--visual-preview-events") || arguments.contains("--visual-preview-hover-fixture") {
             let ordered = demoDays.keys.sorted(); demoDays.removeValue(forKey: ordered[0]); demoDays[ordered[1]] = 0
+            demoDays.removeValue(forKey: ordered[2])
         }
-        usage.official = OfficialUsageSnapshot(lifetime: 2_400_000_000, days: demoDays, fetchedAt: Date())
+        usage.official = OfficialUsageSnapshot(lifetime: 3_180_000_000, days: demoDays, fetchedAt: Date(),
+            sparsePolicy: arguments.contains("--visual-preview-events") || arguments.contains("--visual-preview-hover-fixture") ? .officialActivity : .unknown)
         usage.externalTools["Proma"] = [usage.extToday!, usage.ext7d!, usage.ext30d!]
         usage.sourceStatus = ["Codex": .available, "Proma": .available, "Claude Code": .absent, "Hermes": .absent]
         if arguments.contains("--visual-preview-pro") { usage.planType = "pro"; usage.fiveHour = nil; usage.fiveHourNotApplicable = true }
@@ -3525,6 +3589,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panelController.expandAllTokenBucketsForPreview()
         }
         if arguments.contains("--visual-preview-tools") { panelController.expandToolsForPreview() }
+        if arguments.contains("--visual-preview-daily-collapsed") { panelController.collapseDailyForPreview() }
 
         rebuildMenu()
         renderBar()
@@ -3581,6 +3646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return fail("token bucket expansion, collapse, or refresh state failed")
         }
         guard panelController.verifyChartInteractionsForPreview() else { return fail("chart hover or keyboard navigation failed") }
+        panelController.prepareReopenStateForPreview()
         guard let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
             timestamp: 0, windowNumber: panelController.previewWindowNumber, context: nil, characters: "\u{1b}",
             charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53) else {
@@ -3593,6 +3659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let button = self.statusItem.button else { return fail("status button missing") }
             self.panelController.toggle(anchoredTo: button)
             guard self.panelController.isOpen else { return fail("panel did not reopen") }
+            guard self.panelController.verifyReopenStateForPreview() else { return fail("section or period state lost after reopen") }
             guard let outside = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero,
                 modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
                 eventNumber: 0, clickCount: 1, pressure: 1) else {
@@ -3774,7 +3841,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // （30 分钟后现有 ⚠ 过期标注自动亮起），并显示错误行
     private func applyExternal(_ r: ExternalTokenScanner.Result) {
         usage.sourceStatus = r.sourceStatus
-        for (name, status) in r.sourceStatus where status == .available { usage.sourceLastOK[name] = Date() }
         if let e = r.error {
             usage.extError = e
         } else {
@@ -4160,8 +4226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let quitItem = NSMenuItem(title: "退出", action: #selector(onQuit), keyEquivalent: "q")
         quitItem.target = self
 
-        let displayVersion = visualPreview && CommandLine.arguments.contains("--visual-preview-narrow")
-            ? "v1.0.4-12-g1234567" : BuildInfo.version
+        let displayVersion = BuildInfo.version
         let model = UsagePanelModel(
             updateItem: updateItem,
             title: "Codex 用量", plan: usage.planType?.uppercased(),
@@ -4188,7 +4253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let left = $0.total ?? -1, right = $1.total ?? -1
                     return left == right ? (order[$0.name] ?? 99) < (order[$1.name] ?? 99) : left > right
                 }
-            }, sourceStatus: usage.sourceStatus.merging(["Codex": usage.tokensError == nil ? (usage.tokensToday == nil ? .pending : .available) : .failed]) { _, new in new }, sourceLastOK: usage.sourceLastOK.merging(tokensLastOK.map { ["Codex": $0] } ?? [:]) { _, new in new }, demoComparisons: visualPreview && usage.official != nil,
+            },
             notices: globalNotices,
             lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))",
             version: "版本 \(displayVersion)",
@@ -4436,24 +4501,41 @@ enum CodexOfflineRegression {
                 let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(secondsFromGMT: 0)!; f.dateFormat = "yyyy-MM-dd"
                 return (f.string(from: Date(timeIntervalSince1970: 1_793_836_800 - Double(i) * 86400)), Double(i == 0 ? 118 : (i == 1 ? 100 : (i < 7 ? 88 : 100))))
             }), fetchedAt: compareNow)
-            let descriptions = UsageComparison.descriptions(snapshot: complete, semanticsConfirmed: true)
-            try expect(descriptions.0.contains("2026-11-05 对比 2026-11-04") && descriptions.0.contains("官方账号用量"), "daily comparison dates or source incorrect")
-            try expect(descriptions.1.contains("2026-10-30 至 2026-11-05") && descriptions.1.contains("2026-10-23 至 2026-10-29"), "weekly comparison ranges incorrect")
-            let uncertain = UsageComparison.descriptions(snapshot: complete, semanticsConfirmed: false)
-            try expect(uncertain.0.contains("尚未确认") && uncertain.1.contains("尚未确认"), "unconfirmed date semantics not explained")
+            let comparisons = UsageComparison.evaluate(snapshot: complete, now: compareNow)
+            try expect(comparisons.0.value.text == "+18%" && comparisons.1.value.text == "−6%", "complete comparison mismatch")
+            try expect(comparisons.0.description.contains("2026-11-05 对比 2026-11-04") && comparisons.0.description.contains("官方账号用量"), "daily range or source incorrect")
+            try expect(comparisons.1.description.contains("2026-10-30 至 2026-11-05") && comparisons.1.description.contains("2026-10-23 至 2026-10-29"), "weekly range incorrect")
             let yearBoundary = OfficialUsageSnapshot(lifetime: nil, days: ["2026-01-02": 1], fetchedAt: compareNow)
-            let boundaryDescriptions = UsageComparison.descriptions(snapshot: yearBoundary, semanticsConfirmed: false)
-            try expect(boundaryDescriptions.0.contains("2026-01-02 对比 2026-01-01")
-                       && boundaryDescriptions.1.contains("2025-12-27 至 2026-01-02")
-                       && boundaryDescriptions.1.contains("2025-12-20 至 2025-12-26"), "cross-year comparison dates incorrect")
-            let noDate = UsageComparison.descriptions(snapshot: nil, semanticsConfirmed: false)
-            try expect(noDate.0.contains("暂无源日期") && noDate.1.contains("尚未确认"), "missing source date not explained")
-            let comparisons = UsageComparison.calculate(snapshot: complete, semanticsConfirmed: true, now: compareNow)
-            try expect(comparisons.0.text == "+18%" && comparisons.1.text == "−6%", "complete comparison mismatch")
-            try expect(UsageComparison.calculate(snapshot: complete, semanticsConfirmed: false, now: compareNow).0 == .insufficient, "unconfirmed dates produced percentage")
-            try expect(UsageComparison.calculate(snapshot: complete, semanticsConfirmed: true, now: compareNow.addingTimeInterval(1801)).1 == .insufficient, "stale comparison allowed")
-            var missingDays = complete; missingDays.days.removeValue(forKey: missingDays.days.keys.sorted().first!)
-            try expect(UsageComparison.calculate(snapshot: missingDays, semanticsConfirmed: true, now: compareNow).1 == .insufficient, "incomplete weekly window allowed")
+            let boundary = UsageComparison.evaluate(snapshot: yearBoundary, now: compareNow)
+            try expect(boundary.0.description.contains("2026-01-02 对比 2026-01-01") && boundary.1.description.contains("2025-12-20 至 2025-12-26"), "cross-year dates incorrect")
+            let noDate = UsageComparison.evaluate(snapshot: nil, now: compareNow)
+            try expect(noDate.0.value == .insufficient && noDate.0.description.contains("尚未取得"), "missing source not explained")
+            let stale = UsageComparison.evaluate(snapshot: complete, now: compareNow.addingTimeInterval(1801))
+            try expect(stale.1.value == .insufficient && stale.1.description.contains("已过期"), "stale comparison allowed")
+            var missingDays = complete
+            missingDays.days.removeValue(forKey: "2026-10-25")
+            let unknownSparse = UsageComparison.evaluate(snapshot: missingDays, now: compareNow)
+            try expect(unknownSparse.0.value == comparisons.0.value && unknownSparse.1.value == .insufficient
+                       && unknownSparse.1.description.contains("2026-10-25"), "unknown sparse date or independent windows wrong")
+            missingDays.sparsePolicy = .officialActivity
+            let officialSparse = UsageComparison.evaluate(snapshot: missingDays, now: compareNow)
+            try expect(officialSparse.0.value == comparisons.0.value && officialSparse.1.value != .insufficient
+                       && officialSparse.1.description.contains("按 0"), "official sparse date not counted as zero")
+            try expect(missingDays.day("2026-10-25") == .inferredZero && missingDays.day("2026-10-22") == .missing
+                       && missingDays.day("2026-11-06") == .missing, "sparse date bounds wrong")
+            var outside = missingDays; outside.days.removeValue(forKey: "2026-10-23")
+            let outsideResult = UsageComparison.evaluate(snapshot: outside, now: compareNow)
+            try expect(outsideResult.0.value == comparisons.0.value && outsideResult.1.value == .insufficient
+                       && outsideResult.1.description.contains("2026-10-23"), "out-of-range date was invented")
+            var explicitZero = complete; explicitZero.days["2026-11-04"] = 0
+            try expect(UsageComparison.evaluate(snapshot: explicitZero, now: compareNow).0.value == .fromZero(118), "zero-base comparison incorrect")
+            let emptyOfficial = OfficialUsageReader.parse(["stats": ["lifetime_tokens": 42, "daily_usage_buckets": []]])
+            try expect(emptyOfficial?.day("2026-11-05") == .missing, "empty official days were fabricated")
+            try expect(OfficialUsageReader.parse(["metadata": ["stats_error": "failure"], "stats": ["daily_usage_buckets": [["start_date": "2026-11-05", "tokens": 1]]]]) == nil,
+                       "failed stats exposed sparse policy")
+            let nativeSparse = OfficialUsageReader.parse(["stats": ["daily_usage_buckets": [["start_date": "2026-11-03", "tokens": 0], ["start_date": "2026-11-05", "tokens": 5]]]])
+            try expect(nativeSparse?.day("2026-11-03") == .reported(0) && nativeSparse?.day("2026-11-04") == .inferredZero && nativeSparse?.day("2026-11-02") == .missing,
+                       "native sparse, explicit zero, or range semantics incorrect")
 
             let now = Date(timeIntervalSince1970: 1_800_000_000)
             var calendar = Calendar(identifier: .gregorian)
@@ -5497,7 +5579,10 @@ func onceMode() {
 
 if CommandLine.arguments.contains("--official-usage-check") {
     switch OfficialUsageReader.read(expected: CodexAuth.load()) {
-    case .success: print("official usage: success (values withheld)"); exit(0)
+    case .success(let snapshot):
+        let comparison = UsageComparison.evaluate(snapshot: snapshot, now: Date())
+        print("official usage: success; dailyComparisonReady=\(comparison.0.value != .insufficient); weeklyComparisonReady=\(comparison.1.value != .insufficient) (values withheld)")
+        exit(0)
     case .failure(let failure): print("official usage: \(failure)"); exit(1)
     }
 }
