@@ -2719,7 +2719,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         let left = PanelUI.label("较昨日  " + compared.0.text, size: 11, color: comparisonColor(compared.0), wrapping: false)
         let right = PanelUI.label("较前7天  " + compared.1.text, size: 11, color: comparisonColor(compared.1), wrapping: false)
-        left.toolTip = "截至 \(end) 的当日与前一源日期比较"; right.toolTip = "截至 \(end) 的 7 日与之前 7 日比较"
+        let descriptions = UsageComparison.descriptions(snapshot: model.official, semanticsConfirmed: model.demoComparisons)
+        left.toolTip = descriptions.0; right.toolTip = descriptions.1
+        left.setAccessibilityHelp(descriptions.0); right.setAccessibilityHelp(descriptions.1)
         left.alignment = .center; right.alignment = .center
         left.setContentHuggingPriority(.init(1), for: .horizontal)
         right.setContentHuggingPriority(.init(1), for: .horizontal)
@@ -2756,6 +2758,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         PanelUI.addFullWidth(segment, to: root)
         let items = model.tools[toolPeriod]
         let total = items.reduce(0.0) { $0 + ($1.total ?? 0) }
+        if !items.contains(where: { ($0.total ?? 0) > 0 }) {
+            PanelUI.addFullWidth(PanelUI.label("该周期暂无可统计用量", size: 11, color: .secondaryLabelColor), to: root)
+        }
         for item in items where (item.total ?? 0) > 0 || item.status == .failed {
             let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
             let name = PanelUI.label(item.name, size: 11, wrapping: false); name.widthAnchor.constraint(equalToConstant: 76).isActive = true
@@ -3510,6 +3515,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             resetCardsLastOK = now - 3_600
             tiboLastOK = now - 3_600
             extLastOK = now - 3_600
+        }
+        if arguments.contains("--visual-preview-empty-failure") {
+            usage.tokensError = "会话目录读取失败"
+            usage.sourceStatus["Proma"] = .failed
+            usage.externalTools = [:]
         }
         if arguments.contains("--visual-preview-models") {
             panelController.expandAllTokenBucketsForPreview()
@@ -4426,6 +4436,18 @@ enum CodexOfflineRegression {
                 let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(secondsFromGMT: 0)!; f.dateFormat = "yyyy-MM-dd"
                 return (f.string(from: Date(timeIntervalSince1970: 1_793_836_800 - Double(i) * 86400)), Double(i == 0 ? 118 : (i == 1 ? 100 : (i < 7 ? 88 : 100))))
             }), fetchedAt: compareNow)
+            let descriptions = UsageComparison.descriptions(snapshot: complete, semanticsConfirmed: true)
+            try expect(descriptions.0.contains("2026-11-05 对比 2026-11-04") && descriptions.0.contains("官方账号用量"), "daily comparison dates or source incorrect")
+            try expect(descriptions.1.contains("2026-10-30 至 2026-11-05") && descriptions.1.contains("2026-10-23 至 2026-10-29"), "weekly comparison ranges incorrect")
+            let uncertain = UsageComparison.descriptions(snapshot: complete, semanticsConfirmed: false)
+            try expect(uncertain.0.contains("尚未确认") && uncertain.1.contains("尚未确认"), "unconfirmed date semantics not explained")
+            let yearBoundary = OfficialUsageSnapshot(lifetime: nil, days: ["2026-01-02": 1], fetchedAt: compareNow)
+            let boundaryDescriptions = UsageComparison.descriptions(snapshot: yearBoundary, semanticsConfirmed: false)
+            try expect(boundaryDescriptions.0.contains("2026-01-02 对比 2026-01-01")
+                       && boundaryDescriptions.1.contains("2025-12-27 至 2026-01-02")
+                       && boundaryDescriptions.1.contains("2025-12-20 至 2025-12-26"), "cross-year comparison dates incorrect")
+            let noDate = UsageComparison.descriptions(snapshot: nil, semanticsConfirmed: false)
+            try expect(noDate.0.contains("暂无源日期") && noDate.1.contains("尚未确认"), "missing source date not explained")
             let comparisons = UsageComparison.calculate(snapshot: complete, semanticsConfirmed: true, now: compareNow)
             try expect(comparisons.0.text == "+18%" && comparisons.1.text == "−6%", "complete comparison mismatch")
             try expect(UsageComparison.calculate(snapshot: complete, semanticsConfirmed: false, now: compareNow).0 == .insufficient, "unconfirmed dates produced percentage")

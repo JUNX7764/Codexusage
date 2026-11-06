@@ -18,6 +18,29 @@ enum UsageComparison {
         if current == prior { return .unchanged }
         return .percent((current - prior) / prior * 100)
     }
+    /// The source date is a calendar label; UTC is used only for date arithmetic.
+    static func descriptions(snapshot: OfficialUsageSnapshot?, semanticsConfirmed: Bool) -> (String, String) {
+        let source = "来源：官方账号用量"
+        let caveat = semanticsConfirmed ? "" : "；源日期时区及缺失日期含义尚未确认"
+        guard let end = snapshot?.days.keys.sorted().last else {
+            let text = source + "；暂无源日期" + caveat
+            return (text, text)
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)!
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.dateFormat = "yyyy-MM-dd"; formatter.isLenient = false
+        guard let date = formatter.date(from: end), formatter.string(from: date) == end else {
+            let text = source + "；源日期无效" + caveat
+            return (text, text)
+        }
+        func day(_ offset: Int) -> String {
+            formatter.string(from: date.addingTimeInterval(-Double(offset) * 86400))
+        }
+        return ("\(source)；\(day(0)) 对比 \(day(1))\(caveat)",
+                "\(source)；\(day(6)) 至 \(day(0)) 对比 \(day(13)) 至 \(day(7))\(caveat)")
+    }
     static func calculate(snapshot: OfficialUsageSnapshot?, semanticsConfirmed: Bool, now: Date) -> (Value, Value) {
         guard semanticsConfirmed, let snapshot = snapshot, now.timeIntervalSince(snapshot.fetchedAt) <= 1800,
               now >= snapshot.fetchedAt, let end = snapshot.days.keys.sorted().last else { return (.insufficient, .insufficient) }

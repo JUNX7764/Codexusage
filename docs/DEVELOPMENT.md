@@ -58,6 +58,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-narrow
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-pro
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-tools
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-empty --visual-preview-empty-failure --visual-preview-tools
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-models
 ```
 
