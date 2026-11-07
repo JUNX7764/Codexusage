@@ -27,7 +27,12 @@ INSTALLED="$2"
 INSTALLED="$(cd "$(dirname "$INSTALLED")" && pwd -P)/${APP_NAME}"
 BINARY="${INSTALLED}/Contents/MacOS/${EXECUTABLE}"
 [ -x "$BINARY" ] || { echo "!! 当前应用缺少可执行文件"; exit 1; }
-TMP="$(mktemp -d)"
+# 从下载目录直接运行的应用会被 Gatekeeper 挂载到只读的 App Translocation 位置，
+# 暂存与换包必然失败；在联网下载前就给出可操作的指引。
+case "$INSTALLED" in
+    *"/AppTranslocation/"*) echo "!! ${APP_NAME} 正在从临时位置运行（App Translocation），无法原地更新。请退出应用，把它拖入「应用程序」文件夹后重新打开再更新"; exit 1 ;;
+esac
+TMP="$(mktemp -d)" || { echo "!! 无法创建下载临时目录，已中止"; exit 1; }
 
 # 仅匹配实际可执行路径；遇到同名的其他副本时中止，绝不按名称杀进程。
 processes() { ps -axo pid=,comm=; }
@@ -64,9 +69,9 @@ JXA
 
 start_and_wait() {
     if [ "$AGENT" = 1 ]; then
-        launchctl bootstrap "gui/${MYUID}" "$AGENT_PLIST"
+        launchctl bootstrap "gui/${MYUID}" "$AGENT_PLIST" || { echo "!! LaunchAgent 加载失败，无法启动应用"; return 1; }
     else
-        open -n "$INSTALLED"
+        open -n "$INSTALLED" || { echo "!! 应用启动命令失败"; return 1; }
     fi
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         if [ -n "$(target_pids)" ]; then
@@ -189,7 +194,10 @@ if ! (cd "$TMP" && shasum -a 256 -c CodexUsage.zip.sha256); then
     echo "!! 发布包 SHA256 校验失败，已中止"
     exit 1
 fi
-unzip -q -o "${TMP}/CodexUsage.zip" -d "$TMP"
+if ! unzip -q -o "${TMP}/CodexUsage.zip" -d "$TMP"; then
+    echo "!! 发布包解压失败，已中止"
+    exit 1
+fi
 NEW_APP="${TMP}/${APP_NAME}"
 NEW_BINARY="${NEW_APP}/Contents/MacOS/${EXECUTABLE}"
 if [ ! -x "$NEW_BINARY" ]; then
@@ -207,8 +215,14 @@ for bundle in "$NEW_APP" "$INSTALLED"; do
 done
 OLD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${INSTALLED}/Contents/Info.plist")" || { echo "!! 当前应用缺少构建版本"; exit 1; }
 [ "$(version_newer "$NEW_VERSION" "$OLD_VERSION")" = yes ] || { echo "!! 目标版本必须高于当前应用"; exit 1; }
-codesign --verify --deep --strict "$NEW_APP"
-"$NEW_BINARY" --self-test
+if ! codesign --verify --deep --strict "$NEW_APP"; then
+    echo "!! 新版本签名校验未通过，已中止"
+    exit 1
+fi
+if ! "$NEW_BINARY" --self-test; then
+    echo "!! 新版本离线自检未通过，已中止"
+    exit 1
+fi
 
 if other_copy_running; then
     echo "!! 检测到另一应用副本正在运行，已中止"
@@ -224,12 +238,15 @@ if JOB_INFO="$(launchctl print "gui/${MYUID}/${LABEL}" 2>/dev/null)"; then
 fi
 
 echo "==> 3/5 在安装位置旁暂存新版本"
-WORK="$(mktemp -d "$(dirname "$INSTALLED")/.${APP_NAME}.update.XXXXXX")"
+WORK="$(mktemp -d "$(dirname "$INSTALLED")/.${APP_NAME}.update.XXXXXX")" || { echo "!! 无法在应用旁创建暂存目录（磁盘空间或位置权限不足），已中止"; exit 1; }
 STAGE="${WORK}/new/${APP_NAME}"
 BACKUP="${WORK}/old/${APP_NAME}"
 mkdir -p "$(dirname "$STAGE")" "$(dirname "$BACKUP")"
-cp -R "$NEW_APP" "$STAGE"
-[ -x "${STAGE}/Contents/MacOS/${EXECUTABLE}" ]
+if ! cp -R "$NEW_APP" "$STAGE"; then
+    echo "!! 暂存新版本失败（磁盘空间或权限不足），已中止"
+    exit 1
+fi
+[ -x "${STAGE}/Contents/MacOS/${EXECUTABLE}" ] || { echo "!! 暂存后的新版本内容异常，已中止"; exit 1; }
 
 echo "==> 4/5 停止 ${LABEL} 并切换版本"
 if [ "$AGENT" = 1 ]; then
@@ -246,7 +263,10 @@ if ! mv "$INSTALLED" "$BACKUP"; then
     echo "!! 无法移动当前应用：macOS 权限或文件占用阻止了替换。旧版本仍保留在 ${INSTALLED}"
     exit 1
 fi
-mv "$STAGE" "$INSTALLED"
+if ! mv "$STAGE" "$INSTALLED"; then
+    echo "!! 新版本移入安装位置失败，将恢复旧版本"
+    exit 1
+fi
 if [ "$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${INSTALLED}/Contents/Info.plist")" != "$NEW_VERSION" ]; then
     echo "!! 安装后的版本校验失败"
     exit 1

@@ -1813,7 +1813,7 @@ final class UpdateProgressController: NSObject {
         }
         if let result = try? String(contentsOf: dir.appendingPathComponent("result"), encoding: .utf8) {
             if result != "0" {
-                let detail = log.components(separatedBy: .newlines).last(where: { $0.contains("!!") }) ?? "请检查网络后重试。"
+                let detail = log.components(separatedBy: .newlines).last(where: { $0.contains("!!") }) ?? "更新未完成，请查看日志。"
                 finishError(detail.replacingOccurrences(of: "!! ", with: ""))
             } else {
                 // 正常路径下旧进程已被脚本替换重启，走不到这里；兜底停止轮询
@@ -4038,7 +4038,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateProgressWasActive = active
             rebuildMenu()
             if !active, UpdateProgressController.shared.phase == .failed {
-                panelController.setUpdateMessage("更新失败，请检查网络后重试", dismissAfter: 8)
+                panelController.setUpdateMessage("更新失败，详见弹窗提示", dismissAfter: 8)
             }
         }
         renderBar()
@@ -4470,6 +4470,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func onUpdateApp() {
         guard !visualPreview else { return }
+        // App Translocation：从下载目录直接运行的应用被挂载到只读位置，原地更新必然失败，
+        // 在发起更新前拦截并给出安装指引，而不是让脚本在暂存阶段报错。
+        if Bundle.main.bundleURL.standardizedFileURL.path.contains("/AppTranslocation/") {
+            let alert = NSAlert()
+            alert.messageText = "无法原地更新"
+            alert.informativeText = "CodexUsage 正在从临时位置运行（App Translocation），无法原地替换。\n请退出应用，把 CodexUsage.app 拖入「应用程序」文件夹后从那里打开。"
+            alert.addButton(withTitle: "好")
+            alert.runModal()
+            return
+        }
         guard let script = Bundle.main.path(forResource: "update", ofType: "sh") else {
             NSWorkspace.shared.open(UpdateCheck.releasesPage); return
         }

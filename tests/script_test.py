@@ -78,6 +78,13 @@ class ScriptTest(unittest.TestCase):
         path.chmod(0o755)
 
     def _write_mocks(self):
+        self._mock("mktemp", r'''
+echo "mktemp $*" >> "$MOCK_LOG"
+if [ "${MOCK_MKTEMP_STAGE_FAIL:-0}" = 1 ]; then
+    case "$*" in *".${MOCK_APP_NAME}.update."*) exit 46 ;; esac
+fi
+exec /usr/bin/mktemp "$@"
+''')
         self._mock("curl", r'''
 echo "curl $*" >> "$MOCK_LOG"
 out=""
@@ -100,6 +107,7 @@ esac
 ''')
         self._mock("unzip", r'''
 echo "unzip $*" >> "$MOCK_LOG"
+if [ "${MOCK_UNZIP_FAIL:-0}" = 1 ]; then exit 48; fi
 if [ "$1" = "-t" ]; then exit 0; fi
 dest=""
 while [ "$#" -gt 0 ]; do
@@ -112,6 +120,9 @@ echo "codesign $*" >> "$MOCK_LOG"
 if [ "${MOCK_CODESIGN_FAIL:-0}" = 1 ]; then
     case " $* " in *" --sign "*) exit 41 ;; esac
 fi
+if [ "${MOCK_CODESIGN_VERIFY_FAIL:-0}" = 1 ]; then
+    case " $* " in *" --verify "*) exit 47 ;; esac
+fi
 exit 0
 ''')
         self._mock("launchctl", r'''
@@ -123,6 +134,7 @@ case "$1" in
         rm -f "$MOCK_STATE"
         ;;
     bootstrap)
+        if [ "${MOCK_BOOTSTRAP_FAIL:-0}" = 1 ]; then exit 49; fi
         if [ "${MOCK_UNHEALTHY_ONCE:-0}" = 1 ] && [ ! -e "$MOCK_UNHEALTHY_MARKER" ]; then
             : > "$MOCK_UNHEALTHY_MARKER"
             exit 0
@@ -250,11 +262,11 @@ exit 0
         self.env.update({"MOCK_AGENT_ACTIVE": "1", "MOCK_PAYLOAD": str(payload), "MOCK_TARGET": str(installed), "MOCK_EXECUTABLE": EXECUTABLE})
         return installed
 
-    def run_update(self, **overrides):
+    def run_update(self, installed=None, **overrides):
         env = self.env.copy()
         env.update(overrides)
         return subprocess.run(
-            ["bash", str(UPDATE), "v2.0.0", str(self.apps / APP_NAME)], env=env, text=True,
+            ["bash", str(UPDATE), "v2.0.0", str(installed or self.apps / APP_NAME)], env=env, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
         )
 
@@ -323,20 +335,75 @@ exit 0
         self.assertFalse(any(line.startswith("mv ") for line in self.log_lines()))
         self.assertTrue(self.state.exists())
 
+    def test_translocated_install_aborts_before_network(self):
+        translocated = self.base / "trans" / "AppTranslocation" / "51B81EF9-6DC0-4347-A923-59C0F946670D" / "d"
+        installed = self.make_app(translocated, "v1.0.0", "old")
+        result = self.run_update(installed=installed)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("App Translocation", result.stdout)
+        self.assertIn("应用程序", result.stdout)
+        self.assertFalse(any(line.startswith("curl") for line in self.log_lines()))
+        self.assertFalse(any(line.startswith("mktemp") for line in self.log_lines()))
+        self.assertEqual(self.marker(installed), "old")
+
     def test_staging_failure_preserves_old_app_and_service(self):
         installed = self.prepare_update()
         result = self.run_update(MOCK_CP_FAIL="1")
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.marker(installed), "old")
+        self.assertIn("暂存新版本失败", result.stdout)
         self.assertFalse(any("bootout" in line for line in self.log_lines()))
         self.assertFalse(any(line.startswith("pkill") for line in self.log_lines()))
         self.assertTrue(self.state.exists())
+
+    def test_staging_mktemp_failure_preserves_old_app_and_reports(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_MKTEMP_STAGE_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("暂存目录", result.stdout)
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+        self.assertTrue(self.state.exists())
+
+    def test_unzip_failure_reports_and_preserves_old_app(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_UNZIP_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("解压失败", result.stdout)
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_signature_verify_failure_aborts_before_staging(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_CODESIGN_VERIFY_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("签名校验未通过", result.stdout)
+        self.assertFalse(any(line.startswith("mv ") for line in self.log_lines()))
+        self.assertTrue(self.state.exists())
+
+    def test_new_app_self_test_failure_aborts_before_staging(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_SELF_TEST_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("离线自检未通过", result.stdout)
+        self.assertFalse(any(line.startswith("mv ") for line in self.log_lines()))
+        self.assertTrue(self.state.exists())
+
+    def test_bootstrap_failure_rolls_back_and_reports(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_BOOTSTRAP_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("LaunchAgent 加载失败", result.stdout)
 
     def test_swap_failure_restores_old_app_and_restarts(self):
         installed = self.prepare_update()
         result = self.run_update(MOCK_MV_SWAP_FAIL="1")
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.marker(installed), "old")
+        self.assertIn("移入安装位置失败", result.stdout)
         self.assertTrue(self.state.exists())
         self.assertTrue(any("bootstrap" in line for line in self.log_lines()))
 
