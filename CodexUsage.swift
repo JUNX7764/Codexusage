@@ -2234,7 +2234,7 @@ final class PanelSolidBackgroundView: NSView {
 
 final class PanelActionButton: NSButton {
     enum Style {
-        case plain, prominent, checkbox
+        case plain, prominent, checkbox, subtleAccent
     }
 
     var menuItem: NSMenuItem?
@@ -2252,6 +2252,8 @@ final class PanelActionButton: NSButton {
                 layer?.backgroundColor = (hovered
                     ? NSColor.labelColor.withAlphaComponent(0.08)
                     : NSColor.clear).cgColor
+            case .subtleAccent:
+                layer?.backgroundColor = PanelAccent.codex.color.withAlphaComponent(hovered ? 0.28 : 0.18).cgColor
             case .checkbox:
                 layer?.backgroundColor = NSColor.clear.cgColor
             }
@@ -2447,8 +2449,16 @@ final class ResetCardSectionView: PanelCardView {
         let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
         header.addArrangedSubview(PanelUI.symbol("calendar", size: 15, color: PanelAccent.codex.color))
         header.addArrangedSubview(PanelUI.label("重置卡", size: 13, weight: .semibold, wrapping: false))
+        if let count = model.count {
+            header.addArrangedSubview(PanelUI.label("×\(count)", size: 12, weight: .semibold,
+                color: PanelAccent.codex.color, wrapping: false, monospacedDigits: true))
+        } else if let empty = model.emptyText {
+            header.addArrangedSubview(PanelUI.label(empty, size: 11, color: .secondaryLabelColor, wrapping: false))
+        }
+        header.addArrangedSubview(PanelUI.spacer())
         if let title = model.useTitle {
             let button = PanelActionButton(frame: .zero)
+            button.style = .subtleAccent
             button.title = title
             button.target = target
             button.action = action
@@ -2462,16 +2472,10 @@ final class ResetCardSectionView: PanelCardView {
             button.font = NSFont.systemFont(ofSize: 11, weight: .medium)
             button.contentTintColor = .secondaryLabelColor
             button.heightAnchor.constraint(equalToConstant: 20).isActive = true
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: 86).isActive = true
             button.isEnabled = model.useEnabled
             button.setAccessibilityLabel(title)
             header.addArrangedSubview(button)
-        }
-        header.addArrangedSubview(PanelUI.spacer())
-        if let count = model.count {
-            header.addArrangedSubview(PanelUI.label("×\(count)", size: 12, weight: .semibold,
-                color: PanelAccent.codex.color, wrapping: false, monospacedDigits: true))
-        } else if let empty = model.emptyText {
-            header.addArrangedSubview(PanelUI.label(empty, size: 11, color: .secondaryLabelColor, wrapping: false))
         }
         contentStack.addArrangedSubview(header)
         for (index, rowModel) in model.rows.enumerated() {
