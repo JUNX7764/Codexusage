@@ -100,6 +100,8 @@ final class DailyUsageChart: NSView {
             if case .reported(let value) = item.1 { return value }; return nil
         }.max() ?? 1)
         let width = bounds.width / CGFloat(days.count)
+        let barWidth = min(6, width)
+        let barInset = (width - barWidth) / 2
         for (index, day) in days.enumerated() {
             let x = CGFloat(index) * width
             if index == selection { NSColor.labelColor.withAlphaComponent(0.07).setFill(); NSRect(x: x, y: 0, width: width, height: 46).fill() }
@@ -108,7 +110,7 @@ final class DailyUsageChart: NSView {
             if let value = dayValue {
                 orange.setFill()
                 let height = max(value == 0 ? 1 : 2, CGFloat(value / maxValue) * 46)
-                NSBezierPath(roundedRect: NSRect(x: x + 1, y: 46 - height, width: max(1, width - 2), height: height), xRadius: 1, yRadius: 1).fill()
+                NSBezierPath(roundedRect: NSRect(x: x + barInset, y: 46 - height, width: barWidth, height: height), xRadius: 1, yRadius: 1).fill()
             } else {
                 NSColor.tertiaryLabelColor.setFill(); NSRect(x: x + 2, y: 45, width: max(1, width - 4), height: 1).fill()
             }
@@ -128,13 +130,14 @@ final class UsageShareBar: NSView {
         self.fraction = min(1, max(0, fraction))
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        heightAnchor.constraint(equalToConstant: 6).isActive = true
+        heightAnchor.constraint(equalToConstant: UsageBarMetrics.height).isActive = true
     }
     required init?(coder: NSCoder) { fatalError() }
     override func draw(_ dirtyRect: NSRect) {
+        let radius = UsageBarMetrics.cornerRadius
         NSColor.secondaryLabelColor.withAlphaComponent(0.16).setFill()
-        NSBezierPath(roundedRect: bounds, xRadius: 3, yRadius: 3).fill()
+        NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius).fill()
         PanelAccent.codex.color.setFill()
-        NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: bounds.width * fraction, height: bounds.height), xRadius: 3, yRadius: 3).fill()
+        NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: bounds.width * fraction, height: bounds.height), xRadius: radius, yRadius: radius).fill()
     }
 }

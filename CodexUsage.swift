@@ -2363,6 +2363,11 @@ final class PanelHeaderView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
+enum UsageBarMetrics {
+    static let height: CGFloat = 6
+    static let cornerRadius = height / 2
+}
+
 final class QuotaProgressView: NSView {
     var remaining: Int? { didSet { needsLayout = true; needsDisplay = true } }
     private let fill = CALayer()
@@ -2372,11 +2377,11 @@ final class QuotaProgressView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 4
+        layer?.cornerRadius = UsageBarMetrics.cornerRadius
         layer?.masksToBounds = true
-        fill.cornerRadius = 4
+        fill.cornerRadius = UsageBarMetrics.cornerRadius
         layer?.addSublayer(fill)
-        heightAnchor.constraint(equalToConstant: 8).isActive = true
+        heightAnchor.constraint(equalToConstant: UsageBarMetrics.height).isActive = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
