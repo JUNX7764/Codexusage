@@ -2800,8 +2800,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             if case .fromZero = value { return PanelAccent.codex.color }
             return .secondaryLabelColor
         }
-        let left = PanelUI.label("较昨日  " + compared.0.value.text, size: 11, color: comparisonColor(compared.0.value), wrapping: false)
-        let right = PanelUI.label("较前7天  " + compared.1.value.text, size: 11, color: comparisonColor(compared.1.value), wrapping: false)
+        let left = PanelUI.label("日环比  " + compared.0.value.text, size: 11, color: comparisonColor(compared.0.value), wrapping: false)
+        let right = PanelUI.label("7日环比  " + compared.1.value.text, size: 11, color: comparisonColor(compared.1.value), wrapping: false)
         left.toolTip = compared.0.description; right.toolTip = compared.1.description
         left.setAccessibilityHelp(compared.0.description); right.setAccessibilityHelp(compared.1.description)
         left.alignment = .center; right.alignment = .center
