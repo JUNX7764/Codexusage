@@ -23,7 +23,7 @@ enum UsageComparison {
         return .percent((current - prior) / prior * 100)
     }
     /// 以本地今日为 D：日环比 = 今日（未结束）对比昨日；周环比 = 最近 7 日（含今日）对比此前 7 日。
-    /// 官方日桶尚未包含当日时，今日取 `todayFill`（本机扫描今日用量）；界面文案不区分补足来源。
+    /// 官方日桶尚未包含当日时，今日取 `todayFill`（与用量情况同口径的本机合并今日用量）；界面文案不区分补足来源。
     static func evaluate(snapshot: OfficialUsageSnapshot?, now: Date, todayFill: Double? = nil) -> (Item, Item) {
         let source = "来源：官方账号用量"
         let weeklyFormula = "两组7日总量比较：（最近7日总量−前7日总量）÷前7日总量×100%"

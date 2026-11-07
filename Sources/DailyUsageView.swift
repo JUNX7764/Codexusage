@@ -22,7 +22,7 @@ final class DailyUsageChart: NSView {
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
 
-    /// 近 30 个日历日止于今日（官方最大源日期更晚时以其为界）；官方缺今日桶时以本机扫描补并描边标注未结束。
+    /// 近 30 个日历日止于今日（官方最大源日期更晚时以其为界）；官方缺今日桶时以与用量情况同口径的本机合并用量补并描边标注未结束。
     init(snapshot: OfficialUsageSnapshot?, scannedToday: Double? = nil) {
         var entries: [(String, Entry)] = []
         var today: String?

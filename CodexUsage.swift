@@ -2086,7 +2086,7 @@ struct UsagePanelModel {
     var externalTokens: TokenSection?
     var official: OfficialUsageSnapshot?
     var officialError: String?
-    var officialTodayFill: Double?   // 官方日桶缺今日时以本机扫描今日用量补足
+    var officialTodayFill: Double?   // 官方日桶缺今日时以与用量情况同口径的本机合并今日用量补足（Codex+外部）
     var tools: [[(name: String, total: Double?, input: Double?, output: Double?, status: UsageSourceStatus)]]
     var notices: [Notice]
     var lastAttempt: String
@@ -4329,7 +4329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             codexTokens: codexSection,
             externalTokens: externalSection,
             official: usage.official, officialError: usage.officialError,
-            officialTodayFill: usage.tokensToday?.total,
+            officialTodayFill: LocalUsageMerge.combine(usage.tokensToday, usage.extToday)?.total,
             tools: (0..<3).map { period in
                 let codex = [usage.tokensToday, usage.tokens7d, usage.tokens30d][period]
                 var rows: [(name: String, total: Double?, input: Double?, output: Double?, status: UsageSourceStatus)] = []
@@ -5712,8 +5712,10 @@ func onceMode() {
 if CommandLine.arguments.contains("--official-usage-check") {
     switch OfficialUsageReader.read(expected: CodexAuth.load()) {
     case .success(let snapshot):
-        let scan = TokenScanner.scan()
-        let fill = scan.error == nil ? scan.today.total : nil
+        let codex = TokenScanner.scan()
+        let external = ExternalTokenScanner.scan()
+        let fill = LocalUsageMerge.combine(codex.error == nil ? codex.today : nil,
+                                           external.error == nil ? external.today : nil)?.total
         let comparison = UsageComparison.evaluate(snapshot: snapshot, now: Date(), todayFill: fill)
         print("official usage: success; dailyComparisonReady=\(comparison.0.value != .insufficient); weeklyComparisonReady=\(comparison.1.value != .insufficient) (values withheld)")
         exit(0)
