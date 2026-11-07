@@ -2276,6 +2276,7 @@ final class PanelActionButton: NSButton {
 
 private enum PanelSurface {
     static var fill: NSColor { NSColor.labelColor.withAlphaComponent(0.035) }
+    static var comparisonFill: NSColor { NSColor.labelColor.withAlphaComponent(0.06) }
 }
 
 private final class PanelComparisonStack: NSStackView {
@@ -2288,7 +2289,7 @@ private final class PanelComparisonStack: NSStackView {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func updateLayer() {
-        effectiveAppearance.performAsCurrentDrawingAppearance { layer?.backgroundColor = PanelSurface.fill.cgColor }
+        effectiveAppearance.performAsCurrentDrawingAppearance { layer?.backgroundColor = PanelSurface.comparisonFill.cgColor }
     }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance(); needsDisplay = true
@@ -2446,6 +2447,28 @@ final class QuotaWindowView: NSView {
         addSubview(root)
         PanelUI.pin(root, to: self)
     }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+final class QuotaCardSectionView: PanelCardView {
+    init(quotas: [UsagePanelModel.Quota]) {
+        super.init(padding: 8)
+        contentStack.spacing = 6
+        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+        header.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        header.addArrangedSubview(PanelUI.symbol("stopwatch", size: 14, color: PanelAccent.codex.color))
+        header.addArrangedSubview(PanelUI.label("用量进度", size: 12, weight: .semibold, wrapping: false))
+        header.addArrangedSubview(PanelUI.spacer())
+        let resetHeading = PanelUI.label("重置时间", size: 10, color: .secondaryLabelColor, wrapping: false)
+        header.addArrangedSubview(resetHeading)
+        PanelUI.addFullWidth(header, to: contentStack)
+        for quota in quotas {
+            let row = QuotaWindowView(model: quota)
+            row.heightAnchor.constraint(equalToConstant: 24).isActive = true
+            PanelUI.addFullWidth(row, to: contentStack)
+        }
+    }
+
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
@@ -2758,29 +2781,30 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             button.heightAnchor.constraint(equalToConstant: 30).isActive = true
             addContentRow(button)
         }
-        let quotaHeading = PanelUI.label("重置时间", size: 10, color: .secondaryLabelColor, wrapping: false)
-        quotaHeading.alignment = .right
-        addContentRow(quotaHeading)
-        for quota in model.quotas { addContentRow(QuotaWindowView(model: quota, compact: panelWidth < 400)) }
+        addContentRow(QuotaCardSectionView(quotas: model.quotas))
         if let reset = model.resetCards {
             addContentRow(ResetCardSectionView(model: reset, target: self, action: #selector(requestUseReset)))
         }
         if let tibo = model.tibo {
             addContentRow(makeTiboSection(tibo))
         }
-        addContentRow(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
+        addContentRow(makeCardSection(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
             expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
-            bucketAction: #selector(toggleCodexBucket(_:))))
-        addContentRow(PanelUI.separator())
-        addContentRow(makeDailySection(model))
-        addContentRow(PanelUI.separator())
-        addContentRow(makeToolSection(model))
+            bucketAction: #selector(toggleCodexBucket(_:)))))
+        addContentRow(makeCardSection(makeDailySection(model)))
+        addContentRow(makeCardSection(makeToolSection(model)))
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
     }
 
+    private func makeCardSection(_ content: NSView) -> PanelCardView {
+        let card = PanelCardView(padding: 8)
+        PanelUI.addFullWidth(content, to: card.contentStack)
+        return card
+    }
+
     private func makeDailySection(_ model: UsagePanelModel) -> NSView {
-        let root = PanelUI.stack(spacing: 4)
+        let root = PanelUI.stack(spacing: 6)
         let heading = PanelSectionHeading.make(title: "用量简析", symbol: "chart.bar.fill",
             color: PanelAccent.codex.color, expanded: dailyExpanded, target: self,
             action: #selector(toggleDaily), toolTip: "官方账号累计和每日 Token；覆盖范围与源时区尚未确认")
@@ -2789,6 +2813,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         let total = PanelUI.label(Fmt.tokensAbbr(model.official?.lifetime), size: 19, weight: .semibold, monospacedDigits: true)
         total.toolTip = model.official?.lifetime.map { String(format: "%.0f Token", $0) } ?? "暂无累计数据"
         let totalRow = PanelUI.stack(orientation: .horizontal, alignment: .firstBaseline, spacing: 7)
+        totalRow.heightAnchor.constraint(equalToConstant: 28).isActive = true
         totalRow.addArrangedSubview(total)
         totalRow.addArrangedSubview(PanelUI.label("累计 Token", size: 10, color: .secondaryLabelColor, wrapping: false))
         totalRow.addArrangedSubview(PanelUI.spacer())
@@ -3003,28 +3028,41 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         refreshPanelLayout()
     }
 
-    /// 板块线与页脚样式一致，线上下分别保留完整堆栈间距，展开／折叠时均保持。
-    func verifySectionDividersForPreview() -> Bool {
+    /// 六个业务模块均使用原生卡片，展开／折叠只改变卡片内容，不改变模块顺序。
+    func verifyCardLayoutForPreview() -> Bool {
         stack.layoutSubtreeIfNeeded()
-        let rows = stack.arrangedSubviews
-        let indices = rows.indices.filter { (rows[$0] as? NSBox)?.boxType == .separator }
-        guard let reference = footerContainer.subviews.compactMap({ $0 as? NSBox }).first(where: { $0.boxType == .separator }),
-              indices.count == 2, indices[0] > 0, indices[1] + 1 < rows.count,
-              rows[indices[0] - 1] is TokenSectionView, indices[1] == indices[0] + 2 else { return false }
-        return indices.allSatisfy { index in
-            let line = rows[index], previous = rows[index - 1], next = rows[index + 1]
-            let before = abs(line.frame.midY - previous.frame.midY) - (line.frame.height + previous.frame.height) / 2
-            let after = abs(next.frame.midY - line.frame.midY) - (next.frame.height + line.frame.height) / 2
-            // NSBox 的 frame 包含系统内边距，直接与同窗页脚线比较，避免误当作描画线宽。
-            let valid = abs(line.frame.height - reference.frame.height) < 0.01
-                && line.alphaValue == 1 && line.alphaValue == reference.alphaValue
-                && abs(line.frame.width - (panelWidth - 32)) < 0.01
-                && abs(line.frame.minX - previous.frame.minX) < 0.01
-                && abs(before - after) < 0.51
-                && abs(before + line.frame.height + after - (2 * stack.spacing + PanelUI.separatorHeight)) < 0.51
-            if !valid {
-                print("CODEX_SECTION_DIVIDER index=\(index) height=\(line.frame.height) referenceHeight=\(reference.frame.height) alpha=\(line.alphaValue) width=\(line.frame.width) x=\(line.frame.minX) previousX=\(previous.frame.minX) before=\(before) after=\(after)")
-            }
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+        let cards = stack.arrangedSubviews.compactMap { $0 as? PanelCardView }
+        let hasSectionSeparator = stack.arrangedSubviews.contains { ($0 as? NSBox)?.boxType == .separator }
+        let dailyButtons = descendants(cards.count > 4 ? cards[4] : NSView()).compactMap { $0 as? PanelDisclosureButton }
+            .filter { $0.action == #selector(toggleDaily) }
+        let toolButtons = descendants(cards.count > 5 ? cards[5] : NSView()).compactMap { $0 as? PanelDisclosureButton }
+            .filter { $0.action == #selector(toggleExternal) }
+        let hasFooterSeparator = footerContainer.subviews.contains { ($0 as? NSBox)?.boxType == .separator }
+        let hasConsistentSpacing = zip(cards, cards.dropFirst()).allSatisfy { previous, card in
+            abs(previous.frame.minY - card.frame.maxY - stack.spacing) < 0.01
+        }
+        guard cards.count == 6, !hasSectionSeparator, hasFooterSeparator,
+              stack.spacing == 8, hasConsistentSpacing,
+              cards[0] is QuotaCardSectionView, cards[1] is ResetCardSectionView,
+              descendants(cards[0]).compactMap({ $0 as? QuotaWindowView }).count == model?.quotas.count,
+              descendants(cards[3]).contains(where: { $0 is TokenSectionView }),
+              dailyButtons.count == 2, toolButtons.count == 2 else {
+            print("CODEX_CARD_LAYOUT structureFailed cards=\(cards.count) separators=\(hasSectionSeparator) footer=\(hasFooterSeparator) spacing=\(hasConsistentSpacing)")
+            return false
+        }
+        return cards.enumerated().allSatisfy { index, card in
+            card.layoutSubtreeIfNeeded()
+            let content = card.contentStack.frame
+            let valid = card.frame.height > 0
+                && abs(card.frame.width - (panelWidth - 32)) < 0.01
+                && abs(card.frame.minX - 16) < 0.01
+                && abs(content.minX - 8) < 0.01
+                && abs(content.maxX - (card.bounds.width - 8)) < 0.01
+                && abs(content.height - (card.bounds.height - 16)) < 0.01
+                && card.layer?.cornerRadius == 12
+                && card.layer?.borderWidth == 0.5
+            if !valid { print("CODEX_CARD_LAYOUT index=\(index) frame=\(card.frame) content=\(content) radius=\(card.layer?.cornerRadius ?? -1) border=\(card.layer?.borderWidth ?? -1)") }
             return valid
         }
     }
@@ -3067,7 +3105,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         guard !dailyExpanded, descendants(stack).compactMap({ $0 as? DailyUsageChart }).isEmpty else { return false }
         update(model: model)
         guard !dailyExpanded, toolPeriod == 1, externalExpanded, expandedCodexBuckets == [0, 2],
-              dailyButtons().count == 2, verifySectionDividersForPreview() else { return false }
+              dailyButtons().count == 2, verifyCardLayoutForPreview() else { return false }
         guard window.makeFirstResponder(dailyButtons()[1]) else { return false }
         window.sendEvent(space)
         return dailyExpanded && descendants(stack).compactMap({ $0 as? DailyUsageChart }).count == 1
@@ -3076,7 +3114,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     func prepareReopenStateForPreview() { if dailyExpanded { toggleDaily() } }
     func verifyReopenStateForPreview() -> Bool {
         let intact = !dailyExpanded && externalExpanded && toolPeriod == 1
-            && expandedCodexBuckets == [0, 2] && verifySectionDividersForPreview()
+            && expandedCodexBuckets == [0, 2] && verifyCardLayoutForPreview()
         if !dailyExpanded { toggleDaily() }
         return intact
     }
@@ -3389,7 +3427,7 @@ private final class TokenSectionView: NSView {
          target: AnyObject, action: Selector, bucketAction: Selector) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        let root = PanelUI.stack(spacing: 3)
+        let root = PanelUI.stack(spacing: 4)
         let header = PanelSectionHeading.make(title: model.title, symbol: model.accent.symbol,
             color: model.accent.color, expanded: expanded, target: target, action: action)
         PanelUI.addFullWidth(header, to: root)
@@ -3723,7 +3761,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panelController.toggle(anchoredTo: button)
         }
         guard panelController.isOpen else { return fail("preview panel did not open") }
-        guard panelController.verifySectionDividersForPreview() else { return fail("section divider layout or spacing failed") }
+        guard panelController.verifyCardLayoutForPreview() else { return fail("card layout or spacing failed") }
         guard let statusButton = statusItem.button else { return fail("status button missing") }
         statusButton.performClick(nil)
         guard !panelController.isOpen else { return fail("status button did not close panel") }
@@ -3736,7 +3774,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard panelController.verifyTokenBucketInteractionsForPreview() else {
             return fail("token bucket expansion, collapse, or refresh state failed")
         }
-        guard panelController.verifySectionDividersForPreview() else { return fail("section dividers changed after interactions") }
+        guard panelController.verifyCardLayoutForPreview() else { return fail("card layout changed after interactions") }
         guard panelController.verifyChartInteractionsForPreview() else { return fail("chart hover or keyboard navigation failed") }
         panelController.prepareReopenStateForPreview()
         guard let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
@@ -3769,7 +3807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.postEvent(refresh, atStart: false)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     guard self.panelController.isOpen else { return fail("refresh action closed the panel") }
-                    print("CodexUsage visual event test: PASS (section dividers, status button toggle, model rows, tool periods, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
+                    print("CodexUsage visual event test: PASS (card layout, status button toggle, model rows, tool periods, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
                     exit(0)
                 }
             }
@@ -4697,8 +4735,9 @@ enum CodexOfflineRegression {
                 let card = PanelCardView(); let strip = PanelComparisonStack()
                 card.appearance = NSAppearance(named: appearanceName); strip.appearance = NSAppearance(named: appearanceName)
                 card.updateLayer(); strip.updateLayer()
-                try expect(card.layer?.backgroundColor == strip.layer?.backgroundColor,
-                           "comparison background diverged from card background")
+                try expect(card.layer?.backgroundColor != nil && strip.layer?.backgroundColor != nil
+                           && card.layer?.backgroundColor != strip.layer?.backgroundColor,
+                           "comparison strip lacks subtle contrast inside card")
             }
 
             let tiers: [(Int?, RemainingColorTier)] = [
