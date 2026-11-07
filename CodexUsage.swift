@@ -2086,6 +2086,7 @@ struct UsagePanelModel {
     var externalTokens: TokenSection?
     var official: OfficialUsageSnapshot?
     var officialError: String?
+    var officialTodayFill: Double?   // 官方日桶缺今日时以本机扫描今日用量补足
     var tools: [[(name: String, total: Double?, input: Double?, output: Double?, status: UsageSourceStatus)]]
     var notices: [Notice]
     var lastAttempt: String
@@ -2792,9 +2793,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         totalRow.addArrangedSubview(PanelUI.label("累计 Token", size: 10, color: .secondaryLabelColor, wrapping: false))
         totalRow.addArrangedSubview(PanelUI.spacer())
         PanelUI.addFullWidth(totalRow, to: root)
-        PanelUI.addFullWidth(DailyUsageChart(snapshot: model.official), to: root)
+        PanelUI.addFullWidth(DailyUsageChart(snapshot: model.official, scannedToday: model.officialTodayFill), to: root)
         let comparison = PanelComparisonStack()
-        let compared = UsageComparison.evaluate(snapshot: model.official, now: Date())
+        let compared = UsageComparison.evaluate(snapshot: model.official, now: Date(), todayFill: model.officialTodayFill)
         func comparisonColor(_ value: UsageComparison.Value) -> NSColor {
             if case .percent(let amount) = value { return amount < 0 ? RemainingColorTier.green.color() : PanelAccent.codex.color }
             if case .fromZero = value { return PanelAccent.codex.color }
@@ -3609,16 +3610,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "gpt-5.6-sol": ModelTokenUsage(input: 400_000_000, output: 2_000_000, total: 402_000_000),
             "gpt-5.5": ModelTokenUsage(input: 253_870_000, output: 1_480_000, total: 255_350_000)
         ])
-        let demoFormatter = DateFormatter(); demoFormatter.locale = Locale(identifier: "en_US_POSIX"); demoFormatter.timeZone = TimeZone(secondsFromGMT: 0)!; demoFormatter.dateFormat = "yyyy-MM-dd"
+        let demoFormatter = DateFormatter(); demoFormatter.locale = Locale(identifier: "en_US_POSIX"); demoFormatter.timeZone = .current; demoFormatter.dateFormat = "yyyy-MM-dd"
         var demoDays: [String: Double] = [:]
         for day in 0..<30 {
-            let date = Date(timeIntervalSince1970: 1_793_836_800 - Double(day) * 86400)
+            let date = Calendar.current.date(byAdding: .day, value: -day, to: now)!
             let value: Double = day == 0 ? 118 : (day == 1 ? 100 : (day < 7 ? 88 : 100))
             demoDays[demoFormatter.string(from: date)] = value * 100_000
         }
         if arguments.contains("--visual-preview-events") || arguments.contains("--visual-preview-hover-fixture") {
             let ordered = demoDays.keys.sorted(); demoDays.removeValue(forKey: ordered[0]); demoDays[ordered[1]] = 0
             demoDays.removeValue(forKey: ordered[2])
+            demoDays.removeValue(forKey: ordered[29])   // 今日改由本机扫描补足：预览描边未结束柱
         }
         usage.official = OfficialUsageSnapshot(lifetime: 3_180_000_000, days: demoDays, fetchedAt: Date(),
             sparsePolicy: arguments.contains("--visual-preview-events") || arguments.contains("--visual-preview-hover-fixture") ? .officialActivity : .unknown)
@@ -4327,6 +4329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             codexTokens: codexSection,
             externalTokens: externalSection,
             official: usage.official, officialError: usage.officialError,
+            officialTodayFill: usage.tokensToday?.total,
             tools: (0..<3).map { period in
                 let codex = [usage.tokensToday, usage.tokens7d, usage.tokens30d][period]
                 var rows: [(name: String, total: Double?, input: Double?, output: Double?, status: UsageSourceStatus)] = []
@@ -4587,39 +4590,58 @@ enum CodexOfflineRegression {
 
             try expect(UsageComparison.compare(0, 0) == .unchanged && UsageComparison.compare(10, 0) == .fromZero(10), "zero-base comparison wrong")
             let compareNow = Date()
+            let compareFmt = DateFormatter(); compareFmt.locale = Locale(identifier: "en_US_POSIX")
+            compareFmt.timeZone = .current; compareFmt.dateFormat = "yyyy-MM-dd"
+            func compareKey(_ offset: Int) -> String {
+                compareFmt.string(from: Calendar.current.date(byAdding: .day, value: -offset, to: compareNow)!)
+            }
+            // 今日 118、昨日 100、前 5 日 88、更早 7 日 100：日环比 +18%、周环比 −6%
             let complete = OfficialUsageSnapshot(lifetime: nil, days: Dictionary(uniqueKeysWithValues: (0..<14).map { i in
-                let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(secondsFromGMT: 0)!; f.dateFormat = "yyyy-MM-dd"
-                return (f.string(from: Date(timeIntervalSince1970: 1_793_836_800 - Double(i) * 86400)), Double(i == 0 ? 118 : (i == 1 ? 100 : (i < 7 ? 88 : 100))))
+                (compareKey(i), Double(i == 0 ? 118 : (i == 1 ? 100 : (i < 7 ? 88 : 100))))
             }), fetchedAt: compareNow)
             let comparisons = UsageComparison.evaluate(snapshot: complete, now: compareNow)
             try expect(comparisons.0.value.text == "+18%" && comparisons.1.value.text == "−6%", "complete comparison mismatch")
-            try expect(comparisons.0.description.contains("2026-11-05 对比 2026-11-04") && comparisons.0.description.contains("官方账号用量"), "daily range or source incorrect")
-            try expect(comparisons.1.description.contains("2026-10-30 至 2026-11-05") && comparisons.1.description.contains("2026-10-23 至 2026-10-29")
+            try expect(comparisons.0.description.contains("\(compareKey(0)) 对比 \(compareKey(1))（今日未结束）")
+                       && comparisons.0.description.contains("官方账号用量"), "daily range or source incorrect")
+            try expect(comparisons.1.description.contains("\(compareKey(6)) 至 \(compareKey(0))")
+                       && comparisons.1.description.contains("\(compareKey(13)) 至 \(compareKey(7))")
                        && comparisons.1.description.contains("两组7日总量比较")
                        && comparisons.1.description.contains("（最近7日总量−前7日总量）÷前7日总量×100%"), "weekly range or formula incorrect")
-            let yearBoundary = OfficialUsageSnapshot(lifetime: nil, days: ["2026-01-02": 1], fetchedAt: compareNow)
-            let boundary = UsageComparison.evaluate(snapshot: yearBoundary, now: compareNow)
-            try expect(boundary.0.description.contains("2026-01-02 对比 2026-01-01") && boundary.1.description.contains("2025-12-20 至 2025-12-26"), "cross-year dates incorrect")
+            // 官方缺今日桶：以本机扫描补今日；界面文案不标注补足来源；官方已含今日时不覆盖
+            let openEnd = OfficialUsageSnapshot(lifetime: nil, days: complete.days.filter { $0.key != compareKey(0) }, fetchedAt: compareNow)
+            let filled = UsageComparison.evaluate(snapshot: openEnd, now: compareNow, todayFill: 57)
+            try expect(filled.0.value.text == "−43%" && !filled.0.description.contains("本机扫描"), "scanned-today fill missing")
+            try expect(filled.1.value != .insufficient && !filled.1.description.contains("本机扫描"), "weekly fill flagged source")
+            try expect(UsageComparison.evaluate(snapshot: complete, now: compareNow, todayFill: 999).0.value.text == "+18%", "fill overrode official today")
+            let unfilled = UsageComparison.evaluate(snapshot: openEnd, now: compareNow)
+            try expect(unfilled.0.value == .insufficient && unfilled.0.description.contains("缺少日期：\(compareKey(0))"), "missing today without fill not flagged")
+            var yearComponents = DateComponents(); yearComponents.year = 2026; yearComponents.month = 1; yearComponents.day = 2; yearComponents.hour = 12
+            let yearNow = Calendar.current.date(from: yearComponents)!
+            let yearBoundary = OfficialUsageSnapshot(lifetime: nil, days: ["2026-01-02": 1], fetchedAt: yearNow)
+            let boundary = UsageComparison.evaluate(snapshot: yearBoundary, now: yearNow)
+            try expect(boundary.0.description.contains("2026-01-02 对比 2026-01-01")
+                       && boundary.1.description.contains("2025-12-27 至 2026-01-02")
+                       && boundary.1.description.contains("2025-12-20 至 2025-12-26"), "cross-year dates incorrect")
             let noDate = UsageComparison.evaluate(snapshot: nil, now: compareNow)
             try expect(noDate.0.value == .insufficient && noDate.0.description.contains("尚未取得"), "missing source not explained")
             let stale = UsageComparison.evaluate(snapshot: complete, now: compareNow.addingTimeInterval(1801))
             try expect(stale.1.value == .insufficient && stale.1.description.contains("已过期"), "stale comparison allowed")
             var missingDays = complete
-            missingDays.days.removeValue(forKey: "2026-10-25")
+            missingDays.days.removeValue(forKey: compareKey(11))
             let unknownSparse = UsageComparison.evaluate(snapshot: missingDays, now: compareNow)
             try expect(unknownSparse.0.value == comparisons.0.value && unknownSparse.1.value == .insufficient
-                       && unknownSparse.1.description.contains("2026-10-25"), "unknown sparse date or independent windows wrong")
+                       && unknownSparse.1.description.contains(compareKey(11)), "unknown sparse date or independent windows wrong")
             missingDays.sparsePolicy = .officialActivity
             let officialSparse = UsageComparison.evaluate(snapshot: missingDays, now: compareNow)
             try expect(officialSparse.0.value == comparisons.0.value && officialSparse.1.value != .insufficient
                        && officialSparse.1.description.contains("按 0"), "official sparse date not counted as zero")
-            try expect(missingDays.day("2026-10-25") == .inferredZero && missingDays.day("2026-10-22") == .missing
-                       && missingDays.day("2026-11-06") == .missing, "sparse date bounds wrong")
-            var outside = missingDays; outside.days.removeValue(forKey: "2026-10-23")
+            try expect(missingDays.day(compareKey(11)) == .inferredZero && missingDays.day(compareKey(14)) == .missing
+                       && missingDays.day(compareKey(-1)) == .missing, "sparse date bounds wrong")
+            var outside = missingDays; outside.days.removeValue(forKey: compareKey(13))
             let outsideResult = UsageComparison.evaluate(snapshot: outside, now: compareNow)
             try expect(outsideResult.0.value == comparisons.0.value && outsideResult.1.value == .insufficient
-                       && outsideResult.1.description.contains("2026-10-23"), "out-of-range date was invented")
-            var explicitZero = complete; explicitZero.days["2026-11-04"] = 0
+                       && outsideResult.1.description.contains(compareKey(13)), "out-of-range date was invented")
+            var explicitZero = complete; explicitZero.days[compareKey(1)] = 0
             try expect(UsageComparison.evaluate(snapshot: explicitZero, now: compareNow).0.value == .fromZero(118), "zero-base comparison incorrect")
             let emptyOfficial = OfficialUsageReader.parse(["stats": ["lifetime_tokens": 42, "daily_usage_buckets": []]])
             try expect(emptyOfficial?.day("2026-11-05") == .missing, "empty official days were fabricated")
@@ -5680,7 +5702,9 @@ func onceMode() {
 if CommandLine.arguments.contains("--official-usage-check") {
     switch OfficialUsageReader.read(expected: CodexAuth.load()) {
     case .success(let snapshot):
-        let comparison = UsageComparison.evaluate(snapshot: snapshot, now: Date())
+        let scan = TokenScanner.scan()
+        let fill = scan.error == nil ? scan.today.total : nil
+        let comparison = UsageComparison.evaluate(snapshot: snapshot, now: Date(), todayFill: fill)
         print("official usage: success; dailyComparisonReady=\(comparison.0.value != .insufficient); weeklyComparisonReady=\(comparison.1.value != .insufficient) (values withheld)")
         exit(0)
     case .failure(let failure): print("official usage: \(failure)"); exit(1)

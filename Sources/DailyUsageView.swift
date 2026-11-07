@@ -5,7 +5,10 @@ private final class ChartHoverLabel: NSTextField {
 }
 
 final class DailyUsageChart: NSView {
-    private let days: [(String, OfficialUsageSnapshot.Day)]
+    /// 图元口径：官方日桶 / 官方范围内缺桶（官方客户端按 0 渲染）/ 本机扫描补今日 / 缺失。
+    enum Entry { case reported(Double), inferredZero, scanned(Double), missing }
+    private let days: [(String, Entry)]
+    private let todayKey: String?
     var selectedIndexForPreview: Int? { selection }
     var selectedTextForPreview: String { hover.stringValue }
     var hoverWithinBoundsForPreview: Bool {
@@ -19,20 +22,36 @@ final class DailyUsageChart: NSView {
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
 
-    init(snapshot: OfficialUsageSnapshot?) {
-        var entries: [(String, OfficialUsageSnapshot.Day)] = []
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)!
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.dateFormat = "yyyy-MM-dd"
-        if let end = snapshot?.days.keys.sorted().last, let endDate = formatter.date(from: end) {
-            for index in (0..<30).reversed() {
-                let day = formatter.string(from: endDate.addingTimeInterval(-Double(index) * 86400))
-                entries.append((day, snapshot?.day(day) ?? .missing))
+    /// 近 30 个日历日止于今日（官方最大源日期更晚时以其为界）；官方缺今日桶时以本机扫描补并描边标注未结束。
+    init(snapshot: OfficialUsageSnapshot?, scannedToday: Double? = nil) {
+        var entries: [(String, Entry)] = []
+        var today: String?
+        if let snapshot = snapshot, !snapshot.days.isEmpty {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = .current
+            formatter.calendar = Calendar(identifier: .gregorian)
+            formatter.dateFormat = "yyyy-MM-dd"
+            let calendar = Calendar.current
+            let now = Date()
+            let todayName = formatter.string(from: now)
+            today = todayName
+            let end = max(todayName, snapshot.days.keys.max() ?? todayName)
+            if let endDate = formatter.date(from: end) {
+                for index in (0..<30).reversed() {
+                    let day = formatter.string(from: calendar.date(byAdding: .day, value: -index, to: endDate)!)
+                    let entry: Entry
+                    switch snapshot.day(day) {
+                    case .reported(let value): entry = .reported(value)
+                    case .inferredZero: entry = .inferredZero
+                    case .missing: entry = day == todayName && scannedToday != nil ? .scanned(scannedToday!) : .missing
+                    }
+                    entries.append((day, entry))
+                }
             }
         }
         days = entries
+        todayKey = today
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 61).isActive = true
@@ -76,7 +95,8 @@ final class DailyUsageChart: NSView {
         let day = days[index]
         let value: String
         switch day.1 {
-        case .reported(let amount): value = Fmt.tokensAbbr(amount) + " Token"
+        case .reported(let amount): value = Fmt.tokensAbbr(amount) + " Token" + (day.0 == todayKey ? "（今日未结束）" : "")
+        case .scanned(let amount): value = Fmt.tokensAbbr(amount) + " Token（今日未结束）"
         case .inferredZero: value = "0 Token（无活动记录）"
         case .missing: value = "暂无数据"
         }
@@ -97,7 +117,7 @@ final class DailyUsageChart: NSView {
             return
         }
         let maxValue = max(1, days.compactMap { item -> Double? in
-            if case .reported(let value) = item.1 { return value }; return nil
+            switch item.1 { case .reported(let value), .scanned(let value): return value; default: return nil }
         }.max() ?? 1)
         let width = bounds.width / CGFloat(days.count)
         let barWidth = min(6, width)
@@ -106,11 +126,22 @@ final class DailyUsageChart: NSView {
             let x = CGFloat(index) * width
             if index == selection { NSColor.labelColor.withAlphaComponent(0.07).setFill(); NSRect(x: x, y: 0, width: width, height: 46).fill() }
             let dayValue: Double?
-            switch day.1 { case .reported(let value): dayValue = value; case .inferredZero: dayValue = 0; case .missing: dayValue = nil }
+            var open = false   // 今日未结束：描边空心柱
+            switch day.1 {
+            case .reported(let value): dayValue = value
+            case .scanned(let value): dayValue = value; open = true
+            case .inferredZero: dayValue = 0
+            case .missing: dayValue = nil
+            }
             if let value = dayValue {
-                orange.setFill()
-                let height = max(value == 0 ? 1 : 2, CGFloat(value / maxValue) * 46)
-                NSBezierPath(roundedRect: NSRect(x: x + barInset, y: 46 - height, width: barWidth, height: height), xRadius: 1, yRadius: 1).fill()
+                let minimum: CGFloat = open ? (value == 0 ? 2 : 3) : (value == 0 ? 1 : 2)
+                let height = max(minimum, CGFloat(value / maxValue) * 46)
+                let bar = NSBezierPath(roundedRect: NSRect(x: x + barInset, y: 46 - height, width: barWidth, height: height), xRadius: 1, yRadius: 1)
+                if open {
+                    orange.setStroke(); bar.lineWidth = 1; bar.stroke()
+                } else {
+                    orange.setFill(); bar.fill()
+                }
             } else {
                 NSColor.tertiaryLabelColor.setFill(); NSRect(x: x + 2, y: 45, width: max(1, width - 4), height: 1).fill()
             }

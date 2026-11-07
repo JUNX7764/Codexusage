@@ -92,7 +92,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 Codex 会话按 `token_count` 事件的本地日期统计，累计值按同一会话前后差额入账，并按最近一条 `turn_context.payload.model` 归入模型；缺少模型信息的旧记录归为「未知模型」。缺少事件时间的旧记录使用文件名日期。未修改文件复用缓存，活跃明文会话只读取新增内容，压缩归档发生变化时重新解压。
 
-官方用量通过 `GET /backend-api/wham/profiles/me` 只读请求，使用已有认证快照及 `ChatGPT-Account-ID`，查询本身不续期；401 等待额度链路按既有规则处理。请求结果接受前后核对账号身份和凭据，失败保留同账号上次成功值。官方数据及本机扫描随约五分钟调度，鼠标与控件交互只使用缓存。图表及比较遵循[官方客户端稀疏活动桶显示行为](https://github.com/openai/codex/blob/2c502d8b3d382dd609179164f31396d95deee55c/codex-rs/tui/src/analytics/activity_chart.rs)：非空官方日数组范围内缺桶按零，范围外与未知来源不外推；以最大源日期为 D，源日期时区未确认不阻止相邻标签计算。缺失范围、空数据或查询过期时显示数据不足。
+官方用量通过 `GET /backend-api/wham/profiles/me` 只读请求，使用已有认证快照及 `ChatGPT-Account-ID`，查询本身不续期；401 等待额度链路按既有规则处理。请求结果接受前后核对账号身份和凭据，失败保留同账号上次成功值。官方数据及本机扫描随约五分钟调度，鼠标与控件交互只使用缓存。图表及比较遵循[官方客户端稀疏活动桶显示行为](https://github.com/openai/codex/blob/2c502d8b3d382dd609179164f31396d95deee55c/codex-rs/tui/src/analytics/activity_chart.rs)：非空官方日数组范围内缺桶按零，范围外与未知来源不外推；以本地今日为 D，官方日桶尚未含当日时以本机扫描今日用量补足（描边空心柱，界面文案不标注来源），源日期时区未确认不阻止相邻标签计算。缺失范围、空数据或查询过期时显示数据不足。
 
 构建时在专属临时目录生成合法 `main.swift` 并编译 `Sources/`；真实只读能力可通过 `--official-usage-check` 检查，该命令联网，只输出成功或失败类别及日／周比较是否可计算的布尔值，不输出日期、账号或个人用量。
 
