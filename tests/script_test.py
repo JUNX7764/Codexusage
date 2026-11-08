@@ -102,6 +102,11 @@ case "$out" in
             (cd "$(dirname "$out")" && /usr/bin/shasum -a 256 "$(basename "${out%.sha256}")" > "$out")
         fi
         ;;
+    *.zip)
+        # 模拟网络层失败（传输中断/超时），校验 update.sh 的失败路径
+        if [ "${MOCK_CURL_ZIP_FAIL:-0}" = 1 ]; then exit 22; fi
+        : > "$out"
+        ;;
     *) : > "$out" ;;
 esac
 ''')
@@ -262,11 +267,11 @@ exit 0
         self.env.update({"MOCK_AGENT_ACTIVE": "1", "MOCK_PAYLOAD": str(payload), "MOCK_TARGET": str(installed), "MOCK_EXECUTABLE": EXECUTABLE})
         return installed
 
-    def run_update(self, installed=None, **overrides):
+    def run_update(self, installed=None, target="v2.0.0", **overrides):
         env = self.env.copy()
         env.update(overrides)
         return subprocess.run(
-            ["bash", str(UPDATE), "v2.0.0", str(installed or self.apps / APP_NAME)], env=env, text=True,
+            ["bash", str(UPDATE), target, str(installed or self.apps / APP_NAME)], env=env, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
         )
 
@@ -516,11 +521,63 @@ exit 0
         self.assertIn("已加载的 LaunchAgent", result.stdout)
         self.assertFalse(any("bootout" in line for line in self.log_lines()))
 
+    def test_loaded_agent_with_missing_plist_self_heals_and_updates(self):
+        # 旧版本关自启只删 plist 不 bootout：job 仍在 launchd 内存里而 plist 缺失，
+        # 更新不应被阻断，而是按当前安装位置重写 plist 后继续
+        installed = self.prepare_update()
+        plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        plist.unlink()
+        result = self.run_update()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        self.assertIn("缺少 plist 文件，已按当前安装位置重写", result.stdout)
+        self.assertTrue(plist.exists(), result.stdout)
+        with plist.open("rb") as handle:
+            healed = plistlib.load(handle)
+        self.assertEqual(healed["Label"], LABEL)
+        self.assertEqual(healed["ProgramArguments"], [str(installed / "Contents" / "MacOS" / EXECUTABLE)])
+        self.assertTrue(healed["RunAtLoad"])
+        self.assertEqual(healed["KeepAlive"], {"SuccessfulExit": False})
+
+    def test_zip_download_failure_aborts_before_staging(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_CURL_ZIP_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("发布包下载失败", result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(any("/new/" in line for line in self.log_lines()))
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_same_version_is_rejected(self):
+        installed = self.prepare_update()
+        payload = self.make_app(self.base / "payload-same", "v1.0.0", "new")
+        zip_url = f"https://github.com/{REPO}/releases/download/v1.0.0/{EXECUTABLE}.zip"
+        releases = [{"tag_name": "v1.0.0", "draft": False, "prerelease": False, "assets": [
+            {"name": f"{EXECUTABLE}.zip", "browser_download_url": zip_url},
+            {"name": f"{EXECUTABLE}.zip.sha256", "browser_download_url": zip_url + ".sha256"}]}]
+        self.env.update({"MOCK_PAYLOAD": str(payload)})
+        result = self.run_update(installed=installed, target="v1.0.0",
+                                 MOCK_RELEASES_JSON=json.dumps(releases))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("目标版本必须高于当前应用", result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_git_push_failure_cleans_local_tag(self):
+        project = self.prepare_release()
+        result = self.run_release(project, MOCK_GIT_PUSH_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        lines = self.log_lines()
+        self.assertFalse(any(line.startswith("gh release") for line in lines))
+        self.assertTrue(any("tag -d v9.9.9" in line for line in lines), lines)
+
     def prepare_release(self):
         project = self.base / "release-project"
         (project / "scripts").mkdir(parents=True)
         shutil.copy2(RELEASE, project / "scripts" / "release.sh")
         shutil.copy2(UPDATE, project / "scripts" / "update.sh")
+        # release.sh 会对应用源码中的身份常量做交叉校验，沙箱项目须包含同一份源码
+        shutil.copy2(ROOT / "CodexUsage.swift", project / "CodexUsage.swift")
         template = self.make_app(self.base / "release-template", "v9.9.9", "release")
         build = project / "build.sh"
         build.write_text(f'''#!/bin/bash

@@ -63,6 +63,15 @@ for expected in \
         exit 1
     fi
 done
+# 应用内硬编码的身份常量（更新检查仓库、LaunchAgent label）同样纳入发布期校验，
+# 防止脚本与应用单侧改动造成「应用检查旧仓库 / label 不一致」的静默漂移。
+# 锚定到具体赋值行，避免子串前缀碰撞漏报
+for expected in "api.github.com/repos/${REPO}/releases" "launchAgentLabel = \"${LABEL}\""; do
+    if ! /usr/bin/grep -Fq "$expected" "$DIR/CodexUsage.swift"; then
+        echo "!! CodexUsage.swift 身份常量缺失或不一致：${expected}"
+        exit 1
+    fi
+done
 
 if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
     if [ "$(git rev-parse "refs/tags/${TAG}^{commit}")" != "$(git rev-parse HEAD)" ]; then

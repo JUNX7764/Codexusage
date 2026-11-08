@@ -11,7 +11,6 @@ MYUID="$(id -u)"
 AGENT_PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 
 TMP=""
-KEEP_TMP=0
 WORK=""
 BACKUP=""
 INSTALLED=""
@@ -73,14 +72,22 @@ start_and_wait() {
     else
         open -n "$INSTALLED" || { echo "!! 应用启动命令失败"; return 1; }
     fi
+    local pids="" first_pid=""
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        if [ -n "$(target_pids)" ]; then
-            sleep 1
-            if [ -n "$(target_pids)" ]; then
+        # 全量捕获后取首行：head 提前退出会触发 pipefail 下的 SIGPIPE 中断
+        pids="$(target_pids)" || pids=""
+        first_pid="${pids%%$'\n'*}"
+        if [ -n "$first_pid" ]; then
+            sleep 2
+            # 同一 PID 持续存活才算稳定驻留：崩溃循环型坏版本会被 launchd 反复拉起、
+            # pid 不断更替，仅检查“有进程”会把这种版本误判成功并删掉旧版备份
+            pids="$(target_pids)" || pids=""
+            if [ "${pids%%$'\n'*}" = "$first_pid" ]; then
                 return 0
             fi
+        else
+            sleep 1
         fi
-        sleep 1
     done
     echo "!! ${EXECUTABLE} 启动后未稳定驻留"
     return 1
@@ -112,9 +119,7 @@ on_exit() {
     if [ "$rc" -ne 0 ] && [ "$STOPPED" = 1 ] && [ "$SUCCESS" = 0 ]; then
         rollback || rc=$?
     fi
-    if [ "$KEEP_TMP" = 0 ]; then
-        rm -rf "$TMP"
-    fi
+    rm -rf "$TMP"
     if [ -n "$WORK" ]; then
         if [ -n "$BACKUP" ] && [ -e "$BACKUP" ]; then
             echo "!! 更新备份保留在：${BACKUP}"
@@ -132,7 +137,7 @@ echo "==> 1/5 查找并下载最新可安装 Release"
 if ! curl -fsSL --max-time 60 \
     -H 'Accept: application/vnd.github+json' -H 'User-Agent: CodexUsage-Updater' \
     -o "${TMP}/releases.json" "$API_URL"; then
-    echo "!! Release 信息获取失败，请检查网络后重试"
+    echo "!! Release 信息获取失败（网络异常或 GitHub 限流），请稍后重试"
     exit 1
 fi
 if ! SELECTION="$(/usr/bin/osascript -l JavaScript - "${TMP}/releases.json" "$EXECUTABLE" "$TARGET_TAG" <<'JXA'
@@ -179,7 +184,7 @@ DOWNLOAD_PROGRESS=--silent
 if [ -n "${UPDATE_PROGRESS_FILE:-}" ]; then
     DOWNLOAD_PROGRESS=--progress-bar
 fi
-if ! curl -fL "$DOWNLOAD_PROGRESS" --max-time 180 -o "${TMP}/CodexUsage.zip" "$ZIP_URL" 2>"${UPDATE_PROGRESS_FILE:-/dev/null}"; then
+if ! curl -fL "$DOWNLOAD_PROGRESS" --retry 2 --retry-delay 2 --max-time 180 -o "${TMP}/CodexUsage.zip" "$ZIP_URL" 2>"${UPDATE_PROGRESS_FILE:-/dev/null}"; then
     echo "!! 发布包下载失败，请稍后重试"
     exit 1
 fi
@@ -219,7 +224,22 @@ if ! codesign --verify --deep --strict "$NEW_APP"; then
     echo "!! 新版本签名校验未通过，已中止"
     exit 1
 fi
-if ! "$NEW_BINARY" --self-test; then
+# 自检是停机前唯一无界步骤：限时 120 秒，挂起即中止（后台运行 + 轮询 + 超时 kill）
+"$NEW_BINARY" --self-test &
+SELF_TEST_PID=$!
+SELF_TEST_RC=0
+for _ in $(seq 1 120); do
+    kill -0 "$SELF_TEST_PID" 2>/dev/null || break
+    sleep 1
+done
+if kill -0 "$SELF_TEST_PID" 2>/dev/null; then
+    kill "$SELF_TEST_PID" 2>/dev/null || true
+    wait "$SELF_TEST_PID" 2>/dev/null || true
+    echo "!! 新版本离线自检超时（120 秒未完成），已中止"
+    exit 1
+fi
+wait "$SELF_TEST_PID" || SELF_TEST_RC=$?
+if [ "$SELF_TEST_RC" -ne 0 ]; then
     echo "!! 新版本离线自检未通过，已中止"
     exit 1
 fi
@@ -231,7 +251,16 @@ fi
 if JOB_INFO="$(launchctl print "gui/${MYUID}/${LABEL}" 2>/dev/null)"; then
     LOADED_BINARY="$(printf '%s\n' "$JOB_INFO" | awk '/^[[:space:]]*program = / { sub(/^[[:space:]]*program = /, ""); print; exit }')"
     [ "$LOADED_BINARY" = "$BINARY" ] || { echo "!! 已加载的 LaunchAgent 指向另一副本或无法确认，已中止"; exit 1; }
-    [ -f "$AGENT_PLIST" ] || { echo "!! LaunchAgent plist 不存在"; exit 1; }
+    if [ ! -f "$AGENT_PLIST" ]; then
+        # 旧版本关闭自启时只删 plist 不 bootout，已加载 job 与磁盘状态会脱节，导致更新
+        # 被永久阻断。已加载 program 已确认指向本应用，按开启自启的同款内容重写后继续；
+        # 本脚本稍后本就 bootout → 换包 → bootstrap，重写内容即为最终生效状态。
+        mkdir -p "$(dirname "$AGENT_PLIST")"
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n    <key>Label</key><string>%s</string>\n    <key>ProgramArguments</key>\n    <array><string>%s</string></array>\n    <key>RunAtLoad</key><true/>\n    <key>KeepAlive</key>\n    <dict><key>SuccessfulExit</key><false/></dict>\n</dict>\n</plist>\n' \
+            "$LABEL" "$BINARY" > "$AGENT_PLIST" \
+            || { echo "!! LaunchAgent plist 不存在且重写失败，已中止"; exit 1; }
+        echo "==> 已加载的 LaunchAgent 缺少 plist 文件，已按当前安装位置重写"
+    fi
     AGENT_BINARY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null || true)"
     [ "$AGENT_BINARY" = "$BINARY" ] || { echo "!! LaunchAgent 指向另一副本，已中止"; exit 1; }
     AGENT=1
@@ -247,6 +276,11 @@ if ! cp -R "$NEW_APP" "$STAGE"; then
     exit 1
 fi
 [ -x "${STAGE}/Contents/MacOS/${EXECUTABLE}" ] || { echo "!! 暂存后的新版本内容异常，已中止"; exit 1; }
+# 拷贝过程可能丢元数据：暂存副本复验一次签名，再进入停机换包
+if ! codesign --verify --deep --strict "$STAGE"; then
+    echo "!! 暂存后的新版本签名校验未通过，已中止"
+    exit 1
+fi
 
 echo "==> 4/5 停止 ${LABEL} 并切换版本"
 if [ "$AGENT" = 1 ]; then
