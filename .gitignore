@@ -8,3 +8,17 @@ icon_1024x1024.png
 
 # Python 测试缓存
 __pycache__/
+
+# 本地审查工作台（内嵌兄弟项目仓库，不入库）
+.sibling-doc-review/
+
+# 设计稿工作目录（探索性草稿与截图，定稿后另行提交）
+docs/design/codexusage-balanced-b/
+docs/design/codexusage-balanced-b-screenshots/
+docs/design/codexusage-card-options/
+docs/design/codexusage-card-options-screenshots/
+docs/design/codexusage-compact-b/
+docs/design/codexusage-compact-b-screenshots/
+docs/design/full-card-native-preview/full-card-bottom.png
+docs/design/full-card-native-preview/full-card-expanded-bottom.png
+docs/design/full-card-native-preview/full-card-expanded-top.png
