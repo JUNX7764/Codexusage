@@ -12,6 +12,12 @@ enum UsageSourceStatus {
     }
 }
 
+/// 本机扫描 / 外部来源 / 官方查询结果共用的 30 分钟过期阈值：
+/// 超过该时长未成功刷新即在 UI 标注过期（面板、比较与菜单栏口径一致）
+enum UsageFreshness {
+    static let staleSeconds: TimeInterval = 1800
+}
+
 enum UsageAttribution {
     // Most-specific root owns an overlapping path; equal roots keep their first owner.
     static func owner(path: String, roots: [String]) -> Int? {

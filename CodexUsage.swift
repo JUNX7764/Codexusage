@@ -27,7 +27,9 @@ enum CodexNumber {
 enum AtomicJSONFile {
     static func replace(_ data: Data, at path: String) throws {
         let directory = (path as NSString).deletingLastPathComponent
-        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        // 目录缺失时显式收权到仅所有者（凭据与状态文件都不应给其他用户留读面）
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
         let existingMode = (try? FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber)
             .map { Int16(truncating: $0) }
         let requested = existingMode ?? 0o600
@@ -156,7 +158,7 @@ enum TiboFreshness {
 //     totalTokens 口径一致（其值 = input + cacheRead + output，实测对账吻合）
 // 凭证红线：access_token / refresh_token / id_token 只存在于内存，绝不写入日志、
 //   status.json、scan-state.json 或提交；~/.codex/ 只读，唯一例外是 401 刷新成功后
-//   按 PLAN §2 原子写回 auth.json 本身。
+//   经 AtomicJSONFile 原子合并写回 auth.json 本身（Codex CLI 轮换优先）。
 
 // MARK: - Codex CLI 凭证读取（只读 ~/.codex/auth.json）
 //
@@ -223,25 +225,35 @@ enum CodexAuth {
     /// Re-read and merge into the newest document. A Codex CLI rotation during refresh wins.
     static func writeBack(at path: String = authPath, expected: Tokens, accessToken: String,
                           refreshToken: String?, idToken: String?) throws -> (access: String, wrote: Bool) {
-        guard let data = FileManager.default.contents(atPath: path),
-              var obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              var tokens = obj["tokens"] as? [String: Any],
-              let latestAccess = tokens["access_token"] as? String, !latestAccess.isEmpty else {
-            throw NSError(domain: "CodexUsage.Auth", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "auth.json missing tokens.access_token"])
+        func readLatest() throws -> (obj: [String: Any], tokens: [String: Any], latest: Tokens) {
+            guard let data = FileManager.default.contents(atPath: path),
+                  let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tokens = obj["tokens"] as? [String: Any],
+                  let latestAccess = tokens["access_token"] as? String, !latestAccess.isEmpty else {
+                throw NSError(domain: "CodexUsage.Auth", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "auth.json missing tokens.access_token"])
+            }
+            let latest = Tokens(accessToken: latestAccess,
+                                refreshToken: tokens["refresh_token"] as? String,
+                                idToken: tokens["id_token"] as? String,
+                                email: (tokens["id_token"] as? String).flatMap(jwtEmail),
+                                accountID: tokens["account_id"] as? String)
+            return (obj, tokens, latest)
         }
-        let latest = Tokens(accessToken: latestAccess,
-                            refreshToken: tokens["refresh_token"] as? String,
-                            idToken: tokens["id_token"] as? String,
-                            email: (tokens["id_token"] as? String).flatMap(jwtEmail),
-                            accountID: tokens["account_id"] as? String)
-        guard sameAuth(expected, latest) else { return (latestAccess, false) }
+        let first = try readLatest()
+        guard sameAuth(expected, first.latest) else { return (first.latest.accessToken, false) }
+        var obj = first.obj
+        var tokens = first.tokens
         tokens["access_token"] = accessToken
         if let r = refreshToken, !r.isEmpty { tokens["refresh_token"] = r }
         if let i = idToken, !i.isEmpty { tokens["id_token"] = i }
         obj["tokens"] = tokens
         obj["last_refresh"] = Fmt.isoFrac.string(from: Date())
         let updated = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+        // rename 前对磁盘最新值复检一次：把「序列化期间 Codex CLI 完成轮换」的竞态窗口
+        // 从毫秒级压到微秒级；复检不一致时放弃写入、保留 CLI 的最新凭据
+        let second = try readLatest()
+        guard sameAuth(first.latest, second.latest) else { return (second.latest.accessToken, false) }
         try AtomicJSONFile.replace(updated, at: path)
         return (accessToken, true)
     }
@@ -346,7 +358,6 @@ struct UsageData {
     var extError: String?           // 外部用量已安装来源全部不可读
     var fiveHourError: String?
     var sevenDayError: String?
-    var updatedAt: Date = Date()
 }
 
 enum AccountIsolation {
@@ -874,10 +885,12 @@ enum TokenScanner {
         let cutoff30 = dayFmt.string(from: calendar.date(byAdding: .day, value: -29, to: now)!)
         var seen = Set<String>()
         var enumed = false
+        var enumFailed = false
         if let enumm = FileManager.default.enumerator(
             at: URL(fileURLWithPath: root),
             includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]) {
+            options: [.skipsHiddenFiles],
+            errorHandler: { _, _ in enumFailed = true; return true }) {
             enumed = true
             for case let url as URL in enumm {
                 let name = url.lastPathComponent
@@ -978,7 +991,9 @@ enum TokenScanner {
                 st.files[path] = entry
             }
         }
-        if enumed {
+        // 枚举部分失败（子目录暂不可读）时不清理未见面：保留旧条目避免误删仍在窗口内的贡献，
+        // 目录恢复可读后下一轮自然收敛（ExternalTokenScanner 同口径）
+        if enumed && !enumFailed {
             for path in Array(st.files.keys) where !seen.contains(path) { st.files.removeValue(forKey: path) }
         }
         if statePath == defaultStatePath { cache = st }
@@ -1072,10 +1087,9 @@ enum TokenScanner {
 
     private static func saveState(_ s: State, to path: String) {
         guard let data = try? JSONEncoder().encode(s) else { return }
-        try? FileManager.default.createDirectory(
-            atPath: (path as NSString).deletingLastPathComponent,
-            withIntermediateDirectories: true)
-        try? data.write(to: URL(fileURLWithPath: path), options: [.atomic])
+        // 复用凭据链的原子写：UUID 临时名 + rename + 仅所有者权限
+        // （状态文件含会话绝对路径与逐文件聚合，不应给其他用户留读面）
+        try? AtomicJSONFile.replace(data, at: path)
     }
 }
 
@@ -1118,6 +1132,7 @@ enum ExternalTokenScanner {
     /// 按文件增量扫描状态：offset 为已消费字节数，days 为按日聚合 [input, output]
     struct FileState: Codable {
         var offset: UInt64 = 0
+        var mtime: Double?
         var days: [String: [Double]] = [:]
         var daysByModel: [String: [String: [Double]]] = [:]
     }
@@ -1145,6 +1160,9 @@ enum ExternalTokenScanner {
     // v4 proma 源切 agent-sessions 对齐 Token Monitor、v5 增加模型维度）
     static let defaultStatePath = NSHomeDirectory()
         + "/Library/Application Support/CodexUsage/external-scan-state-v5.json"
+
+    // 与 TokenScanner.scan 同款互斥：状态读改写不是原子的，防止未来调用方并发进入
+    private static let lock = NSLock()
 
     // 只关心近 30 天窗口，日聚合保留 31 天余量
     private static let retainSeconds: TimeInterval = 31 * 86400
@@ -1174,6 +1192,7 @@ enum ExternalTokenScanner {
                      statePath: String = defaultStatePath,
                      now: Date = Date(),
                      hermesFailAfterRows: Int? = nil) -> Result {
+        lock.lock(); defer { lock.unlock() }
         var st = loadState(at: statePath)
         // Collapse old aliases before aggregation; keep the most advanced snapshot.
         var canonicalFiles: [String: FileState] = [:]
@@ -1272,31 +1291,64 @@ enum ExternalTokenScanner {
                       let size = vals.fileSize
                 else { rootFailed = true; continue }
                 let sizeU = UInt64(size)
+                let mtimeU = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
                 var fs = st.files[path] ?? FileState()
-                // 文件只增不改：大小未变直接跳过（绝大多数文件走这里）
-                if fs.offset == sizeU { st.files[path] = fs; continue }
+                // 文件只增不改：大小与 mtime 均未变才跳过（绝大多数文件走这里）
+                if fs.offset == sizeU, let cached = fs.mtime, cached == mtimeU {
+                    st.files[path] = fs; continue
+                }
                 // 首次见到且 31 天未修改：旧内容不可能贡献近 30 天数据，记录大小后跳过
                 if fs.offset == 0, fs.days.isEmpty,
                    let mtime = vals.contentModificationDate, mtime < cutoff {
-                    fs.offset = sizeU; st.files[path] = fs; continue
+                    fs.offset = sizeU; fs.mtime = mtimeU; st.files[path] = fs; continue
                 }
                 // 截断/轮换：该文件的旧聚合已不可信，清零重扫
                 if sizeU < fs.offset { fs = FileState() }
+                // 同字节数整文件重写：offset 已追平但 mtime 与上次记录不同 → 旧聚合不可信，
+                // 清零重扫（mtime 缺失为 0 时无法判断，保持旧行为避免每轮重扫）
+                if fs.offset == sizeU, fs.mtime != nil, mtimeU != 0 { fs = FileState() }
 
                 guard let fh = try? FileHandle(forReadingFrom: url) else { rootFailed = true; continue }
                 fh.seek(toFileOffset: fs.offset)
-                guard let data = try? fh.readToEnd() else { try? fh.close(); rootFailed = true; continue }
-                try? fh.close()
-                // 只消费到最后一个完整换行：正在被写入的残缺行留给下次
-                guard let lastNL = data.lastIndex(of: UInt8(ascii: "\n")) else { continue }
-                let consumed = fs.offset + UInt64(lastNL + 1)
-                if let text = String(data: data[..<lastNL], encoding: .utf8) {
-                    parseLines(text, cutoffKey: cutoffKey, into: &fs)
+                // 与 TokenScanner 同款分块读 + 行缓冲：首见的大文件不再整份载入内存；
+                // 只消费到最后一个完整换行，正在被写入的残缺行留给下次
+                var pending = Data()
+                var consumed = fs.offset
+                var readError = false
+                while true {
+                    let chunk: Data
+                    do {
+                        // nil / empty = 已到文件末尾（offset 追平属正常状态）；抛错才置失败
+                        guard let read = try fh.read(upToCount: 256 * 1024) else { break }
+                        chunk = read
+                    } catch { readError = true; break }
+                    if chunk.isEmpty { break }
+                    var start = chunk.startIndex
+                    while let nl = chunk[start...].firstIndex(of: 10) {
+                        pending.append(contentsOf: chunk[start..<nl])
+                        if let line = String(data: pending, encoding: .utf8) {
+                            parseLine(line, cutoffKey: cutoffKey, into: &fs)
+                        }
+                        consumed += UInt64(pending.count) + 1
+                        pending.removeAll(keepingCapacity: true)
+                        start = chunk.index(after: nl)
+                    }
+                    pending.append(contentsOf: chunk[start...])
                 }
-                fs.offset = consumed
-                fs.days = fs.days.filter { $0.key >= cutoffKey }
-                fs.daysByModel = fs.daysByModel.filter { $0.key >= cutoffKey }
-                st.files[path] = fs
+                try? fh.close()
+                if readError { rootFailed = true; continue }
+                if consumed > fs.offset {
+                    fs.offset = consumed
+                    fs.mtime = mtimeU
+                    fs.days = fs.days.filter { $0.key >= cutoffKey }
+                    fs.daysByModel = fs.daysByModel.filter { $0.key >= cutoffKey }
+                    st.files[path] = fs
+                } else if fs.mtime != mtimeU {
+                    // EOF 无新字节：补记 mtime 完成 v5 旧缓存条目迁移，
+                    // 否则缺失 mtime 的条目每轮扫描都要空 open 一次
+                    fs.mtime = mtimeU
+                    st.files[path] = fs
+                }
             }
             status[root] = rootFailed ? .failed : .available
             if rootFailed { enumedRoots.removeAll { $0 == realPath(root) } }
@@ -1318,51 +1370,58 @@ enum ExternalTokenScanner {
     /// input 含 cache read/write：对齐外部中转/用量 monitor 的总量口径
     ///（cache_read 是长会话每轮上下文全额重读，量级远大于净 input，别误当虚高）。
     static func parseLines(_ text: String, cutoffKey: String, into st: inout FileState) {
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true)
-        where line.contains("\"usage\"") {
-            guard let data = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
-            // Proma result 行的 modelUsage / 顶层 usage 是全会话累计汇总，
-            // 逐条 assistant 行已含每次调用，跳过汇总行避免双算
-            if obj["modelUsage"] != nil { continue }
-            let t: Date
-            if let ms = CodexNumber.finite(obj["_createdAt"]) {
-                t = Date(timeIntervalSince1970: ms / 1000)
-            } else if let ts = Fmt.iso(obj["timestamp"] as? String) {
-                t = ts
-            } else if let ms = CodexNumber.finite(obj["time"]) {
-                t = Date(timeIntervalSince1970: ms / 1000)
-            } else { continue }
-            let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any]
-                ?? obj["usage"] as? [String: Any]
-                ?? (obj["message"] as? [String: Any])?["usage"] as? [String: Any]
-            guard let usage = usage else { continue }
-            let model = (obj["message"] as? [String: Any])?["model"] as? String
-                ?? obj["model"] as? String
-            guard let model = model, isOpenAIModel(model) else { continue }
-            var input: Double = 0
-            for k in ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
-                      "input", "cacheRead", "cacheWrite"] {
-                if let v = CodexNumber.finite(usage[k]) { input += v }
-            }
-            var output: Double = 0
-            for k in ["output", "output_tokens"] {
-                if let v = CodexNumber.finite(usage[k]) { output += v }
-            }
-            let dayKey = dayFmt.string(from: t)
-            if dayKey >= cutoffKey {
-                var day = st.days[dayKey] ?? [0, 0]
-                day[0] += input
-                day[1] += output
-                st.days[dayKey] = day
-                var models = st.daysByModel[dayKey] ?? [:]
-                var modelDay = models[model] ?? [0, 0]
-                modelDay[0] += input
-                modelDay[1] += output
-                models[model] = modelDay
-                st.daysByModel[dayKey] = models
-            }
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            parseLine(String(line), cutoffKey: cutoffKey, into: &st)
+        }
+    }
+
+    /// 解析单行；分块读取时逐行调用，避免把整个新增长度一次性转成 String
+    static func parseLine(_ line: String, cutoffKey: String, into st: inout FileState) {
+        guard line.contains("\"usage\""),
+              let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+        // Proma result 行的 modelUsage / 顶层 usage 是全会话累计汇总，
+        // 逐条 assistant 行已含每次调用，跳过汇总行避免双算
+        if obj["modelUsage"] != nil { return }
+        let t: Date
+        if let ms = CodexNumber.finite(obj["_createdAt"]) {
+            t = Date(timeIntervalSince1970: ms / 1000)
+        } else if let ts = Fmt.iso(obj["timestamp"] as? String) {
+            t = ts
+        } else if let ms = CodexNumber.finite(obj["time"]) {
+            t = Date(timeIntervalSince1970: ms / 1000)
+        } else { return }
+        let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any]
+            ?? obj["usage"] as? [String: Any]
+            ?? (obj["message"] as? [String: Any])?["usage"] as? [String: Any]
+        guard let usage = usage else { return }
+        let model = (obj["message"] as? [String: Any])?["model"] as? String
+            ?? obj["model"] as? String
+        guard let model = model, isOpenAIModel(model) else { return }
+        // input 键名有 snake_case 与 camelCase 两套，分别来自不同产方；同一 usage 只出
+        // 一套——任一主键 finite 命中即整套生效，缺失才回退别名，防止两套同名含义双算
+        let inputKeys = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+        let inputAliases = ["input", "cacheRead", "cacheWrite"]
+        var input: Double = 0
+        for k in inputKeys.contains(where: { CodexNumber.finite(usage[$0]) != nil }) ? inputKeys : inputAliases {
+            if let v = CodexNumber.finite(usage[k]) { input += v }
+        }
+        var output: Double = 0
+        if let v = CodexNumber.finite(usage["output_tokens"]) { output = v }
+        else if let v = CodexNumber.finite(usage["output"]) { output = v }
+        let dayKey = dayFmt.string(from: t)
+        if dayKey >= cutoffKey {
+            var day = st.days[dayKey] ?? [0, 0]
+            day[0] += input
+            day[1] += output
+            st.days[dayKey] = day
+            var models = st.daysByModel[dayKey] ?? [:]
+            var modelDay = models[model] ?? [0, 0]
+            modelDay[0] += input
+            modelDay[1] += output
+            models[model] = modelDay
+            st.daysByModel[dayKey] = models
         }
     }
 
@@ -1373,6 +1432,8 @@ enum ExternalTokenScanner {
         var db: OpaquePointer?
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db = db
         else { _ = db.map { sqlite3_close($0) }; return false }
+        // 上游 hermes 写入中（WAL/锁）时等待而非整轮置败；只读打开绝不写入
+        sqlite3_busy_timeout(db, 2000)
         defer { sqlite3_close(db) }
         // 行身份键与 KimiUsage 一致：同一 (session,model) 可因 task/billing 拆成多行；
         // input 含 cache read/write（与文件来源同口径，对齐中转/monitor 总量）
@@ -1500,16 +1561,8 @@ enum ExternalTokenScanner {
 
     private static func saveState(_ s: State, at path: String) {
         guard let data = try? JSONEncoder().encode(s) else { return }
-        try? FileManager.default.createDirectory(
-            atPath: (path as NSString).deletingLastPathComponent,
-            withIntermediateDirectories: true)
-        // 与 AtomicJSONFile.replace 同思路：临时文件 + 原子 rename，避免半写状态
-        let dir = (path as NSString).deletingLastPathComponent
-        let tmp = dir + "/." + (path as NSString).lastPathComponent + ".tmp"
-        if (try? data.write(to: URL(fileURLWithPath: tmp), options: [.atomic])) != nil {
-            _ = try? FileManager.default.replaceItemAt(
-                URL(fileURLWithPath: path), withItemAt: URL(fileURLWithPath: tmp))
-        }
+        // 复用凭据链的原子写：UUID 临时名 + rename + 仅所有者权限（与 TokenScanner 同口径）
+        try? AtomicJSONFile.replace(data, at: path)
     }
 }
 
@@ -1755,7 +1808,9 @@ final class UpdateProgressController: NSObject {
             export UPDATE_PROGRESS_FILE="$1/progress"
             /bin/bash "$1/update.sh" "$2" "$3" > "$1/log" 2>&1
             result=$?
-            printf '%s' "$result" > "$1/result"
+            # 先写临时文件再 mv：轮询方读到空 result 不会误判为失败
+            printf '%s' "$result" > "$1/.result.tmp"
+            /bin/mv "$1/.result.tmp" "$1/result"
             if [ "$result" -ne 0 ] && /usr/bin/grep -q '4/5' "$1/log"; then
                 detail=$(/usr/bin/grep '!!' "$1/log" | /usr/bin/tail -1)
                 /usr/bin/osascript - "${detail:-更新未完成，请查看日志。}" "$1/log" <<'APPLESCRIPT' >/dev/null 2>&1
@@ -1812,13 +1867,20 @@ final class UpdateProgressController: NSObject {
             setPhase(.downloading, fraction: value)   // 百分比尚未写出时保留旧值
         }
         if let result = try? String(contentsOf: dir.appendingPathComponent("result"), encoding: .utf8) {
-            if result != "0" {
+            let code = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !code.isEmpty else { return }   // result 尚未写完整，下轮再读
+            timer?.invalidate(); timer = nil
+            if code == "0" {
+                // 正常路径下旧进程已被脚本替换重启，走不到这里；兜底停止轮询
+                setPhase(.finished)
+            } else if log.contains("4/5") || log.contains("5/5") {
+                // 停机/换包阶段失败由 wrapper 弹系统对话框兜底（那一刻本进程可能已被替换），
+                // 这里只恢复面板按钮状态，不再重复弹模态框
+                directory = nil
+                setPhase(.failed)
+            } else {
                 let detail = log.components(separatedBy: .newlines).last(where: { $0.contains("!!") }) ?? "更新未完成，请查看日志。"
                 finishError(detail.replacingOccurrences(of: "!! ", with: ""))
-            } else {
-                // 正常路径下旧进程已被脚本替换重启，走不到这里；兜底停止轮询
-                timer?.invalidate(); timer = nil
-                setPhase(.finished)
             }
         }
     }
@@ -2083,7 +2145,6 @@ struct UsagePanelModel {
     var resetCards: ResetSection?
     var tibo: TiboSection?
     var codexTokens: TokenSection
-    var externalTokens: TokenSection?
     var official: OfficialUsageSnapshot?
     var officialError: String?
     var officialTodayFill: Double?   // 官方日桶缺今日时以与用量情况同口径的本机合并今日用量补足（Codex+外部）
@@ -2329,6 +2390,20 @@ class PanelCardView: NSView {
     }
 }
 
+/// 套餐徽标：layer 背景随当前绘制外观解析（与 PanelCardView 同款），深浅色切换即时响应
+private final class PlanBadgeLabel: NSTextField {
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.12).cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
 final class PanelHeaderView: NSView {
     init(model: UsagePanelModel) {
         super.init(frame: .zero)
@@ -2347,9 +2422,14 @@ final class PanelHeaderView: NSView {
         let title = PanelUI.label(model.title, size: 15, weight: .semibold, wrapping: false)
         titleRow.addArrangedSubview(title)
         if let plan = model.plan, !plan.isEmpty {
-            let badge = PanelUI.label(" " + plan + " ", size: 10, weight: .semibold, color: .secondaryLabelColor, wrapping: false)
+            let badge = PlanBadgeLabel(wrappingLabelWithString: " " + plan + " ")
+            badge.font = .systemFont(ofSize: 10, weight: .semibold)
+            badge.textColor = .secondaryLabelColor
+            badge.maximumNumberOfLines = 1
+            badge.cell?.lineBreakMode = .byTruncatingTail
+            badge.translatesAutoresizingMaskIntoConstraints = false
+            badge.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             badge.wantsLayer = true; badge.layer?.cornerRadius = 4
-            badge.layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.12).cgColor
             badge.toolTip = plan; titleRow.addArrangedSubview(badge)
         }
         titleRow.addArrangedSubview(PanelUI.spacer())
@@ -2507,8 +2587,7 @@ final class ResetCardSectionView: PanelCardView {
             header.addArrangedSubview(button)
         }
         contentStack.addArrangedSubview(header)
-        for (index, rowModel) in model.rows.enumerated() {
-            _ = index
+        for rowModel in model.rows {
             let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
             let color: NSColor = rowModel.warning ? PanelAccent.codex.color : .labelColor
             // 即将到期只用语义色区分，不加 ⚠ 前缀：长卡名（如"完全重置（每周 + 5 小时）"）会因此换行
@@ -2811,7 +2890,12 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         PanelUI.addFullWidth(heading, to: root)
         guard dailyExpanded else { return root }
         let total = PanelUI.label(Fmt.tokensAbbr(model.official?.lifetime), size: 19, weight: .semibold, monospacedDigits: true)
-        total.toolTip = model.official?.lifetime.map { String(format: "%.0f Token", $0) } ?? "暂无累计数据"
+        // PRD 5.1：悬停可读未缩写总数、来源与最近成功查询时间
+        if let snapshot = model.official, let lifetime = snapshot.lifetime {
+            total.toolTip = String(format: "%.0f Token · 来源：官方账号用量 · 最后成功 %@", lifetime, Fmt.time(snapshot.fetchedAt))
+        } else {
+            total.toolTip = "暂无累计数据"
+        }
         let totalRow = PanelUI.stack(orientation: .horizontal, alignment: .firstBaseline, spacing: 7)
         totalRow.heightAnchor.constraint(equalToConstant: 28).isActive = true
         totalRow.addArrangedSubview(total)
@@ -2841,7 +2925,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         comparison.heightAnchor.constraint(equalToConstant: 32).isActive = true
         PanelUI.addFullWidth(comparison, to: root)
         if let error = model.officialError { PanelUI.addFullWidth(PanelUI.label(error, size: 10, color: .secondaryLabelColor), to: root) }
-        if let snapshot = model.official, Date().timeIntervalSince(snapshot.fetchedAt) > 1800 {
+        if let snapshot = model.official, Date().timeIntervalSince(snapshot.fetchedAt) > UsageFreshness.staleSeconds {
             PanelUI.addFullWidth(PanelUI.label("数据已过期 · 最后成功 \(Fmt.dayTime(snapshot.fetchedAt))", size: 10, color: .secondaryLabelColor), to: root)
         }
         return root
@@ -2874,7 +2958,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             row.addArrangedSubview(bar)
             let value = PanelUI.label(Fmt.tokensAbbr(item.total), size: 11, wrapping: false, monospacedDigits: true); value.alignment = .right; value.widthAnchor.constraint(equalToConstant: 52).isActive = true
             row.addArrangedSubview(value)
-            row.toolTip = "输入 \(Fmt.tokensAbbr(item.input)) · 输出 \(Fmt.tokensAbbr(item.output)) · \(item.status.text)"
+            let share = total > 0 ? Int(round((item.total ?? 0) / total * 100)) : 0
+            row.toolTip = "占比 \(share)% · 输入 \(Fmt.tokensAbbr(item.input)) · 输出 \(Fmt.tokensAbbr(item.output)) · \(item.status.text)"
             PanelUI.addFullWidth(row, to: root)
         }
         return root
@@ -3514,8 +3599,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
     // （与 GlmUsage 的静默保留旧数据不同，这是刻意改进：过期数据必须可见）
     private let quotaStaleAfter: TimeInterval = 600
-    private let tokensStaleAfter: TimeInterval = 1800
-    private let tiboStaleAfter: TimeInterval = 1800
+    private let tokensStaleAfter: TimeInterval = UsageFreshness.staleSeconds
+    private let tiboStaleAfter: TimeInterval = UsageFreshness.staleSeconds
     private var fiveHourLastOK: Date?
     private var sevenDayLastOK: Date?
     private var tokensLastOK: Date?
@@ -3840,7 +3925,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 if let self = self {
                     if self.acceptAccountResponse(generation: generation, identity: identity) { self.applyQuota(r) }
-                    self.updateUI()
                 }
                 group.leave()
             }
@@ -3951,7 +4035,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.sevenDayError = r.sevenDay == nil ? (r.sevenDayError ?? r.error) : nil
         usage.quotaError = r.error
         usage.email = r.email ?? usage.email
-        usage.updatedAt = Date()
     }
 
     private func applyTokens(_ r: TokenScanner.Result) {
@@ -3964,7 +4047,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.tokens30d = r.thirty
             usage.tokensError = nil
         }
-        usage.updatedAt = Date()
     }
 
     // 外部用量：成功则全量替换快照；已安装来源全部不可读时保留旧值、不推进 lastOK
@@ -3982,7 +4064,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.ext30d = r.thirty
             usage.extError = nil
         }
-        usage.updatedAt = Date()
     }
 
     // 重置卡：成功则更新并清错误；瞬时失败保留上次数据、仅记录错误
@@ -3993,7 +4074,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.resetCards = r.value
         resetCardsLastOK = r.lastOK
         usage.resetCardsError = r.error
-        usage.updatedAt = Date()
     }
 
     // Tibo 动态：304 = 内容未变但服务端确认有效（推进成功时间）；失败保留旧数据与旧成功时间。
@@ -4005,7 +4085,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.tiboCheckedAt = r.checkedAt
         tiboLastOK = r.lastOK
         usage.tiboError = r.error
-        usage.updatedAt = Date()
     }
 
     // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
@@ -4078,8 +4157,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !active, UpdateProgressController.shared.phase == .failed {
                 panelController.setUpdateMessage("更新失败，详见弹窗提示", dismissAfter: 8)
             }
+            renderBar()
+        } else if UpdateProgressController.shared.isActive {
+            // 下载进行中的百分比通知：只刷新 toolTip（含进度行文本），不重绘菜单栏图片、不重写 status.json
+            statusItem.button?.toolTip = barToolTip()
         }
-        renderBar()
+    }
+
+    /// 菜单栏悬停提示：各来源最后成功时间 + 进行中的更新阶段
+    private func barToolTip() -> String {
+        var text = "Codex 用量"
+            + (usage.fiveHourNotApplicable ? "" : " · 5H成功 \(fiveHourLastOK.map { Fmt.time($0) } ?? "--")")
+            + " · 7D成功 \(sevenDayLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · 外部最后成功 \(extLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · 重置卡最后成功 \(resetCardsLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · Tibo 最后成功 \(tiboLastOK.map { Fmt.time($0) } ?? "--")"
+        if UpdateProgressController.shared.isActive {
+            text += " · \(UpdateProgressController.shared.statusLine)"
+        }
+        return text
     }
 
     private func renderBar() {
@@ -4097,17 +4194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ? StackImage.make(line1: line2, line2: nil) : StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
-        statusItem.button?.toolTip = "Codex 用量"
-            + (usage.fiveHourNotApplicable ? "" : " · 5H成功 \(fiveHourLastOK.map { Fmt.time($0) } ?? "--")")
-            + " · 7D成功 \(sevenDayLastOK.map { Fmt.time($0) } ?? "--")"
-            + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
-            + " · 外部最后成功 \(extLastOK.map { Fmt.time($0) } ?? "--")"
-            + " · 重置卡最后成功 \(resetCardsLastOK.map { Fmt.time($0) } ?? "--")"
-            + " · Tibo 最后成功 \(tiboLastOK.map { Fmt.time($0) } ?? "--")"
-        if UpdateProgressController.shared.isActive {
-            statusItem.button?.toolTip = (statusItem.button?.toolTip ?? "")
-                + " · \(UpdateProgressController.shared.statusLine)"
-        }
+        statusItem.button?.toolTip = barToolTip()
         if !visualPreview {
             writeStatus(line1: usage.fiveHourNotApplicable ? "\(line2.label) \(line2.value)" : "\(line1.label) \(line1.value)", line2: usage.fiveHourNotApplicable ? "" : "\(line2.label) \(line2.value)")
         }
@@ -4116,7 +4203,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 自诊断：把渲染内容写到本地，便于排查（绝不写任何凭证值）
     private func writeStatus(line1: String, line2: String) {
         let dir = NSHomeDirectory() + "/Library/Application Support/CodexUsage"
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
         func iso(_ d: Date?) -> String { d.map { ISO8601DateFormatter().string(from: $0) } ?? "" }
         let cardsNow = CodexFreshness.availableCards(usage.resetCards ?? [], now: Date())
         let info: [String: Any] = [
@@ -4158,11 +4246,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "updateAvailable": UpdateChecker.shared.available
         ]
         if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
-            try? data.write(to: URL(fileURLWithPath: dir + "/status.json"))
+            // 与扫描状态文件同口径：仅所有者可读（内容含会话路径与统计聚合）
+            try? AtomicJSONFile.replace(data, at: dir + "/status.json")
         }
     }
 
-    // 下拉面板（PLAN §4 自上而下）：typed model 与网络/扫描数据在同一渲染入口组装
+    // 下拉面板（六卡片自上而下，见 docs/project/11-usage-insights-prd.md §3）：
+    // typed model 与网络/扫描数据在同一渲染入口组装
     private func rebuildMenu() {
         func notice(_ text: String, _ level: UsagePanelModel.NoticeLevel = .info) -> UsagePanelModel.Notice {
             UsagePanelModel.Notice(text: text, level: level)
@@ -4318,31 +4408,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let codexSection = UsagePanelModel.TokenSection(title: "用量情况", accent: .codex,
             buckets: codexBuckets, notices: codexNotices)
 
-        var externalSection: UsagePanelModel.TokenSection?
-        if usage.extToday != nil || usage.ext7d != nil || usage.ext30d != nil || usage.extError != nil {
-            let buckets = [
-                bucket("今天", "今天", total: usage.extToday?.total,
-                    input: usage.extToday?.input, output: usage.extToday?.output,
-                    models: usage.extToday?.models),
-                bucket("7 天", "近 7 天", total: usage.ext7d?.total,
-                    input: usage.ext7d?.input, output: usage.ext7d?.output,
-                    models: usage.ext7d?.models),
-                bucket("30 天", "近 30 天", total: usage.ext30d?.total,
-                    input: usage.ext30d?.input, output: usage.ext30d?.output,
-                    models: usage.ext30d?.models)
-            ]
-            var notices: [UsagePanelModel.Notice] = []
-            if let error = usage.extError {
-                notices.append(notice("外部用量统计失败：\(error)", .error))
-            }
-            if extStale {
-                notices.append(notice(
-                    "⚠ 外部用量已过期（最后成功 \(extLastOK.map { Fmt.dayTime($0) } ?? "--")）", .warning))
-            }
-            externalSection = UsagePanelModel.TokenSection(title: "外部用量（非Codex）", accent: .external,
-                buckets: buckets, notices: notices)
-        }
-
         var globalNotices: [UsagePanelModel.Notice] = []
         if let error = usage.quotaError {
             globalNotices.append(notice("额度错误：\(error)", .error))
@@ -4365,7 +4430,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             resetCards: resetSection,
             tibo: tiboSection,
             codexTokens: codexSection,
-            externalTokens: externalSection,
             official: usage.official, officialError: usage.officialError,
             officialTodayFill: LocalUsageMerge.combine(usage.tokensToday, usage.extToday)?.total,
             tools: (0..<3).map { period in
@@ -4506,11 +4570,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// App Translocation：从下载目录直接运行的应用被挂载到只读临时位置
+    private var isTranslocated: Bool {
+        Bundle.main.bundleURL.standardizedFileURL.path.contains("/AppTranslocation/")
+    }
+
     @objc private func onUpdateApp() {
         guard !visualPreview else { return }
-        // App Translocation：从下载目录直接运行的应用被挂载到只读位置，原地更新必然失败，
-        // 在发起更新前拦截并给出安装指引，而不是让脚本在暂存阶段报错。
-        if Bundle.main.bundleURL.standardizedFileURL.path.contains("/AppTranslocation/") {
+        // 原地更新必然失败：发起更新前拦截并给出安装指引，而不是让脚本在暂存阶段报错。
+        if isTranslocated {
             let alert = NSAlert()
             alert.messageText = "无法原地更新"
             alert.informativeText = "CodexUsage 正在从临时位置运行（App Translocation），无法原地替换。\n请退出应用，把 CodexUsage.app 拖入「应用程序」文件夹后从那里打开。"
@@ -4540,6 +4608,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isLoginItemEnabled() {
             try? FileManager.default.removeItem(atPath: launchAgentPath)
         } else {
+            // Translocation 下可执行文件位于只读临时挂载：写进 plist 重启后指向失效路径，
+            // 与更新同款拦截，提示先安装到「应用程序」再开启
+            if isTranslocated {
+                let alert = NSAlert()
+                alert.messageText = "无法开启开机自启"
+                alert.informativeText = "CodexUsage 正在从临时位置运行（App Translocation）。\n请退出应用，把 CodexUsage.app 拖入「应用程序」文件夹后从那里打开，再开启自启。"
+                alert.addButton(withTitle: "好")
+                alert.runModal()
+                updateUI()
+                return
+            }
             let exec = Bundle.main.executablePath ?? ""
             // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
             let plist = """

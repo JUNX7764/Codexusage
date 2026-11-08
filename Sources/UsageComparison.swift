@@ -43,7 +43,7 @@ enum UsageComparison {
         let dailyRange = "\(dates[0]) 对比 \(dates[1])（今日未结束）"
         let weeklyRange = "\(dates[6]) 至 \(dates[0]) 对比 \(dates[13]) 至 \(dates[7])（今日未结束）；\(weeklyFormula)"
         let age = now.timeIntervalSince(snapshot.fetchedAt)
-        let ageReason: String? = age < 0 ? "查询时间异常" : (age > 1800 ? "查询结果已过期" : nil)
+        let ageReason: String? = age < 0 ? "查询时间异常" : (age > UsageFreshness.staleSeconds ? "查询结果已过期" : nil)
         func item(_ range: String, indexes: Range<Int>, current: Range<Int>, prior: Range<Int>) -> Item {
             let prefix = source + "；" + range
             if let ageReason = ageReason { return Item(value: .insufficient, description: prefix + "；" + ageReason) }
