@@ -802,18 +802,18 @@ enum TiboDisplay {
     /// 「预估 <窗口文案>」（无预估时回退事件标题）；预估窗口已过但未确认 → 追加
     /// 「（窗口已过，待确认）」（schedule 不随时间自动完成）；已确认（confirmed）只展示
     /// 最近一条。空列表 → 占位行。
-    static func rows(_ events: [TiboEvent], now: Date) -> [(text: String, link: String)] {
-        guard !events.isEmpty else { return [("暂无重置动态", "")] }
-        var out: [(text: String, link: String)] = []
+    static func rows(_ events: [TiboEvent], now: Date) -> [(text: String, link: String, confirmed: Bool)] {
+        guard !events.isEmpty else { return [("暂无重置动态", "", false)] }
+        var out: [(text: String, link: String, confirmed: Bool)] = []
         for e in events.filter({ $0.status == "announced" && $0.presentationStatus != "likely_completed" })
             .sorted(by: windowDesc).prefix(1) {
             var s = e.estimateLabel.map { "预估 \($0)" } ?? e.title
             if let through = e.estimateThrough, through < now { s += "（窗口已过，待确认）" }
-            out.append((text: s, link: e.link))
+            out.append((text: s, link: e.link, confirmed: false))
         }
         if let latest = events.filter({ $0.status != "announced" }).sorted(by: timeDesc).first {
             let day = latest.occurredAt.map { Fmt.day($0) } ?? ""
-            out.append((text: "✅ " + (day.isEmpty ? "" : day + " ") + latest.title, link: latest.link))
+            out.append((text: (day.isEmpty ? "" : day + " ") + latest.title, link: latest.link, confirmed: true))
         }
         return out
     }
@@ -1631,15 +1631,19 @@ enum StackImage {
             .font: font,
             .foregroundColor: NSColor.labelColor
         ])
+        // 无数据时"--"用 tertiaryLabelColor，与正常值区分
+        let valueColor: NSColor = line.value == "--"
+            ? NSColor(name: nil) { _ in NSColor.tertiaryLabelColor }
+            : RemainingColorTier(remaining: line.remaining).color()
         result.append(NSAttributedString(string: line.value, attributes: [
             .font: font,
-            .foregroundColor: RemainingColorTier(remaining: line.remaining).color()
+            .foregroundColor: valueColor
         ]))
         return result
     }
 
     static func make(line1: Line, line2: Line?, appearance: NSAppearance? = nil) -> NSImage {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 10.0, weight: .semibold)
         let s1 = attributed(line1, font: font)
         let s2 = line2.map { attributed($0, font: font) }
         let w = max(ceil(s1.size().width), ceil(s2?.size().width ?? 0)) + 2
@@ -2122,6 +2126,7 @@ struct UsagePanelModel {
     }
     struct TiboRow {
         var text: String
+        var confirmed: Bool   // 已确认发放，渲染时显示 checkmark.circle.fill
         var item: NSMenuItem?
     }
     struct TiboSection {
@@ -2459,7 +2464,7 @@ final class PanelHeaderView: NSView {
 }
 
 enum UsageBarMetrics {
-    static let height: CGFloat = 6
+    static let height: CGFloat = 8
     static let cornerRadius = height / 2
 }
 
@@ -2569,8 +2574,8 @@ final class ResetCardSectionView: PanelCardView {
     init(model: UsagePanelModel.ResetSection, target: AnyObject, action: Selector) {
         super.init(padding: 8)
         let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-        header.addArrangedSubview(PanelUI.symbol("calendar", size: 15, color: PanelAccent.codex.color))
-        header.addArrangedSubview(PanelUI.label("重置卡", size: 13, weight: .semibold, wrapping: false))
+        header.addArrangedSubview(PanelUI.symbol("calendar", size: 14, color: PanelAccent.codex.color))
+        header.addArrangedSubview(PanelUI.label("重置卡", size: 12, weight: .semibold, wrapping: false))
         if let count = model.count {
             header.addArrangedSubview(PanelUI.label("×\(count)", size: 12, weight: .semibold,
                 color: PanelAccent.codex.color, wrapping: false, monospacedDigits: true))
@@ -2607,12 +2612,20 @@ final class ResetCardSectionView: PanelCardView {
             let name = PanelUI.label(rowModel.name, size: 12, color: color)
             row.addArrangedSubview(name)
             row.addArrangedSubview(PanelUI.spacer())
-            let expires = PanelUI.label(rowModel.expires, size: 11,
-                color: rowModel.warning ? PanelAccent.codex.color : .secondaryLabelColor,
-                wrapping: false, monospacedDigits: true)
-            expires.setContentHuggingPriority(.required, for: .horizontal)
-            expires.setContentCompressionResistancePriority(.required, for: .horizontal)
-            row.addArrangedSubview(expires)
+            // 日期用次要色，"过期"标签单独用橙色加粗，主次分明
+            let expiresText = rowModel.expires.hasSuffix(" 过期")
+                ? String(rowModel.expires.dropLast(3)) : rowModel.expires
+            let dateLabel = PanelUI.label(expiresText, size: 11,
+                color: .secondaryLabelColor, wrapping: false, monospacedDigits: true)
+            dateLabel.setContentHuggingPriority(.required, for: .horizontal)
+            dateLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+            row.addArrangedSubview(dateLabel)
+            if rowModel.expires.hasSuffix(" 过期") {
+                let badge = PanelUI.label("过期", size: 10, weight: .medium,
+                    color: PanelAccent.codex.color, wrapping: false)
+                badge.setContentHuggingPriority(.required, for: .horizontal)
+                row.addArrangedSubview(badge)
+            }
             contentStack.addArrangedSubview(row)
         }
         for notice in PanelUI.notices(model.notices) {
@@ -2675,6 +2688,7 @@ private enum PanelSectionHeading {
 
 private final class ToolPeriodButton: NSButton {
     private let selectedPeriod: Bool
+    private var hovered = false { didSet { needsDisplay = true } }
     override var acceptsFirstResponder: Bool { true }
     override var wantsUpdateLayer: Bool { true }
     init(title: String, index: Int, selected: Bool, target: AnyObject, action: Selector) {
@@ -2693,9 +2707,23 @@ private final class ToolPeriodButton: NSButton {
     }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = selectedPeriod ? PanelAccent.codex.color.withAlphaComponent(0.14).cgColor : NSColor.clear.cgColor
+            if selectedPeriod {
+                layer?.backgroundColor = PanelAccent.codex.color.withAlphaComponent(0.14).cgColor
+            } else if hovered {
+                layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
+            } else {
+                layer?.backgroundColor = NSColor.clear.cgColor
+            }
         }
     }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 49 || event.keyCode == 36 { performClick(nil) } else { super.keyDown(with: event) }
     }
@@ -2945,7 +2973,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     private func makeToolSection(_ model: UsagePanelModel) -> NSView {
-        let root = PanelUI.stack(spacing: 5)
+        let root = PanelUI.stack(spacing: 4)
         let periods: NSStackView? = externalExpanded ? PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 4) : nil
         if let periods = periods {
             for (index, label) in ["今天", "7天", "30天"].enumerated() {
@@ -2963,11 +2991,19 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if !items.contains(where: { ($0.total ?? 0) > 0 }) {
             PanelUI.addFullWidth(PanelUI.label("该周期暂无可统计用量", size: 11, color: .secondaryLabelColor), to: root)
         }
-        for item in items where (item.total ?? 0) > 0 || item.status == .failed {
+        for (itemIndex, item) in items.enumerated() where (item.total ?? 0) > 0 || item.status == .failed {
+            // 每个工具用不同颜色，方便一眼区分占比
+            let toolColors: [NSColor] = [
+                PanelAccent.codex.color,
+                PanelAccent.external.color,
+                NSColor.systemTeal,
+                NSColor.systemPurple,
+            ]
+            let barColor = toolColors[itemIndex % toolColors.count]
             let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
             let name = PanelUI.label(item.name, size: 11, wrapping: false); name.widthAnchor.constraint(equalToConstant: 76).isActive = true
             row.addArrangedSubview(name)
-            let bar = UsageShareBar(fraction: total > 0 ? (item.total ?? 0) / total : 0)
+            let bar = UsageShareBar(fraction: total > 0 ? (item.total ?? 0) / total : 0, color: barColor)
             row.addArrangedSubview(bar)
             let value = PanelUI.label(Fmt.tokensAbbr(item.total), size: 11, wrapping: false, monospacedDigits: true); value.alignment = .right; value.widthAnchor.constraint(equalToConstant: 52).isActive = true
             row.addArrangedSubview(value)
@@ -3035,17 +3071,31 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private func makeTiboSection(_ model: UsagePanelModel.TiboSection) -> NSView {
         let card = PanelCardView(padding: 8)
         let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-        header.addArrangedSubview(PanelUI.label("Tibo 重置动态", size: 13, weight: .semibold, wrapping: false))
+        header.addArrangedSubview(PanelUI.label("Tibo 重置动态", size: 12, weight: .semibold, wrapping: false))
         header.addArrangedSubview(PanelUI.spacer())
         PanelUI.addFullWidth(header, to: card.contentStack)
         for row in model.rows {
-            let view: NSView
-            if let item = row.item {
-                view = makeActionButton(item, .plain, title: row.text)
+            // confirmed 行：checkmark.circle.fill + 文字横排，与面板 SF Symbol 体系一致
+            if row.confirmed {
+                let rowStack = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 5)
+                let icon = PanelUI.symbol("checkmark.circle.fill", size: 12, color: .systemGreen)
+                rowStack.addArrangedSubview(icon)
+                if let item = row.item {
+                    let btn = makeActionButton(item, .plain, title: row.text)
+                    rowStack.addArrangedSubview(btn)
+                } else {
+                    rowStack.addArrangedSubview(PanelUI.label(row.text, size: 12))
+                }
+                PanelUI.addFullWidth(rowStack, to: card.contentStack)
             } else {
-                view = PanelUI.label(row.text, size: 12)
+                let view: NSView
+                if let item = row.item {
+                    view = makeActionButton(item, .plain, title: row.text)
+                } else {
+                    view = PanelUI.label(row.text, size: 12)
+                }
+                PanelUI.addFullWidth(view, to: card.contentStack)
             }
-            PanelUI.addFullWidth(view, to: card.contentStack)
         }
         for notice in PanelUI.notices(model.notices) {
             PanelUI.addFullWidth(notice, to: card.contentStack)
@@ -3572,10 +3622,19 @@ private final class PanelFooterView: NSView {
         version.contentTintColor = .secondaryLabelColor
         version.toolTip = "点击检查更新"
         version.setAccessibilityLabel("\(model.version)，点击检查更新")
+        version.focusRingType = .none
+        // hover 时提亮，让用户知道这是可点击的
+        (version as NSView).addTrackingRect(version.bounds, owner: version, userData: nil, assumeInside: false)
+        NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: version, queue: .main) { _ in }
+        // 用 cursor 暗示可点击
+        version.addCursorRect(version.bounds, cursor: .pointingHand)
         meta.addArrangedSubview(version)
         root.addArrangedSubview(meta)
         if let message = updateMessage {
-            let label = PanelUI.label(message, size: 11, color: .secondaryLabelColor)
+            // 含"失败"/"错误"/"无法"关键词用红色，其余用次要色
+            let isError = message.contains("失败") || message.contains("错误") || message.contains("无法")
+            let msgColor: NSColor = isError ? .systemRed : .secondaryLabelColor
+            let label = PanelUI.label(message, size: 11, color: msgColor)
             root.addArrangedSubview(label)
         }
 
@@ -4384,12 +4443,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let events = usage.tiboEvents {
             let rows = TiboDisplay.rows(events, now: Date()).map { row -> UsagePanelModel.TiboRow in
                 guard let url = Fmt.webURL(row.link) else {
-                    return UsagePanelModel.TiboRow(text: row.text, item: nil)
+                    return UsagePanelModel.TiboRow(text: row.text, confirmed: row.confirmed, item: nil)
                 }
                 let item = NSMenuItem(title: row.text, action: #selector(openLink(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = url
-                return UsagePanelModel.TiboRow(text: row.text, item: item)
+                return UsagePanelModel.TiboRow(text: row.text, confirmed: row.confirmed, item: item)
             }
             tiboSection = UsagePanelModel.TiboSection(rows: rows, notices: [])
         } else if let error = usage.tiboError {
@@ -5174,7 +5233,7 @@ enum CodexOfflineRegression {
                        "announced tibo row still carried the event title")
             try expect(!rowsDuring[0].text.contains("待确认"),
                        "pending marker shown while estimate window still open")
-            try expect(rowsDuring[1].text.hasPrefix("✅") && rowsDuring[1].text.contains("额度重置已完成")
+            try expect(rowsDuring[1].confirmed && rowsDuring[1].text.contains("额度重置已完成")
                        && !rowsDuring[1].text.contains("重置卡已发放"),
                        "confirmed tibo row must show the latest real confirm, not reset_credit")
             try expect(!rowsDuring.contains { $0.text.contains("已过窗口的旧预告")

@@ -158,7 +158,15 @@ final class DailyUsageChart: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard !days.isEmpty else {
-            ("暂无每日数据" as NSString).draw(at: NSPoint(x: 4, y: 17), withAttributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+            let text = "暂无每日数据" as NSString
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+            let size = text.size(withAttributes: attrs)
+            let x = (bounds.width - size.width) / 2
+            let y = (46 - size.height) / 2
+            text.draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
             return
         }
         let maxValue = max(1, days.compactMap { item -> Double? in
@@ -202,8 +210,10 @@ final class DailyUsageChart: NSView {
 
 final class UsageShareBar: NSView {
     let fraction: Double
-    init(fraction: Double) {
+    let barColor: NSColor
+    init(fraction: Double, color: NSColor = PanelAccent.codex.color) {
         self.fraction = min(1, max(0, fraction))
+        self.barColor = color
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: UsageBarMetrics.height).isActive = true
@@ -213,7 +223,13 @@ final class UsageShareBar: NSView {
         let radius = UsageBarMetrics.cornerRadius
         NSColor.secondaryLabelColor.withAlphaComponent(0.16).setFill()
         NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius).fill()
-        PanelAccent.codex.color.setFill()
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            barColor.setFill()
+        }
         NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: bounds.width * fraction, height: bounds.height), xRadius: radius, yRadius: radius).fill()
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
     }
 }
