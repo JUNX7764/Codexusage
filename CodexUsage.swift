@@ -3,6 +3,7 @@ import Foundation
 import SQLite3
 import CoreFoundation
 import Darwin
+import CryptoKit
 
 enum CodexNumber {
     static func finite(_ value: Any?) -> Double? {
@@ -214,7 +215,11 @@ enum CodexAuth {
         if let subject = subject, !subject.isEmpty, let account = account, !account.isEmpty {
             return "account:" + subject + "|" + account
         }
-        return "token:" + tokens.accessToken
+        // 使用 accessToken 的 SHA256 摘要前缀作为兜底标识，避免 token 明文传入标识链
+        let tokenData = Data((tokens.accessToken).utf8)
+        let digest = SHA256.hash(data: tokenData)
+        let hex = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "token-hash:" + hex
     }
 
     static func sameAuth(_ a: Tokens, _ b: Tokens) -> Bool {
@@ -1089,7 +1094,11 @@ enum TokenScanner {
         guard let data = try? JSONEncoder().encode(s) else { return }
         // 复用凭据链的原子写：UUID 临时名 + rename + 仅所有者权限
         // （状态文件含会话绝对路径与逐文件聚合，不应给其他用户留读面）
-        try? AtomicJSONFile.replace(data, at: path)
+        do {
+            try AtomicJSONFile.replace(data, at: path)
+        } catch {
+            NSLog("[CodexUsage] TokenScanner saveState failed at %@: %@", path, error.localizedDescription)
+        }
     }
 }
 
@@ -1562,7 +1571,11 @@ enum ExternalTokenScanner {
     private static func saveState(_ s: State, at path: String) {
         guard let data = try? JSONEncoder().encode(s) else { return }
         // 复用凭据链的原子写：UUID 临时名 + rename + 仅所有者权限（与 TokenScanner 同口径）
-        try? AtomicJSONFile.replace(data, at: path)
+        do {
+            try AtomicJSONFile.replace(data, at: path)
+        } catch {
+            NSLog("[CodexUsage] ExternalTokenScanner saveState failed at %@: %@", path, error.localizedDescription)
+        }
     }
 }
 
@@ -4058,7 +4071,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             extLastOK = CodexFreshness.updated(extLastOK, succeeded: true, at: Date())
             usage.externalTools = r.tools
-            usage.sourceStatus = r.sourceStatus
             usage.extToday = r.today
             usage.ext7d = r.seven
             usage.ext30d = r.thirty
@@ -4545,11 +4557,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func manualUpdateCheck() {
-        panelController.setUpdateMessage("正在检查更新…")
         guard !visualPreview else {
             panelController.setUpdateMessage("预览模式：未联网检查更新", dismissAfter: 3)
             return
         }
+        panelController.setUpdateMessage("正在检查更新…")
         UpdateChecker.shared.check(force: true) { [weak self] result in
             guard let self = self else { return }
             switch result {
@@ -4635,7 +4647,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             </dict>
             </plist>
             """
-            try? plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+            do {
+                try plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+            } catch {
+                NSLog("[CodexUsage] Failed to write LaunchAgent plist at %@: %@", launchAgentPath, error.localizedDescription)
+                let alert = NSAlert()
+                alert.messageText = "开启开机自启失败"
+                alert.informativeText = "无法写入 LaunchAgent 配置文件，请检查「~/Library/LaunchAgents」目录权限。\n\n\(error.localizedDescription)"
+                alert.addButton(withTitle: "好")
+                alert.runModal()
+            }
         }
         updateUI()
     }
