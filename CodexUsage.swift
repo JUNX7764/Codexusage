@@ -3633,6 +3633,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 菜单栏可因深色壁纸、双屏或全屏而与 App 外观合法地不同，不能用 App 外观覆盖菜单栏。
     // 每 5s 对账，不一致时仅重建不缓存的动态颜色图片，不切换 isVisible、不钉死绘制外观。
     private var appearancePollTimer: Timer?
+    // status.json 去重：内容不变时跳过原子写，避免每 5-10s 无意义的 fsync+rename
+    private var lastStatusData: Data?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
 
@@ -4140,12 +4142,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 外观不一致既可能是按钮粘滞，也可能是深色壁纸或双屏的正常状态。
     /// 因此只重建不缓存的动态颜色图片，让实际菜单栏绘制上下文决定颜色。
+    /// 只调 renderBarImage()，不触发 status.json 写入。
     private func reconcileBarAppearance() {
         guard let button = statusItem?.button else { return }
         let appDark = isDark(NSApp.effectiveAppearance)
         let buttonDark = isDark(button.effectiveAppearance)
         if buttonDark != appDark {
-            renderBar()
+            renderBarImage()
         } else {
             renderBarIfThemeChanged()
         }
@@ -4156,7 +4159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem?.button else { return }
         let dark = isDark(button.effectiveAppearance)
         guard dark != barThemeDark else { return }
-        renderBar()
+        renderBarImage()
     }
 
     /// 进度行自己刷新文本与百分比；这里只在「进行中」状态翻转时重建面板内容（按钮↔进度行），
@@ -4191,7 +4194,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return text
     }
 
-    private func renderBar() {
+    /// 菜单栏图片 + toolTip 渲染，不写磁盘。供外观对账定时器（每 5s）直接调用。
+    private func renderBarImage() {
         let fiveRemaining = Fmt.remaining(usage.fiveHour?.usedPercent)
         let sevenRemaining = Fmt.remaining(usage.sevenDay?.usedPercent)
         let line1 = StackImage.Line(label: (fiveHourStale ? "⚠ 5H" : "5H"),
@@ -4207,9 +4211,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = barToolTip()
-        if !visualPreview {
-            writeStatus(line1: usage.fiveHourNotApplicable ? "\(line2.label) \(line2.value)" : "\(line1.label) \(line1.value)", line2: usage.fiveHourNotApplicable ? "" : "\(line2.label) \(line2.value)")
-        }
+    }
+
+    /// 完整渲染：图片 + toolTip + 写 status.json（内容去重，不变则跳过磁盘写）。
+    /// 数据刷新路径（updateUI）调用此函数；外观对账路径只调 renderBarImage()。
+    private func renderBar() {
+        renderBarImage()
+        guard !visualPreview else { return }
+        let fiveRemaining = Fmt.remaining(usage.fiveHour?.usedPercent)
+        let sevenRemaining = Fmt.remaining(usage.sevenDay?.usedPercent)
+        let line1Label = fiveHourStale ? "⚠ 5H" : "5H"
+        let line2Label = sevenDayStale ? "⚠ 7D" : "7D"
+        let line1Value = Fmt.remainingPct(usage.fiveHour?.usedPercent)
+        let line2Value = Fmt.remainingPct(usage.sevenDay?.usedPercent)
+        writeStatus(
+            line1: usage.fiveHourNotApplicable ? "\(line2Label) \(line2Value)" : "\(line1Label) \(line1Value)",
+            line2: usage.fiveHourNotApplicable ? "" : "\(line2Label) \(line2Value)"
+        )
+        _ = fiveRemaining; _ = sevenRemaining // 保留供未来 writeStatus 直接使用
     }
 
     // 自诊断：把渲染内容写到本地，便于排查（绝不写任何凭证值）
@@ -4258,8 +4277,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "updateAvailable": UpdateChecker.shared.available
         ]
         if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
+            // 内容不变时跳过原子写，避免每 5-10s 无意义的 fsync+rename
+            if data == lastStatusData { return }
+            lastStatusData = data
             // 与扫描状态文件同口径：仅所有者可读（内容含会话路径与统计聚合）
-            try? AtomicJSONFile.replace(data, at: dir + "/status.json")
+            do {
+                try AtomicJSONFile.replace(data, at: dir + "/status.json")
+            } catch {
+                NSLog("[CodexUsage] writeStatus failed: %@", error.localizedDescription)
+            }
         }
     }
 
