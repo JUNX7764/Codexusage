@@ -1,7 +1,57 @@
 import AppKit
 
-private final class ChartHoverLabel: NSTextField {
+private final class ChartHoverLabel: NSView {
+    private let horizontalInset: CGFloat = 8
+    private let verticalInset: CGFloat = 6
+    private let lineSpacing: CGFloat = 2
+    private let dateFont = NSFont.systemFont(ofSize: 10)
+    private let valueFont = NSFont.systemFont(ofSize: 10, weight: .medium)
+    private var date = ""
+    private var value = ""
+    var stringValue: String { "\(date)\n\(value)" }
+    override var isFlipped: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func setText(date: String, value: String) {
+        self.date = date
+        self.value = value
+        needsDisplay = true
+    }
+
+    private func size(of text: String, font: NSFont) -> NSSize {
+        (text as NSString).size(withAttributes: [.font: font])
+    }
+
+    func fitToContent() {
+        let dateSize = size(of: date, font: dateFont)
+        let valueSize = size(of: value, font: valueFont)
+        frame.size = NSSize(width: ceil(max(dateSize.width, valueSize.width)) + horizontalInset * 2,
+                            height: ceil(dateSize.height + valueSize.height + lineSpacing) + verticalInset * 2)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let background = NSColor(name: nil) { appearance in
+            let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return NSColor(calibratedWhite: dark ? 0.20 : 0.92, alpha: 0.96)
+        }
+        let bubble = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.25, dy: 0.25), xRadius: 6, yRadius: 6)
+        background.setFill()
+        bubble.fill()
+        NSColor.labelColor.withAlphaComponent(0.10).setStroke()
+        bubble.lineWidth = 0.5
+        bubble.stroke()
+        let dateSize = size(of: date, font: dateFont)
+        let valueSize = size(of: value, font: valueFont)
+        let width = max(0, bounds.width - horizontalInset * 2)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        (date as NSString).draw(with: NSRect(x: horizontalInset, y: verticalInset, width: width, height: dateSize.height),
+            options: [.usesLineFragmentOrigin],
+            attributes: [.font: dateFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: paragraph])
+        (value as NSString).draw(with: NSRect(x: horizontalInset, y: verticalInset + dateSize.height + lineSpacing,
+            width: width, height: valueSize.height), options: [.usesLineFragmentOrigin],
+            attributes: [.font: valueFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph])
+    }
 }
 
 final class DailyUsageChart: NSView {
@@ -17,7 +67,7 @@ final class DailyUsageChart: NSView {
             && hover.hitTest(.zero) == nil
     }
     private var selection: Int? { didSet { needsDisplay = true; updateAccessibility() } }
-    private let hover = ChartHoverLabel(labelWithString: "")
+    private let hover = ChartHoverLabel()
     private var orange: NSColor { PanelAccent.codex.color }
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
@@ -55,10 +105,6 @@ final class DailyUsageChart: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 61).isActive = true
-        hover.font = .systemFont(ofSize: 10, weight: .medium)
-        hover.backgroundColor = .controlBackgroundColor
-        hover.drawsBackground = true
-        hover.cell?.lineBreakMode = .byTruncatingTail
         hover.isHidden = true
         addSubview(hover)
         setAccessibilityElement(true)
@@ -100,15 +146,14 @@ final class DailyUsageChart: NSView {
         case .inferredZero: value = "0 Token（无活动记录）"
         case .missing: value = "暂无数据"
         }
-        let text = "\(day.0) · \(value)"
-        hover.stringValue = text
-        hover.sizeToFit()
+        hover.setText(date: day.0, value: value)
+        hover.fitToContent()
         hover.frame.size.width = min(hover.frame.width, bounds.width)
         // Keep the overlay on the opposite side where possible; it does not affect layout or hit testing.
         let selectedX = (CGFloat(index) + 0.5) * bounds.width / CGFloat(days.count)
         hover.frame.origin = NSPoint(x: selectedX < bounds.midX ? bounds.width - hover.frame.width : 0, y: 0)
         hover.isHidden = false
-        setAccessibilityValue(text)
+        setAccessibilityValue("\(day.0)，\(value)")
     }
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
