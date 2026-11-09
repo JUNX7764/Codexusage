@@ -3,6 +3,7 @@ import Foundation
 import SQLite3
 import CoreFoundation
 import Darwin
+import CryptoKit
 
 enum CodexNumber {
     static func finite(_ value: Any?) -> Double? {
@@ -214,7 +215,11 @@ enum CodexAuth {
         if let subject = subject, !subject.isEmpty, let account = account, !account.isEmpty {
             return "account:" + subject + "|" + account
         }
-        return "token:" + tokens.accessToken
+        // 使用 accessToken 的 SHA256 摘要前缀作为兜底标识，避免 token 明文传入标识链
+        let tokenData = Data((tokens.accessToken).utf8)
+        let digest = SHA256.hash(data: tokenData)
+        let hex = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "token-hash:" + hex
     }
 
     static func sameAuth(_ a: Tokens, _ b: Tokens) -> Bool {
@@ -1089,7 +1094,11 @@ enum TokenScanner {
         guard let data = try? JSONEncoder().encode(s) else { return }
         // 复用凭据链的原子写：UUID 临时名 + rename + 仅所有者权限
         // （状态文件含会话绝对路径与逐文件聚合，不应给其他用户留读面）
-        try? AtomicJSONFile.replace(data, at: path)
+        do {
+            try AtomicJSONFile.replace(data, at: path)
+        } catch {
+            NSLog("[CodexUsage] TokenScanner saveState failed at %@: %@", path, error.localizedDescription)
+        }
     }
 }
 
@@ -1562,7 +1571,11 @@ enum ExternalTokenScanner {
     private static func saveState(_ s: State, at path: String) {
         guard let data = try? JSONEncoder().encode(s) else { return }
         // 复用凭据链的原子写：UUID 临时名 + rename + 仅所有者权限（与 TokenScanner 同口径）
-        try? AtomicJSONFile.replace(data, at: path)
+        do {
+            try AtomicJSONFile.replace(data, at: path)
+        } catch {
+            NSLog("[CodexUsage] ExternalTokenScanner saveState failed at %@: %@", path, error.localizedDescription)
+        }
     }
 }
 
@@ -3620,6 +3633,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 菜单栏可因深色壁纸、双屏或全屏而与 App 外观合法地不同，不能用 App 外观覆盖菜单栏。
     // 每 5s 对账，不一致时仅重建不缓存的动态颜色图片，不切换 isVisible、不钉死绘制外观。
     private var appearancePollTimer: Timer?
+    // status.json 去重：内容不变时跳过原子写，避免每 5-10s 无意义的 fsync+rename
+    private var lastStatusData: Data?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
 
@@ -4058,7 +4073,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             extLastOK = CodexFreshness.updated(extLastOK, succeeded: true, at: Date())
             usage.externalTools = r.tools
-            usage.sourceStatus = r.sourceStatus
             usage.extToday = r.today
             usage.ext7d = r.seven
             usage.ext30d = r.thirty
@@ -4128,12 +4142,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 外观不一致既可能是按钮粘滞，也可能是深色壁纸或双屏的正常状态。
     /// 因此只重建不缓存的动态颜色图片，让实际菜单栏绘制上下文决定颜色。
+    /// 只调 renderBarImage()，不触发 status.json 写入。
     private func reconcileBarAppearance() {
         guard let button = statusItem?.button else { return }
         let appDark = isDark(NSApp.effectiveAppearance)
         let buttonDark = isDark(button.effectiveAppearance)
         if buttonDark != appDark {
-            renderBar()
+            renderBarImage()
         } else {
             renderBarIfThemeChanged()
         }
@@ -4144,7 +4159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem?.button else { return }
         let dark = isDark(button.effectiveAppearance)
         guard dark != barThemeDark else { return }
-        renderBar()
+        renderBarImage()
     }
 
     /// 进度行自己刷新文本与百分比；这里只在「进行中」状态翻转时重建面板内容（按钮↔进度行），
@@ -4179,7 +4194,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return text
     }
 
-    private func renderBar() {
+    /// 菜单栏图片 + toolTip 渲染，不写磁盘。供外观对账定时器（每 5s）直接调用。
+    private func renderBarImage() {
         let fiveRemaining = Fmt.remaining(usage.fiveHour?.usedPercent)
         let sevenRemaining = Fmt.remaining(usage.sevenDay?.usedPercent)
         let line1 = StackImage.Line(label: (fiveHourStale ? "⚠ 5H" : "5H"),
@@ -4195,9 +4211,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = barToolTip()
-        if !visualPreview {
-            writeStatus(line1: usage.fiveHourNotApplicable ? "\(line2.label) \(line2.value)" : "\(line1.label) \(line1.value)", line2: usage.fiveHourNotApplicable ? "" : "\(line2.label) \(line2.value)")
-        }
+    }
+
+    /// 完整渲染：图片 + toolTip + 写 status.json（内容去重，不变则跳过磁盘写）。
+    /// 数据刷新路径（updateUI）调用此函数；外观对账路径只调 renderBarImage()。
+    private func renderBar() {
+        renderBarImage()
+        guard !visualPreview else { return }
+        let fiveRemaining = Fmt.remaining(usage.fiveHour?.usedPercent)
+        let sevenRemaining = Fmt.remaining(usage.sevenDay?.usedPercent)
+        let line1Label = fiveHourStale ? "⚠ 5H" : "5H"
+        let line2Label = sevenDayStale ? "⚠ 7D" : "7D"
+        let line1Value = Fmt.remainingPct(usage.fiveHour?.usedPercent)
+        let line2Value = Fmt.remainingPct(usage.sevenDay?.usedPercent)
+        writeStatus(
+            line1: usage.fiveHourNotApplicable ? "\(line2Label) \(line2Value)" : "\(line1Label) \(line1Value)",
+            line2: usage.fiveHourNotApplicable ? "" : "\(line2Label) \(line2Value)"
+        )
+        _ = fiveRemaining; _ = sevenRemaining // 保留供未来 writeStatus 直接使用
     }
 
     // 自诊断：把渲染内容写到本地，便于排查（绝不写任何凭证值）
@@ -4246,8 +4277,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "updateAvailable": UpdateChecker.shared.available
         ]
         if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
+            // 内容不变时跳过原子写，避免每 5-10s 无意义的 fsync+rename
+            if data == lastStatusData { return }
+            lastStatusData = data
             // 与扫描状态文件同口径：仅所有者可读（内容含会话路径与统计聚合）
-            try? AtomicJSONFile.replace(data, at: dir + "/status.json")
+            do {
+                try AtomicJSONFile.replace(data, at: dir + "/status.json")
+            } catch {
+                NSLog("[CodexUsage] writeStatus failed: %@", error.localizedDescription)
+            }
         }
     }
 
@@ -4545,11 +4583,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func manualUpdateCheck() {
-        panelController.setUpdateMessage("正在检查更新…")
         guard !visualPreview else {
             panelController.setUpdateMessage("预览模式：未联网检查更新", dismissAfter: 3)
             return
         }
+        panelController.setUpdateMessage("正在检查更新…")
         UpdateChecker.shared.check(force: true) { [weak self] result in
             guard let self = self else { return }
             switch result {
@@ -4635,7 +4673,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             </dict>
             </plist>
             """
-            try? plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+            do {
+                try plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+            } catch {
+                NSLog("[CodexUsage] Failed to write LaunchAgent plist at %@: %@", launchAgentPath, error.localizedDescription)
+                let alert = NSAlert()
+                alert.messageText = "开启开机自启失败"
+                alert.informativeText = "无法写入 LaunchAgent 配置文件，请检查「~/Library/LaunchAgents」目录权限。\n\n\(error.localizedDescription)"
+                alert.addButton(withTitle: "好")
+                alert.runModal()
+            }
         }
         updateUI()
     }
