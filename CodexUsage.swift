@@ -1756,6 +1756,8 @@ enum Fmt {
         return f
     }()
     private static let isoPlain = ISO8601DateFormatter()
+    /// status.json / 诊断用的无毫秒 ISO8601（缓存实例，供 writeStatus 每轮刷新复用）
+    static func isoStamp(_ d: Date?) -> String { d.map { isoPlain.string(from: $0) } ?? "" }
     /// ISO8601 字符串（带/不带毫秒）→ Date；外部会话 timestamp 字段用
     static func iso(_ s: String?) -> Date? {
         guard let s = s else { return nil }
@@ -3657,6 +3659,12 @@ private final class TokenSectionView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
+/// 版本号按钮：hover 显示指向光标，暗示可点击检查更新。
+/// cursor rect 必须在 resetCursorRects() 内注册（在别处调用是 no-op）。
+private final class PanelVersionButton: NSButton {
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+}
+
 private final class PanelFooterView: NSView {
     init(model: UsagePanelModel, updateMessage: String?, target: UsagePanelController,
          buttonFactory: (NSMenuItem, PanelActionButton.Style, String?) -> PanelActionButton) {
@@ -3666,18 +3674,13 @@ private final class PanelFooterView: NSView {
         let meta = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
         meta.addArrangedSubview(PanelUI.label(model.lastAttempt, size: 11, color: .secondaryLabelColor, wrapping: false))
         meta.addArrangedSubview(PanelUI.spacer())
-        let version = NSButton(title: model.version, target: target, action: #selector(UsagePanelController.requestUpdateCheck))
+        let version = PanelVersionButton(title: model.version, target: target, action: #selector(UsagePanelController.requestUpdateCheck))
         version.isBordered = false
         version.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         version.contentTintColor = .secondaryLabelColor
         version.toolTip = "点击检查更新"
         version.setAccessibilityLabel("\(model.version)，点击检查更新")
         version.focusRingType = .none
-        // hover 时提亮，让用户知道这是可点击的
-        (version as NSView).addTrackingRect(version.bounds, owner: version, userData: nil, assumeInside: false)
-        NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: version, queue: .main) { _ in }
-        // 用 cursor 暗示可点击
-        version.addCursorRect(version.bounds, cursor: .pointingHand)
         meta.addArrangedSubview(version)
         root.addArrangedSubview(meta)
         if let message = updateMessage {
@@ -4345,7 +4348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let dir = NSHomeDirectory() + "/Library/Application Support/CodexUsage"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: 0o700])
-        func iso(_ d: Date?) -> String { d.map { ISO8601DateFormatter().string(from: $0) } ?? "" }
+        func iso(_ d: Date?) -> String { Fmt.isoStamp(d) }
         let cardsNow = CodexFreshness.availableCards(usage.resetCards ?? [], now: Date())
         let info: [String: Any] = [
             "line1": line1,
@@ -5165,7 +5168,7 @@ enum CodexOfflineRegression {
             try expect(!CodexRefreshSchedule.slowItemsDue(cycle: 4, manual: false)
                        && CodexRefreshSchedule.slowItemsDue(cycle: 5, manual: false)
                        && CodexRefreshSchedule.slowItemsDue(cycle: 1, manual: true),
-                       "60s/300s/manual refresh schedule is incorrect")
+                       "slow-item cycle or manual refresh schedule is incorrect")
 
             let cardPayload: [String: Any] = ["credits": [
                 ["id": "fixture-card", "reset_type": "codex_rate_limits", "status": "available", "expires_at": now.addingTimeInterval(3_600).timeIntervalSince1970,

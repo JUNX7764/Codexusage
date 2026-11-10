@@ -27,7 +27,6 @@ REPO = setting("REPO")
 APP_NAME = setting("APP_NAME")
 EXECUTABLE = setting("EXECUTABLE")
 LABEL = setting("LABEL")
-NEEDS_PEAK_TEST = setting("NEEDS_PEAK_TEST", RELEASE) == "1"
 OTHER_LABELS = {"com.local.codex-usage", "com.local.glm-usage", "com.local.kimi-usage"} - {LABEL}
 
 
@@ -64,6 +63,7 @@ class ScriptTest(unittest.TestCase):
             "MOCK_UNHEALTHY_MARKER": str(self.unhealthy_marker),
             "MOCK_ORIGIN_REPO": REPO,
             "MOCK_APP_NAME": APP_NAME,
+            "MOCK_EXECUTABLE_NAME": EXECUTABLE,
             "MOCK_RELEASES_JSON": json.dumps(releases),
             "REAL_CP": self.real_cp,
             "REAL_MV": self.real_mv,
@@ -97,7 +97,7 @@ case "$out" in
         ;;
     *.sha256)
         if [ "${MOCK_SHA256_BAD:-0}" = 1 ]; then
-            printf '%064d  %s\n' 0 "CodexUsage.zip" > "$out"
+            printf '%064d  %s\n' 0 "${MOCK_EXECUTABLE_NAME}.zip" > "$out"
         else
             (cd "$(dirname "$out")" && /usr/bin/shasum -a 256 "$(basename "${out%.sha256}")" > "$out")
         fi
@@ -238,10 +238,6 @@ case "${1:-}" in
     --self-test)
         echo "self-test" >> "$MOCK_LOG"
         [ "${MOCK_SELF_TEST_FAIL:-0}" = 1 ] && exit 51
-        ;;
-    --peak-test)
-        echo "peak-test" >> "$MOCK_LOG"
-        [ "${MOCK_PEAK_TEST_FAIL:-0}" = 1 ] && exit 52
         ;;
 esac
 exit 0
@@ -606,8 +602,6 @@ echo "build" >> "$MOCK_LOG"
         self.assertLess(lines.index("self-test"), push)
         self.assertLess(next(i for i, line in enumerate(lines) if line.startswith("codesign --verify")), push)
         self.assertLess(next(i for i, line in enumerate(lines) if line.startswith("unzip -t")), push)
-        if NEEDS_PEAK_TEST:
-            self.assertLess(lines.index("peak-test"), push)
         gh_line = next(line for line in lines if line.startswith("gh release create"))
         self.assertIn(f"{EXECUTABLE}.zip.sha256", gh_line)
 
@@ -630,15 +624,6 @@ echo "build" >> "$MOCK_LOG"
         self.assertFalse(any(line.startswith("git push") for line in lines))
         self.assertFalse(any(line.startswith("gh release create") for line in lines))
         self.assertTrue(any("tag -d v9.9.9" in line for line in lines), lines)
-
-    def test_peak_test_failure_blocks_remote_operations(self):
-        if not NEEDS_PEAK_TEST:
-            self.skipTest("this project has no peak test")
-        project = self.prepare_release()
-        result = self.run_release(project, MOCK_PEAK_TEST_FAIL="1")
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertFalse(any(line.startswith("git push") for line in self.log_lines()))
-        self.assertFalse(any(line.startswith("gh release create") for line in self.log_lines()))
 
     def test_wrong_origin_is_rejected_before_tagging(self):
         project = self.prepare_release()

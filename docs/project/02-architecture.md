@@ -1,6 +1,6 @@
 # CodexUsage 当前架构概览
 
-> 状态：当前架构摘要。最后核对：2026-11-06。
+> 状态：当前架构摘要。最后核对：2026-11-10。
 > 本文解释模块和边界，不复制函数级规格；具体行为以源码和测试为准。
 
 ## 1. 应用形态
@@ -24,6 +24,7 @@ CodexUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 
 | `OfficialUsageReader` | 原生只读获取账号累计和日桶，并核对身份快照 |
 | `DailyUsageChart` / `UsageComparison` | 日图交互和受数据完整性约束的比较计算 |
 | `UsageAttribution` | 处理重叠来源路径的唯一归属 |
+| `PanelCardView` / `PanelComparisonStack` 等卡片组件 | 六个统计板块的原生卡片容器、比较条与徽标 |
 | `TiboDisplay` 与相关模型 | AIHOT 重置动态的解析、排序和展示 |
 | `UpdateChecker` | 检查 GitHub Release 及更新资产 |
 | `UpdateProgressController` | 启动后台更新并恢复、展示进度 |
@@ -67,7 +68,7 @@ GitHub Release 列表 → 可安装版本选择 → ZIP 与 SHA256 下载 → �
 
 ## 5. 已知架构债务
 
-- Swift 源码、UI 和自检集中在单个约五千行文件中，审查与回归定位成本较高。
+- Swift 源码、UI 和自检集中在约六千行的主文件中（新统计模块已拆分至 `Sources/`，拆分工作尚未完成），审查与回归定位成本较高。
 - 自动更新尚缺独立发布者签名和完整面板点击到重启的常规发布验收。
 - 凭据写回与 Codex CLI 之间没有跨进程共同锁，已保留已知竞态说明。
 - 发布前测试目前依赖本地手动执行，没有 CI 强制门禁。

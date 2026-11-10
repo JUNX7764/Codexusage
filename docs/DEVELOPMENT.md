@@ -1,7 +1,7 @@
 # CodexUsage 开发说明
 
 > **当前工程事实源**。构建、测试、发布或权限行为发生变化时，应在同一个提交中更新本文。
-> 最后核对：2026-11-06。
+> 最后核对：2026-11-10。
 
 ## 文档入口与效力
 
@@ -12,6 +12,7 @@
 | `docs/project/02-architecture.md` | 模块、数据流和信任边界 | 当前架构概览，细节以源码为准 |
 | `docs/project/07-standards.md` | 修改、测试、凭据和文档约定 | 当前维护约定 |
 | `docs/project/10-release.md` | 发布资产、门禁和回滚边界 | 当前发布清单 |
+| `docs/project/11-15`（PRD、核验、交接、评审） | 用量总览专项的设计与验收过程记录 | **历史记录**；11 号 PRD 的六卡片布局与验收口径仍是现行基准 |
 | `PLAN.md` | 初始任务书及历次设计记录 | **历史资料，不代表当前行为** |
 | `VISUAL_OPTIMIZATION_PLAN.md`、`docs/features/` | 已完成专项的实施记录 | **历史资料，不代表当前行为** |
 
@@ -58,6 +59,11 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-narrow
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-pro
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-tools
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-full
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-daily-collapsed
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-hover-fixture
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-events --visual-preview-output=/tmp/codex-hover.png --visual-preview-hover-index=29
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-popover-test=/tmp/codex-popover
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-empty --visual-preview-empty-failure --visual-preview-tools
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-models
 ```
@@ -113,7 +119,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 确认工作区干净、HEAD 已推送至 `main` 后，再运行：
 
 ```bash
-scripts/release.sh v1.2.3
+scripts/release.sh vX.Y.Z   # 具体版本号发布前确定，只发正式版
 ```
 
 `release.sh` 会执行构建、二进制自检、签名与资产校验，但**不会自动运行上面的 Python 脚本回归，也不代表真实更新验收已经完成**。完整发布边界见 `docs/project/10-release.md`。
@@ -122,4 +128,5 @@ scripts/release.sh v1.2.3
 
 - 2026-11-04：24 项脚本测试（23 通过、1 项条件跳过）、构建、签名验证和离线自检通过。另用原生测试应用实际完成 v1.0.11 → v1.0.12 下载、替换、旧进程退出及新进程驻留；未覆盖面板按钮点击。
 - 2026-11-06：当前构建的离线自检通过；25 项脚本测试为 24 通过、1 项条件跳过；三个 Shell 脚本语法检查通过。
+- 2026-11-10：全仓审查后复验——构建、签名验证和离线自检通过；34 项脚本测试全部通过（移除了本应用不存在的 `--peak-test` 死测试后无跳过项）；三个 Shell 脚本语法检查通过。
 - 尚无证据表明所有版本都在 macOS 13、14、15 或干净用户环境完成实机验收。部署目标为 macOS 13 不等同于完成兼容性验证。

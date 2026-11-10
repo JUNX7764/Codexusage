@@ -7,7 +7,6 @@ REPO="JUNX7764/Codexusage"
 APP_NAME="CodexUsage.app"
 EXECUTABLE="CodexUsage"
 LABEL="com.local.codex-usage"
-NEEDS_PEAK_TEST=0
 TAG="${1:-}"
 TMP=""
 STAGING=""
@@ -94,9 +93,6 @@ fi
 
 echo "==> 离线回归与签名校验"
 "$BINARY" --self-test
-if [ "$NEEDS_PEAK_TEST" = 1 ]; then
-    "$BINARY" --peak-test
-fi
 codesign --verify --deep --strict "$APP"
 
 echo "==> 打包并校验发布资产（DMG 人工安装，zip 自动更新）"
