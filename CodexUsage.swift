@@ -196,6 +196,16 @@ enum CodexAuth {
                            idToken: id, email: id.flatMap(jwtEmail), accountID: tokens["account_id"] as? String))
     }
 
+    /// API key authentication is distinct from a ChatGPT subscription.
+    static func usesAPIKey(at path: String = authPath) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        let mode = (obj["auth_mode"] as? String)?.lowercased()
+        if mode == "apikey" || mode == "api_key" { return true }
+        if mode != nil { return false }
+        return (obj["OPENAI_API_KEY"] as? String).map { !$0.isEmpty } ?? false
+    }
+
     // Only use stable identity when both the user and workspace can be identified.
     // Otherwise the in-memory access token is a conservative boundary, never persisted.
     static func identity(_ snapshot: Snapshot?) -> String? {
@@ -2408,12 +2418,51 @@ class PanelCardView: NSView {
     }
 }
 
+/// Only explicit plan names are classified; quota values never identify a subscription.
+private struct SubscriptionBadge {
+    let title: String
+    let rgb: UInt32
+
+    static func resolve(_ raw: String?, apiKey: Bool = false) -> SubscriptionBadge {
+        if apiKey { return SubscriptionBadge(title: "API Key", rgb: 0x64748B) }
+        let key = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            .replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " ")
+            .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        switch key {
+        case "api key", "apikey": return .init(title: "API Key", rgb: 0x64748B)
+        case "free": return .init(title: "Free", rgb: 0x949BA6)
+        case "go": return .init(title: "Go", rgb: 0x16A6A1)
+        case "plus": return .init(title: "Plus", rgb: 0x2887E8)
+        case "pro 100": return .init(title: "Pro 100", rgb: 0x8B5CF6)
+        case "pro 200": return .init(title: "Pro 200", rgb: 0xE2A23A)
+        case "pro 500": return .init(title: "Pro 500", rgb: 0xE46B45)
+        case "pro", "prolite", "pro 5x", "pro 20x", "pro5x", "pro20x":
+            return .init(title: "Pro", rgb: 0x8B5CF6)
+        case "business standard": return .init(title: "Business Standard", rgb: 0x3976B9)
+        case "business premium": return .init(title: "Business Premium", rgb: 0x256F78)
+        case "enterprise": return .init(title: "Enterprise", rgb: 0x38465F)
+        case "edu": return .init(title: "Edu", rgb: 0x578E68)
+        default: return .init(title: "Unknown", rgb: 0x9CA3AF)
+        }
+    }
+
+    var color: NSColor {
+        NSColor(srgbRed: CGFloat((rgb >> 16) & 255) / 255,
+                green: CGFloat((rgb >> 8) & 255) / 255,
+                blue: CGFloat(rgb & 255) / 255, alpha: 1)
+    }
+}
+
 /// 套餐徽标：layer 背景随当前绘制外观解析（与 PanelCardView 同款），深浅色切换即时响应
 private final class PlanBadgeLabel: NSTextField {
+    var planColor: NSColor = .secondaryLabelColor
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.12).cgColor
+            let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            layer?.backgroundColor = planColor.withAlphaComponent(dark ? 0.22 : 0.14).cgColor
+            textColor = planColor.blended(withFraction: dark ? 0.38 : 0.30,
+                                          of: dark ? .white : .black) ?? planColor
         }
     }
     override func viewDidChangeEffectiveAppearance() {
@@ -2440,14 +2489,15 @@ final class PanelHeaderView: NSView {
         let title = PanelUI.label(model.title, size: 15, weight: .semibold, wrapping: false)
         titleRow.addArrangedSubview(title)
         if let plan = model.plan, !plan.isEmpty {
-            let badge = PlanBadgeLabel(wrappingLabelWithString: " " + plan + " ")
+            let subscription = SubscriptionBadge.resolve(plan)
+            let badge = PlanBadgeLabel(wrappingLabelWithString: " " + subscription.title + " ")
+            badge.planColor = subscription.color
             badge.font = .systemFont(ofSize: 10, weight: .semibold)
-            badge.textColor = .secondaryLabelColor
             badge.maximumNumberOfLines = 1
             badge.cell?.lineBreakMode = .byTruncatingTail
             badge.translatesAutoresizingMaskIntoConstraints = false
             badge.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            badge.wantsLayer = true; badge.layer?.cornerRadius = 4
+            badge.wantsLayer = true; badge.layer?.cornerRadius = 5
             badge.toolTip = plan; titleRow.addArrangedSubview(badge)
         }
         titleRow.addArrangedSubview(PanelUI.spacer())
@@ -4103,7 +4153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.fiveHourUnavailable = r.fiveHourUnavailable
         usage.sevenDayUnavailable = r.sevenDayUnavailable
         usage.sevenDay = QuotaMerge.preferred(r.sevenDay, old: usage.sevenDay)
-        usage.planType = r.planType ?? usage.planType
+        usage.planType = r.error == nil ? r.planType : (r.planType ?? usage.planType)
         usage.resetCredits = r.resetCredits ?? usage.resetCredits
         usage.fiveHourError = usage.fiveHourNotApplicable ? nil : (r.fiveHour == nil ? (r.fiveHourError ?? r.error) : nil)
         usage.sevenDayError = r.sevenDay == nil ? (r.sevenDayError ?? r.error) : nil
@@ -4521,7 +4571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let displayVersion = BuildInfo.version
         let model = UsagePanelModel(
             updateItem: updateItem,
-            title: "Codex 用量", plan: usage.planType?.uppercased(),
+            title: "Codex 用量", plan: (!visualPreview && CodexAuth.usesAPIKey()) ? "API Key" : (usage.planType ?? "Unknown"),
             email: usage.email,
             quotas: quotas,
             resetCards: resetSection,
@@ -5010,6 +5060,37 @@ enum CodexOfflineRegression {
             ]], now: now, email: nil)
             try expect(legacy.fiveHour?.usedPercent == 15 && legacy.sevenDay?.usedPercent == 64,
                        "valid legacy windows did not parse")
+
+            let badgeCases: [(String?, String, UInt32)] = [
+                ("free", "Free", 0x949BA6), ("go", "Go", 0x16A6A1), ("plus", "Plus", 0x2887E8),
+                ("pro_100", "Pro 100", 0x8B5CF6), ("pro 200", "Pro 200", 0xE2A23A),
+                ("pro-500", "Pro 500", 0xE46B45), ("pro_5x", "Pro", 0x8B5CF6),
+                ("pro_20x", "Pro", 0x8B5CF6), ("prolite", "Pro", 0x8B5CF6),
+                ("business_standard", "Business Standard", 0x3976B9),
+                ("business_premium", "Business Premium", 0x256F78),
+                ("enterprise", "Enterprise", 0x38465F), ("edu", "Edu", 0x578E68),
+                ("unrecognized", "Unknown", 0x9CA3AF), (nil, "Unknown", 0x9CA3AF)
+            ]
+            for (raw, title, rgb) in badgeCases {
+                let badge = SubscriptionBadge.resolve(raw)
+                try expect(badge.title == title && badge.rgb == rgb, "incorrect subscription badge for \(raw ?? "nil")")
+            }
+            try expect(SubscriptionBadge.resolve("pro", apiKey: true).title == "API Key", "API key confused with subscription")
+            let authFixture = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: authFixture) }
+            for (json, expected) in [("{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"test\"}", true),
+                                     ("{\"OPENAI_API_KEY\":\"test\"}", true),
+                                     ("{\"auth_mode\":\"chatgpt\",\"OPENAI_API_KEY\":\"test\"}", false),
+                                     ("{\"OPENAI_API_KEY\":null}", false)] {
+                try Data(json.utf8).write(to: authFixture)
+                try expect(CodexAuth.usesAPIKey(at: authFixture.path) == expected, "API key authentication detection failed")
+            }
+            for appearanceName in [NSAppearance.Name.aqua, .darkAqua] {
+                let badge = PlanBadgeLabel(wrappingLabelWithString: " Pro ")
+                badge.wantsLayer = true; badge.planColor = SubscriptionBadge.resolve("pro").color
+                badge.appearance = NSAppearance(named: appearanceName); badge.updateLayer()
+                try expect(badge.layer?.backgroundColor != nil && badge.textColor != nil, "subscription badge colors missing")
+            }
 
             // Synthetic compatibility fixtures; these are not captured Pro responses.
             for plan in ["pro", "prolite"] {
