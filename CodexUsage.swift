@@ -2543,7 +2543,7 @@ final class PanelHeaderView: NSView {
         row.addArrangedSubview(titles)
         row.addArrangedSubview(PanelUI.spacer())
         if let target = backgroundTarget, let action = backgroundAction {
-            let image = NSImage(systemSymbolName: "square.on.square", accessibilityDescription: "背景样式")?
+            let image = NSImage(systemSymbolName: "paintpalette", accessibilityDescription: "背景样式")?
                 .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
             let button = NSButton(image: image ?? NSImage(), target: target, action: action)
             button.isBordered = false; button.contentTintColor = .secondaryLabelColor
