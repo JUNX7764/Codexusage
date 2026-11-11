@@ -3186,11 +3186,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             attributes: [.font: NSFont.systemFont(ofSize: 12)]).height
         notesBox.heightAnchor.constraint(equalToConstant: min(134, max(48, ceil(measured) + 22))).isActive = true
         PanelUI.addFullWidth(notesBox, to: content)
-        let releaseLink = NSButton(title: "查看完整更新记录", target: self, action: #selector(openConfirmedRelease))
-        releaseLink.isBordered = false
-        releaseLink.alignment = .left
-        releaseLink.contentTintColor = .linkColor
-        PanelUI.addFullWidth(releaseLink, to: content)
         PanelUI.addFullWidth(PanelUI.label("安装完成后，应用将自动重启。", size: 11, color: .secondaryLabelColor), to: content)
         let buttons = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 5)
         buttons.addArrangedSubview(PanelUI.spacer())
@@ -3250,16 +3245,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         guard notes.contentView.bounds.origin.y > 0 else { return false }
         popoverDidClose(Notification(name: NSPopover.didCloseNotification))
         return updateConfirmation == nil && calls.count == 1
-    }
-
-    @objc private func openConfirmedRelease() {
-        if CommandLine.arguments.contains(where: { $0.hasPrefix("--visual-preview") }) {
-            setUpdateMessage("预览模式：演示版本无更新记录", dismissAfter: 4)
-            return
-        }
-        guard let tag = updateConfirmation?.tag,
-              let url = URL(string: "https://github.com/JUNX7764/Codexusage/releases/tag/" + tag) else { return }
-        NSWorkspace.shared.open(url)
     }
 
     private static var supportsLiquidGlass: Bool {
