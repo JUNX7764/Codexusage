@@ -197,8 +197,9 @@ exit 0
         self._mock("gh", r'''
 echo "gh $*" >> "$MOCK_LOG"
 if [ "$1 $2" = "release view" ]; then
-    [ "${MOCK_RELEASE_EXISTS:-0}" = 1 ]
-    exit $?
+    if [ "${MOCK_RELEASE_EXISTS:-0}" != 1 ]; then exit 1; fi
+    case " $* " in *" --json "*) printf '%s\n' "${MOCK_RELEASE_BODY:-版本说明}" ;; esac
+    exit 0
 fi
 exit 0
 ''')
@@ -564,12 +565,14 @@ exit 0
         result = self.run_release(project, MOCK_GIT_PUSH_FAIL="1")
         self.assertNotEqual(result.returncode, 0, result.stdout)
         lines = self.log_lines()
-        self.assertFalse(any(line.startswith("gh release") for line in lines))
+        self.assertFalse(any(line.startswith(("gh release create", "gh release upload")) for line in lines))
         self.assertTrue(any("tag -d v9.9.9" in line for line in lines), lines)
 
     def prepare_release(self):
         project = self.base / "release-project"
         (project / "scripts").mkdir(parents=True)
+        (project / "release-notes").mkdir()
+        (project / "release-notes" / "v9.9.9.md").write_text("版本说明\n")
         shutil.copy2(RELEASE, project / "scripts" / "release.sh")
         shutil.copy2(UPDATE, project / "scripts" / "update.sh")
         # release.sh 会对应用源码中的身份常量做交叉校验，沙箱项目须包含同一份源码
@@ -604,6 +607,20 @@ echo "build" >> "$MOCK_LOG"
         self.assertLess(next(i for i, line in enumerate(lines) if line.startswith("unzip -t")), push)
         gh_line = next(line for line in lines if line.startswith("gh release create"))
         self.assertIn(f"{EXECUTABLE}.zip.sha256", gh_line)
+        self.assertIn("--notes-file", gh_line)
+
+    def test_missing_notes_block_release_before_tag(self):
+        project = self.prepare_release()
+        (project / "release-notes" / "v9.9.9.md").unlink()
+        result = self.run_release(project)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any("git tag" in line or "git push" in line for line in self.log_lines()))
+
+    def test_mismatched_existing_notes_block_release(self):
+        project = self.prepare_release()
+        result = self.run_release(project, MOCK_RELEASE_EXISTS="1", MOCK_RELEASE_BODY="不一致")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any("git tag" in line or "git push" in line for line in self.log_lines()))
 
     def test_existing_release_is_completed_with_clobber_upload(self):
         project = self.prepare_release()
