@@ -23,7 +23,7 @@ python3 -m unittest discover -s tests -p '*_test.py'
 bash -n build.sh scripts/update.sh scripts/release.sh
 ```
 
-确认工作区干净、HEAD 已推送且目标版本符合变更类型后，执行：
+发布前对照上一正式版核实变化，编写并提交 `release-notes/vX.Y.Z.md`；脚本拒绝缺失或空说明，已有 Release 的说明不一致时停止。确认工作区干净、HEAD 已推送且目标版本符合变更类型后，执行：
 
 ```bash
 scripts/release.sh vX.Y.Z

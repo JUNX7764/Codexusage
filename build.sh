@@ -19,6 +19,14 @@ if [ ! -f "$DIR/AppIcon.icns" ]; then
     (cd "$DIR" && swift scripts/icon_gen.swift)
 fi
 
+# 原生液态玻璃需要使用 macOS 26 或更新 SDK 构建。
+SDK_VERSION="$(xcrun --show-sdk-version 2>/dev/null || true)"
+SDK_MAJOR="${SDK_VERSION%%.*}"
+if ! [[ "$SDK_MAJOR" =~ ^[0-9]+$ ]] || [ "$SDK_MAJOR" -lt 26 ]; then
+    echo "错误: 需要 macOS 26+ SDK 编译" >&2
+    exit 1
+fi
+
 echo "== 编译内置 zstd 解码（vendor/zstddeclib.c，上游 v1.5.7，BSD-3-Clause）=="
 # 单文件解码源进程内解压 .zst 归档：系统 Compression 框架不含 zstd，外部 zstd 命令
 # 会把环境负担转嫁给用户（缺失时 30 天口径缺失并提示 brew install）；内置后任何
