@@ -57,3 +57,6 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_coordinator_failure(self):
         self.run_case('coordinatorFailure')
+
+    def test_plan_recovery(self):
+        self.run_case('planRecovery')

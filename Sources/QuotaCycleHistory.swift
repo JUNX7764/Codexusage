@@ -12,7 +12,7 @@ struct QuotaObservation: Codable, Equatable {
     }
 }
 enum QuotaCycleEnd: String, Codable { case natural, redeemed, earlyUnknown, gap, unconfirmed }
-enum QuotaCycleStart: String, Codable { case inferred, observedTransition, redeemed, afterGap }
+enum QuotaCycleStart: String, Codable { case inferred, observedTransition, redeemed, afterGap, afterPlanChange }
 struct QuotaCycleRecord: Codable, Equatable, Identifiable {
     let id: UUID
     var startKind: QuotaCycleStart
@@ -68,7 +68,7 @@ struct QuotaCycleReducer {
             inferredStartAt: kind == .inferred ? sample.resetAt.addingTimeInterval(-604800) : nil,
             firstObservedAt: sample.observedAt, expectedResetAt: sample.resetAt,
             lastObservedAt: sample.observedAt, lastObservedUsedPercent: sample.usedPercent,
-            boundaryLower: nil, boundaryUpper: nil, end: nil, incomplete: kind == .inferred || kind == .afterGap,
+            boundaryLower: nil, boundaryUpper: nil, end: nil, incomplete: kind == .inferred || kind == .afterGap || kind == .afterPlanChange,
             evidence: [sample])
     }
     private func close(_ state: inout QuotaCycleState, first: QuotaObservation, reason: QuotaCycleEnd, kind: QuotaCycleStart) {
@@ -126,6 +126,23 @@ struct QuotaCycleReducer {
             return
         }
         if changed && !samePlan {
+            if let pending = state.pendingTransition, pending.reason == .planChange {
+                let delay = sample.observedAt.timeIntervalSince(pending.first.observedAt)
+                let stable = pending.first.planType != nil && sample.planType == pending.first.planType &&
+                    abs(sample.resetAt.timeIntervalSince(pending.first.resetAt)) <= policy.resetJitter &&
+                    sample.usedPercent >= pending.first.usedPercent
+                if stable && delay >= policy.confirmationMinDelay && delay <= policy.confirmationMaxDelay {
+                    close(&state, first: pending.first, reason: .unconfirmed, kind: .afterPlanChange)
+                    current = state.current!
+                    current.lastObservedAt = sample.observedAt
+                    current.lastObservedUsedPercent = sample.usedPercent
+                    if sample.usedPercent != pending.first.usedPercent { current.evidence.append(sample) }
+                    state.current = current
+                    state.previous = sample
+                    return
+                }
+                if stable && delay < policy.confirmationMinDelay { state.previous = sample; return }
+            }
             appendAnomaly(sample, into: &state)
             state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .planChange)
             state.previous = sample

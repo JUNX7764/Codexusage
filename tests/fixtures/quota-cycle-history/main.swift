@@ -77,8 +77,9 @@ case "candidates":
     state = QuotaCycleState()
     reducer.ingest(sample(0, 72), into: &state)
     reducer.ingest(sample(100, 2, 605800, plan: "pro"), into: &state)
+    check(state.closed.isEmpty && state.pendingTransition?.reason == .planChange, "first plan change remains uncertain")
     reducer.ingest(sample(120, 3, 605800, plan: "pro"), into: &state)
-    check(state.closed.isEmpty && state.pendingTransition?.reason == .planChange, "plan change remains uncertain")
+    check(state.closed.first?.end == .unconfirmed, "stable plan change remains unconfirmed")
 case "redemption":
     reducer.ingest(sample(0, 72), into: &state)
     let id = state.current!.id
@@ -292,5 +293,21 @@ case "coordinatorFailure":
     c2.activate(accountIdentity: identity, generation: 2); wait2()
     c2.observe(sample(20, 10), identity: identity, generation: 2); wait2()
     check(latest?.isSaved == false && (try! Data(contentsOf: path)) == bad, "corrupt file preserved")
+case "planRecovery":
+    reducer.ingest(sample(0, 70), into: &state)
+    reducer.ingest(sample(100, 2, 605800, plan: "pro"), into: &state)
+    check(state.closed.isEmpty, "first plan sample pending")
+    reducer.ingest(sample(120, 3, 605800, plan: "pro"), into: &state)
+    check(state.closed.first?.end == .unconfirmed, "plan change is not a natural or early reset")
+    check(state.current?.incomplete == true && state.current?.lastObservedUsedPercent == 3, "new plan resumes incomplete")
+    var churn = QuotaCycleState()
+    reducer.ingest(sample(0, 70), into: &churn)
+    reducer.ingest(sample(100, 2, 605800, plan: "pro"), into: &churn)
+    reducer.ingest(sample(120, 4, 605800, plan: "team"), into: &churn)
+    check(churn.closed.isEmpty, "changing plans cannot confirm")
+    reducer.ingest(sample(140, 5, 605800, plan: "pro"), into: &churn)
+    check(churn.closed.isEmpty, "return to earlier candidate cannot confirm")
+    reducer.ingest(sample(160, 6, 605800, plan: "pro"), into: &churn)
+    check(churn.closed.first?.end == .unconfirmed, "stable new plan recovers")
 default: exit(2)
 }
