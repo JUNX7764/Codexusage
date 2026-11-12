@@ -18,8 +18,6 @@ final class QuotaCycleHistoryView: NSView {
     private let more = NSButton(title: "更早记录", target: nil, action: nil)
     private let legend = NSTextField(labelWithString: "上限  ·  已用")
     private let detail1 = NSTextField(labelWithString: "")
-    private let detail2 = NSTextField(labelWithString: "")
-    private let notice = NSTextField(labelWithString: "")
     private let chart: QuotaCycleChart
     override var isFlipped: Bool { true }
 
@@ -28,8 +26,8 @@ final class QuotaCycleHistoryView: NSView {
         chart = QuotaCycleChart(state: state, snapshot: snapshot, now: now)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        heightAnchor.constraint(equalToConstant: 150).isActive = true
-        for view in [earlier, newer, more, legend, detail1, detail2, notice, chart] { addSubview(view) }
+        heightAnchor.constraint(equalToConstant: 132).isActive = true
+        for view in [earlier, newer, more, legend, detail1, chart] { addSubview(view) }
         for button in [earlier, newer, more] { button.bezelStyle = .inline; button.target = self; button.font = .systemFont(ofSize: 11) }
         earlier.action = #selector(showEarlier); newer.action = #selector(showNewer); more.action = #selector(showMore)
         earlier.setAccessibilityLabel("更早的额度周期"); newer.setAccessibilityLabel("更新的额度周期")
@@ -37,7 +35,7 @@ final class QuotaCycleHistoryView: NSView {
         let legendText = NSMutableAttributedString(string: "■ 上限   ", attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor])
         legendText.append(NSAttributedString(string: "■ 已用   ● 当前", attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: PanelAccent.codex.color]))
         legend.attributedStringValue = legendText
-        for field in [detail1, detail2, notice] {
+        for field in [detail1] {
             field.font = .systemFont(ofSize: 10); field.lineBreakMode = .byTruncatingTail
             field.textColor = .secondaryLabelColor; field.maximumNumberOfLines = 1
         }
@@ -53,12 +51,16 @@ final class QuotaCycleHistoryView: NSView {
         more.frame = NSRect(x: max(0, width - 132), y: 0, width: 78, height: 19)
         earlier.frame = NSRect(x: width - 51, y: 0, width: 24, height: 19)
         newer.frame = NSRect(x: width - 26, y: 0, width: 24, height: 19)
-        chart.frame = NSRect(x: 0, y: 21, width: width, height: 83)
-        detail1.frame = NSRect(x: 0, y: 105, width: width, height: 15)
-        detail2.frame = NSRect(x: 0, y: 120, width: width, height: 15)
-        notice.frame = NSRect(x: 0, y: 135, width: width, height: 15)
+        chart.frame = NSRect(x: 0, y: 21, width: width, height: 94)
+        detail1.frame = NSRect(x: 0, y: 117, width: width, height: 15)
     }
-    var previewText: String { [detail1.stringValue, detail2.stringValue, notice.stringValue].joined(separator: " · ") }
+    var previewText: String { detail1.stringValue }
+    var previewTooltip: String { detail1.toolTip ?? "" }
+    var previewPercentageLabels: [String] { chart.percentageLabelsForPreview }
+    var previewLayoutFits: Bool {
+        chart.frame.maxY <= detail1.frame.minY && detail1.frame.maxY <= bounds.maxY
+            && chart.frame.width <= bounds.width
+    }
     private func refresh() {
         let records = state.browser.records
         let visible = state.browser.visible
@@ -69,17 +71,18 @@ final class QuotaCycleHistoryView: NSView {
         let selected = state.hover ?? state.browser.selectedCycleID
         if let cycle = records.first(where: { $0.id == selected }) {
             let lines = Self.detail(cycle, pending: snapshot.state.current?.id == cycle.id ? snapshot.state.pendingTransition : nil, now: now)
-            detail1.stringValue = lines.0; detail2.stringValue = lines.1
-            let fullDescription = Self.fullDescription(cycle, pending: snapshot.state.current?.id == cycle.id ? snapshot.state.pendingTransition : nil, now: now)
-            detail1.toolTip = fullDescription; detail2.toolTip = fullDescription
+            let status = !snapshot.isSaved ? "历史未保存 · " : (snapshot.isLoading ? "正在读取历史 · " : "")
+            detail1.stringValue = status + lines.0
+            let fullDescription = status + Self.fullDescription(cycle, pending: snapshot.state.current?.id == cycle.id ? snapshot.state.pendingTransition : nil, now: now)
+            detail1.toolTip = fullDescription
+            detail1.setAccessibilityHelp(fullDescription)
             chart.setAccessibilityValue(fullDescription)
         } else {
             detail1.stringValue = snapshot.isLoading ? "正在读取历史" : (!available ? "无法确认稳定账户，暂不记录" : "从首次成功读取额度后开始记录")
-            detail2.stringValue = ""
+            if !snapshot.isSaved { detail1.stringValue = "历史未保存 · " + detail1.stringValue }
+            detail1.toolTip = detail1.stringValue
+            detail1.setAccessibilityHelp(detail1.stringValue)
         }
-        let selectedRecord = records.first { $0.id == selected }
-        let last = selectedRecord.map { "最后观测 " + Self.date($0.lastObservedAt) } ?? ""
-        notice.stringValue = !snapshot.isSaved ? "历史未保存 · " + last : (snapshot.isLoading ? "正在读取历史" : last)
         chart.needsDisplay = true
     }
     @objc private func showEarlier() {
@@ -154,6 +157,10 @@ final class QuotaCycleChart: NSView {
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     static func isCurrent(_ cycle: QuotaCycleRecord, snapshot: QuotaCycleSnapshot) -> Bool { snapshot.state.current?.id == cycle.id }
+    static func usedPercentage(_ value: Double) -> String {
+        String(format: "%.1f", value).replacingOccurrences(of: ".0", with: "") + "%"
+    }
+    var percentageLabelsForPreview: [String] { state.browser.visible.map { Self.usedPercentage($0.lastObservedUsedPercent) } }
     init(state: QuotaCycleUIState, snapshot: QuotaCycleSnapshot, now: Date) {
         self.state = state; self.snapshot = snapshot; self.now = now; super.init(frame: .zero)
         setAccessibilityElement(true); setAccessibilityRole(.group)
@@ -237,6 +244,14 @@ final class QuotaCycleChart: NSView {
                 PanelAccent.codex.color.setFill()
                 NSBezierPath(ovalIn: NSRect(x: textX + size.width + 2, y: 68, width: 3, height: 3)).fill()
             }
+            let percentage = Self.usedPercentage(cycle.lastObservedUsedPercent) as NSString
+            let percentageAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.labelColor
+            ]
+            let percentageSize = percentage.size(withAttributes: percentageAttrs)
+            percentage.draw(at: NSPoint(x: x + max(0, (width - percentageSize.width) / 2), y: 78),
+                            withAttributes: percentageAttrs)
         }
     }
 }

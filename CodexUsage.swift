@@ -3495,7 +3495,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             print("CODEX_CARD_LAYOUT structureFailed cards=\(cards.count) separators=\(hasSectionSeparator) footer=\(hasFooterSeparator) spacing=\(hasConsistentSpacing)")
             return false
         }
-        if quotaHistoryUI.expanded && (cards[5].frame.height > 210 || cards[5].frame.height < 180) {
+        if quotaHistoryUI.expanded && abs(cards[5].frame.height - 178) > 0.01 {
             print("CODEX_CARD_LAYOUT quota height=\(cards[5].frame.height)"); return false
         }
         return cards.enumerated().allSatisfy { index, card in
@@ -5471,7 +5471,21 @@ enum CodexOfflineRegression {
             let fixtureSnapshot = QuotaCyclePreviewFixture.make(count: 13)
             previewState.browser.update(fixtureSnapshot.state.closed + [fixtureSnapshot.state.current!])
             let unsavedView = QuotaCycleHistoryView(snapshot: QuotaCycleSnapshot(state: fixtureSnapshot.state, isLoading: false, isSaved: false), available: true, state: previewState)
-            try expect(unsavedView.previewText.contains("历史未保存") && unsavedView.previewText.contains("最后观测"), "history save failure was not exposed")
+            try expect(unsavedView.previewText.contains("历史未保存"), "history save failure was not exposed")
+            let compactView = QuotaCycleHistoryView(snapshot: fixtureSnapshot, available: true, state: previewState)
+            let selectedCycle = fixtureSnapshot.state.current!
+            try expect(compactView.previewText == QuotaCycleHistoryView.detail(selectedCycle, pending: nil).0 &&
+                       !compactView.previewText.contains("最后观测"), "history should show only its first detail line")
+            try expect(compactView.previewTooltip.contains("最后观测") && compactView.previewTooltip.contains("已用"),
+                       "compact history lost complete hover details")
+            try expect(QuotaCycleChart.usedPercentage(81) == "81%" &&
+                       QuotaCycleChart.usedPercentage(0) == "0%" &&
+                       QuotaCycleChart.usedPercentage(99.6) == "99.6%" &&
+                       QuotaCycleChart.usedPercentage(100) == "100%", "cycle percentage labels incorrect")
+            compactView.setFrameSize(NSSize(width: 282, height: 132))
+            compactView.layoutSubtreeIfNeeded()
+            try expect(compactView.previewPercentageLabels.count == 6 && compactView.previewLayoutFits,
+                       "compact percentage row or single detail line does not fit")
             let emptyState = QuotaCycleUIState()
             let loadingView = QuotaCycleHistoryView(snapshot: QuotaCycleSnapshot(state: QuotaCycleState(), isLoading: true, isSaved: true), available: true, state: emptyState)
             try expect(loadingView.previewText.contains("正在读取历史"), "history loading state missing")
