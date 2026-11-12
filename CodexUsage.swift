@@ -2209,6 +2209,8 @@ struct UsagePanelModel {
     var codexTokens: TokenSection
     var official: OfficialUsageSnapshot?
     var officialError: String?
+    var quotaHistory: QuotaCycleSnapshot
+    var quotaHistoryAvailable: Bool
     var officialTodayFill: Double?   // 官方日桶缺今日时以与用量情况同口径的本机合并今日用量补足（Codex+外部）
     var tools: [[(name: String, total: Double?, input: Double?, output: Double?, status: UsageSourceStatus)]]
     var notices: [Notice]
@@ -2850,6 +2852,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var codexExpanded = true
     private var externalExpanded = false
     private var dailyExpanded = true
+    private let quotaHistoryUI = QuotaCycleUIState()
     private var toolPeriod = 0
     private var savedScrollOrigin = NSPoint.zero
     private var expandedCodexBuckets: Set<Int> = []
@@ -2962,6 +2965,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     func update(model: UsagePanelModel) {
         self.model = model
+        quotaHistoryUI.hover = nil
+        quotaHistoryUI.browser.update(model.quotaHistory.state.closed + (model.quotaHistory.state.current.map { [$0] } ?? []))
         // 阅读版本说明期间保留滚动位置；数据更新仍写入模型，关闭说明后刷新显示。
         if isOpen && updateConfirmation == nil { refreshPanelLayout() }
     }
@@ -3036,6 +3041,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
             bucketAction: #selector(toggleCodexBucket(_:)))))
         addContentRow(makeCardSection(makeDailySection(model)))
+        addContentRow(makeCardSection(makeQuotaHistorySection(model)))
         addContentRow(makeCardSection(makeToolSection(model)))
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
@@ -3046,6 +3052,20 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         PanelUI.addFullWidth(content, to: card.contentStack)
         return card
     }
+
+    private func makeQuotaHistorySection(_ model: UsagePanelModel) -> NSView {
+        let root = PanelUI.stack(spacing: 6)
+        let heading = PanelSectionHeading.make(title: "额度周期回顾", symbol: "chart.bar.fill",
+            color: PanelAccent.codex.color, expanded: quotaHistoryUI.expanded, target: self,
+            action: #selector(toggleQuotaHistory), toolTip: "根据额度实际观测轮次记录；开始和结束可能不精确")
+        PanelUI.addFullWidth(heading, to: root)
+        if quotaHistoryUI.expanded {
+            PanelUI.addFullWidth(QuotaCycleHistoryView(snapshot: model.quotaHistory, available: model.quotaHistoryAvailable, state: quotaHistoryUI), to: root)
+        }
+        return root
+    }
+    func resetQuotaHistoryAccount() { quotaHistoryUI.reset() }
+    @objc private func toggleQuotaHistory() { quotaHistoryUI.expanded.toggle(); refreshPanelLayout() }
 
     private func makeDailySection(_ model: UsagePanelModel) -> NSView {
         let root = PanelUI.stack(spacing: 6)
@@ -3456,20 +3476,25 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         let hasSectionSeparator = stack.arrangedSubviews.contains { ($0 as? NSBox)?.boxType == .separator }
         let dailyButtons = descendants(cards.count > 4 ? cards[4] : NSView()).compactMap { $0 as? PanelDisclosureButton }
             .filter { $0.action == #selector(toggleDaily) }
-        let toolButtons = descendants(cards.count > 5 ? cards[5] : NSView()).compactMap { $0 as? PanelDisclosureButton }
+        let historyButtons = descendants(cards.count > 5 ? cards[5] : NSView()).compactMap { $0 as? PanelDisclosureButton }
+            .filter { $0.action == #selector(toggleQuotaHistory) }
+        let toolButtons = descendants(cards.count > 6 ? cards[6] : NSView()).compactMap { $0 as? PanelDisclosureButton }
             .filter { $0.action == #selector(toggleExternal) }
         let hasFooterSeparator = footerContainer.subviews.contains { ($0 as? NSBox)?.boxType == .separator }
         let hasConsistentSpacing = zip(cards, cards.dropFirst()).allSatisfy { previous, card in
             abs(previous.frame.minY - card.frame.maxY - stack.spacing) < 0.01
         }
-        guard cards.count == 6, !hasSectionSeparator, hasFooterSeparator,
+        guard cards.count == 7, !hasSectionSeparator, hasFooterSeparator,
               stack.spacing == 8, hasConsistentSpacing,
               cards[0] is QuotaCardSectionView, cards[1] is ResetCardSectionView,
               descendants(cards[0]).compactMap({ $0 as? QuotaWindowView }).count == model?.quotas.count,
               descendants(cards[3]).contains(where: { $0 is TokenSectionView }),
-              dailyButtons.count == 2, toolButtons.count == 2 else {
+              dailyButtons.count == 2, historyButtons.count == 2, toolButtons.count == 2 else {
             print("CODEX_CARD_LAYOUT structureFailed cards=\(cards.count) separators=\(hasSectionSeparator) footer=\(hasFooterSeparator) spacing=\(hasConsistentSpacing)")
             return false
+        }
+        if quotaHistoryUI.expanded && (cards[5].frame.height > 210 || cards[5].frame.height < 180) {
+            print("CODEX_CARD_LAYOUT quota height=\(cards[5].frame.height)"); return false
         }
         return cards.enumerated().allSatisfy { index, card in
             card.layoutSubtreeIfNeeded()
@@ -3485,6 +3510,75 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             if !valid { print("CODEX_CARD_LAYOUT index=\(index) frame=\(card.frame) content=\(content) radius=\(card.layer?.cornerRadius ?? -1) border=\(card.layer?.borderWidth ?? -1)") }
             return valid
         }
+    }
+
+    func scrollQuotaHistoryForPreview() {
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+        if let view = descendants(stack).compactMap({ $0 as? QuotaCycleHistoryView }).first {
+            var card: NSView? = view
+            while card != nil && !(card is PanelCardView) { card = card?.superview }
+            if let card = card { card.scrollToVisible(card.bounds) } else { view.scrollToVisible(view.bounds) }
+        }
+    }
+
+    func verifyQuotaHistoryEventsForPreview() -> Bool {
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+        guard let chart = descendants(stack).compactMap({ $0 as? QuotaCycleChart }).first,
+              let window = chart.window, quotaHistoryUI.browser.records.count >= 13 else { return false }
+        chart.scrollToVisible(chart.bounds); chart.updateTrackingAreas()
+        let visible = quotaHistoryUI.browser.visible
+        guard visible.count == 6, chart.bounds.width >= 200,
+              (chart.accessibilityChildren()?.count ?? 0) == 6 else { return false }
+        let column = (chart.bounds.width - 22) / 6
+        let location = chart.convert(NSPoint(x: 22 + column * 4.5, y: 30), to: nil)
+        guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: location, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 81, clickCount: 1, pressure: 1),
+              let up = NSEvent.mouseEvent(with: .leftMouseUp, location: location, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 82, clickCount: 1, pressure: 0) else { return false }
+        window.sendEvent(down); window.sendEvent(up)
+        guard quotaHistoryUI.browser.selectedCycleID == visible[4].id else { print("QUOTA_EVENT click failed loc=\(location) chart=\(chart.frame) clip=\(scrollView.contentView.bounds) hit=\(String(describing: window.contentView?.hitTest(location))) selected=\(String(describing: quotaHistoryUI.browser.selectedCycleID)) expected=\(visible[4].id)"); return false }
+        let hoverPoint = chart.convert(NSPoint(x: 22 + column * 2.5, y: 30), to: nil)
+        guard let move = NSEvent.mouseEvent(with: .mouseMoved, location: hoverPoint, modifierFlags: [], timestamp: 0,
+              windowNumber: window.windowNumber, context: nil, eventNumber: 83, clickCount: 0, pressure: 0) else { return false }
+        window.sendEvent(move)
+        guard quotaHistoryUI.hover == visible[2].id else { print("QUOTA_EVENT hover failed"); return false }
+        let blankPoint = chart.convert(NSPoint(x: 5, y: 30), to: nil)
+        guard let blank = NSEvent.mouseEvent(with: .mouseMoved, location: blankPoint, modifierFlags: [], timestamp: 0,
+              windowNumber: window.windowNumber, context: nil, eventNumber: 84, clickCount: 0, pressure: 0) else { return false }
+        window.sendEvent(blank)
+        guard quotaHistoryUI.hover == nil, quotaHistoryUI.browser.selectedCycleID == visible[4].id else { print("QUOTA_EVENT hover restore failed"); return false }
+        guard window.makeFirstResponder(chart), let left = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: "\u{f702}", charactersIgnoringModifiers: "\u{f702}", isARepeat: false, keyCode: 123) else { return false }
+        for _ in 0..<6 { window.sendEvent(left) }
+        guard quotaHistoryUI.browser.olderPage == 1, let chosen = quotaHistoryUI.browser.selectedCycleID else { print("QUOTA_EVENT key failed"); return false }
+        if let model = model { update(model: model) }
+        guard quotaHistoryUI.browser.selectedCycleID == chosen, quotaHistoryUI.browser.olderPage == 1 else { return false }
+        func click(_ view: NSView) -> Bool {
+            view.scrollToVisible(view.bounds)
+            let point = view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
+            guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 91, clickCount: 1, pressure: 1),
+              let up = NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 92, clickCount: 1, pressure: 0) else { return false }
+            window.sendEvent(down); window.sendEvent(up); return true
+        }
+        guard let more = descendants(stack).compactMap({ $0 as? NSButton }).first(where: { $0.title == "更早记录" }),
+              click(more), quotaHistoryUI.browser.visibleLimit == min(24, quotaHistoryUI.browser.records.count) else { print("QUOTA_EVENT more failed"); return false }
+        guard let earlier = descendants(stack).compactMap({ $0 as? NSButton }).first(where: { $0.accessibilityLabel() == "更早的额度周期" }),
+              click(earlier), quotaHistoryUI.browser.olderPage == 2 else { print("QUOTA_EVENT earlier failed"); return false }
+        func heading() -> PanelDisclosureButton? {
+            descendants(stack).compactMap { $0 as? PanelDisclosureButton }.first { $0.action == #selector(toggleQuotaHistory) }
+        }
+        let pageSelection = quotaHistoryUI.browser.selectedCycleID
+        guard let close = heading(), click(close), !quotaHistoryUI.expanded,
+              descendants(stack).compactMap({ $0 as? QuotaCycleChart }).isEmpty,
+              let open = heading(), click(open), quotaHistoryUI.expanded,
+              quotaHistoryUI.browser.selectedCycleID == pageSelection, quotaHistoryUI.browser.olderPage == 2 else { print("QUOTA_EVENT collapse failed"); return false }
+        resetQuotaHistoryAccount()
+        guard quotaHistoryUI.browser.selectedCycleID == nil, quotaHistoryUI.browser.records.isEmpty else { return false }
+        if let model = model { update(model: model) }
+        guard quotaHistoryUI.browser.selectedCycleID == quotaHistoryUI.browser.records.last?.id else { return false }
+        return true
     }
 
     /// 面板事件回归：核对模型行、工具周期和简析开合状态。
@@ -4032,6 +4126,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 默认展示绿/红；normal 展示当前色/橙；full 展示 100%；states / empty 覆盖异常与空数据。
     private func configureVisualPreview() {
         let arguments = CommandLine.arguments
+        if arguments.contains(where: { $0.hasPrefix("--visual-preview-quota-history") }) && !arguments.contains("--visual-preview-empty") {
+            let count = arguments.contains("--visual-preview-quota-history=25") ? 25 :
+                (arguments.contains("--visual-preview-quota-history=1") ? 1 : (arguments.contains("--visual-preview-quota-history=6") ? 6 : 13))
+            quotaHistorySnapshot = QuotaCyclePreviewFixture.make(count: count)
+            if arguments.contains("--visual-preview-quota-history-unstable") {
+                quotaHistorySnapshot = QuotaCycleSnapshot(state: QuotaCycleState(), isLoading: false, isSaved: true)
+            } else if arguments.contains("--visual-preview-quota-history-loading") {
+                quotaHistorySnapshot = QuotaCycleSnapshot(state: QuotaCycleState(), isLoading: true, isSaved: true)
+            } else if arguments.contains("--visual-preview-quota-history-unsaved") {
+                quotaHistorySnapshot = QuotaCycleSnapshot(state: quotaHistorySnapshot.state, isLoading: false, isSaved: false)
+            } else if arguments.contains("--visual-preview-quota-history-pending"), let current = quotaHistorySnapshot.state.current, let first = current.evidence.first {
+                var state = quotaHistorySnapshot.state
+                state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: first, reason: .planChange)
+                quotaHistorySnapshot = QuotaCycleSnapshot(state: state, isLoading: false, isSaved: true)
+            }
+        }
         let normal = arguments.contains("--visual-preview-normal")
         if arguments.contains("--visual-preview-narrow") {
             panelController.previewWidth = 320
@@ -4184,6 +4294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let argument = arguments.first(where: { $0.hasPrefix(outputPrefix) }) {
                 let path = String(argument.dropFirst(outputPrefix.count))
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    if arguments.contains(where: { $0.hasPrefix("--visual-preview-quota-history") }) { self.panelController.scrollQuotaHistoryForPreview() }
                     if arguments.contains("--visual-preview-scroll-end") {
                         _ = self.panelController.scrollToEndForPreview()
                     }
@@ -4238,6 +4349,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard panelController.verifyCardLayoutForPreview() else { return fail("card layout changed after interactions") }
         guard panelController.verifyChartInteractionsForPreview() else { return fail("chart hover or keyboard navigation failed") }
+        if CommandLine.arguments.contains(where: { $0.hasPrefix("--visual-preview-quota-history") }) && quotaHistorySnapshot.state.closed.count >= 12 {
+            guard panelController.verifyQuotaHistoryEventsForPreview() else { return fail("quota history event interaction failed") }
+            print("CodexUsage quota history event test: PASS (mouse selection/hover, keyboard paging, load earlier, collapse, refresh/account reset)")
+        }
         panelController.prepareReopenStateForPreview()
         guard let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
             timestamp: 0, windowNumber: panelController.previewWindowNumber, context: nil, characters: "\u{1b}",
@@ -4376,7 +4491,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard current != accountIdentity else { return }
         accountIdentity = current
         accountGeneration += 1
-        quotaHistorySnapshot = QuotaCycleSnapshot(state: QuotaCycleState(), isLoading: current != nil, isSaved: true)
+        panelController.resetQuotaHistoryAccount()
+        quotaHistorySnapshot = QuotaCycleSnapshot(state: QuotaCycleState(), isLoading: QuotaCycleCoordinator.accountKey(current) != nil, isSaved: true)
         quotaHistoryCoordinator?.activate(accountIdentity: current, generation: accountGeneration)
         AccountIsolation.clear(&usage)
         fiveHourLastOK = nil; sevenDayLastOK = nil; resetCardsLastOK = nil
@@ -4839,6 +4955,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             tibo: tiboSection,
             codexTokens: codexSection,
             official: usage.official, officialError: usage.officialError,
+            quotaHistory: quotaHistorySnapshot,
+            quotaHistoryAvailable: (visualPreview && !CommandLine.arguments.contains("--visual-preview-quota-history-unstable")) || QuotaCycleCoordinator.accountKey(accountIdentity) != nil,
             officialTodayFill: LocalUsageMerge.combine(usage.tokensToday, usage.extToday)?.total,
             tools: (0..<3).map { period in
                 let codex = [usage.tokensToday, usage.tokens7d, usage.tokens30d][period]
@@ -5335,6 +5453,19 @@ enum CodexOfflineRegression {
             try expect(previewHistory == nil && !previewCreatedStore &&
                        !FileManager.default.fileExists(atPath: root.appendingPathComponent("preview-must-not-exist").path),
                        "preview created history storage")
+            let previewState = QuotaCycleUIState()
+            let fixtureSnapshot = QuotaCyclePreviewFixture.make(count: 13)
+            previewState.browser.update(fixtureSnapshot.state.closed + [fixtureSnapshot.state.current!])
+            let unsavedView = QuotaCycleHistoryView(snapshot: QuotaCycleSnapshot(state: fixtureSnapshot.state, isLoading: false, isSaved: false), available: true, state: previewState)
+            try expect(unsavedView.previewText.contains("历史未保存") && unsavedView.previewText.contains("最后观测"), "history save failure was not exposed")
+            let emptyState = QuotaCycleUIState()
+            let loadingView = QuotaCycleHistoryView(snapshot: QuotaCycleSnapshot(state: QuotaCycleState(), isLoading: true, isSaved: true), available: true, state: emptyState)
+            try expect(loadingView.previewText.contains("正在读取历史"), "history loading state missing")
+            let unstableView = QuotaCycleHistoryView(snapshot: QuotaCycleSnapshot(state: QuotaCycleState(), isLoading: false, isSaved: true), available: false, state: emptyState)
+            try expect(unstableView.previewText.contains("无法确认稳定账户"), "unstable account loading state incorrect")
+            let planChange = fixtureSnapshot.state.closed.first { $0.end == .unconfirmed }!
+            let planDetail = QuotaCycleHistoryView.detail(planChange, pending: nil)
+            try expect(planDetail.0.contains("套餐/额度变更") && !planDetail.1.contains("到期未用"), "plan change mislabeled as waste")
             var historyFixture = QuotaData()
             historyFixture.sevenDay = QuotaWindow(usedPercent: 35, reset: now.addingTimeInterval(1000))
             try expect(QuotaHistoryAdapter.observation(historyFixture, requestStartedAt: now, observedAt: now) != nil,
