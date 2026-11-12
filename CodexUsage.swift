@@ -3060,7 +3060,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             action: #selector(toggleQuotaHistory), toolTip: "根据额度实际观测轮次记录；开始和结束可能不精确")
         PanelUI.addFullWidth(heading, to: root)
         if quotaHistoryUI.expanded {
-            PanelUI.addFullWidth(QuotaCycleHistoryView(snapshot: model.quotaHistory, available: model.quotaHistoryAvailable, state: quotaHistoryUI), to: root)
+            PanelUI.addFullWidth(QuotaCycleHistoryView(snapshot: model.quotaHistory, available: model.quotaHistoryAvailable, state: quotaHistoryUI,
+                now: CommandLine.arguments.contains(where: { $0.hasPrefix("--visual-preview") }) ? Date(timeIntervalSince1970: 1_793_897_600) : Date()), to: root)
         }
         return root
     }
@@ -5463,6 +5464,9 @@ enum CodexOfflineRegression {
             try expect(loadingView.previewText.contains("正在读取历史"), "history loading state missing")
             let unstableView = QuotaCycleHistoryView(snapshot: QuotaCycleSnapshot(state: QuotaCycleState(), isLoading: false, isSaved: true), available: false, state: emptyState)
             try expect(unstableView.previewText.contains("无法确认稳定账户"), "unstable account loading state incorrect")
+            let waiting = fixtureSnapshot.state.current!
+            let waitingDetail = QuotaCycleHistoryView.detail(waiting, pending: nil, now: waiting.expectedResetAt.addingTimeInterval(1))
+            try expect(waitingDetail.0.contains("等待重置确认"), "expired reset was shown as active")
             let planChange = fixtureSnapshot.state.closed.first { $0.end == .unconfirmed }!
             let planDetail = QuotaCycleHistoryView.detail(planChange, pending: nil)
             try expect(planDetail.0.contains("套餐/额度变更") && !planDetail.1.contains("到期未用"), "plan change mislabeled as waste")

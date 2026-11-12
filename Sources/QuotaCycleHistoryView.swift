@@ -11,6 +11,7 @@ final class QuotaCycleUIState {
 final class QuotaCycleHistoryView: NSView {
     private let snapshot: QuotaCycleSnapshot
     private let available: Bool
+    private let now: Date
     private let state: QuotaCycleUIState
     private let earlier = NSButton(title: "‹", target: nil, action: nil)
     private let newer = NSButton(title: "›", target: nil, action: nil)
@@ -22,9 +23,9 @@ final class QuotaCycleHistoryView: NSView {
     private let chart: QuotaCycleChart
     override var isFlipped: Bool { true }
 
-    init(snapshot: QuotaCycleSnapshot, available: Bool, state: QuotaCycleUIState) {
-        self.snapshot = snapshot; self.available = available; self.state = state
-        chart = QuotaCycleChart(state: state, snapshot: snapshot)
+    init(snapshot: QuotaCycleSnapshot, available: Bool, state: QuotaCycleUIState, now: Date = Date()) {
+        self.snapshot = snapshot; self.available = available; self.state = state; self.now = now
+        chart = QuotaCycleChart(state: state, snapshot: snapshot, now: now)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 150).isActive = true
@@ -67,7 +68,7 @@ final class QuotaCycleHistoryView: NSView {
         more.isHidden = state.browser.visibleLimit >= records.count
         let selected = state.hover ?? state.browser.selectedCycleID
         if let cycle = records.first(where: { $0.id == selected }) {
-            let lines = Self.detail(cycle, pending: snapshot.state.current?.id == cycle.id ? snapshot.state.pendingTransition : nil)
+            let lines = Self.detail(cycle, pending: snapshot.state.current?.id == cycle.id ? snapshot.state.pendingTransition : nil, now: now)
             detail1.stringValue = lines.0; detail2.stringValue = lines.1
             detail1.toolTip = lines.0; detail2.toolTip = lines.1
             chart.setAccessibilityValue(lines.0 + "，" + lines.1 + "，最后观测 " + Self.date(cycle.lastObservedAt))
@@ -94,10 +95,10 @@ final class QuotaCycleHistoryView: NSView {
     static func date(_ date: Date, format: String = "MM/dd HH:mm") -> String {
         let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = format; return f.string(from: date)
     }
-    static func detail(_ cycle: QuotaCycleRecord, pending: QuotaPendingTransition?) -> (String, String) {
+    static func detail(_ cycle: QuotaCycleRecord, pending: QuotaPendingTransition?, now: Date = Date()) -> (String, String) {
         let used = String(format: "%.1f", cycle.lastObservedUsedPercent).replacingOccurrences(of: ".0", with: "")
         let remaining = String(format: "%.1f", cycle.remainingAtLastObservation).replacingOccurrences(of: ".0", with: "")
-        let start = cycle.inferredStartAt.map { "开始推算 " + date($0, format: "MM/dd") } ?? "首次观测 " + date(cycle.firstObservedAt, format: "MM/dd")
+        let start = cycle.startKind == .afterPlanChange ? "开始未知" : (cycle.inferredStartAt.map { "开始推算 " + date($0, format: "MM/dd") } ?? "首次观测 " + date(cycle.firstObservedAt, format: "MM/dd"))
         if let pending = pending { return (start + " · " + (pending.reason == .planChange ? "套餐/额度变更待确认" : "重置待确认"), "最后观测已用 \(used)%") }
         switch cycle.end {
         case .natural: return (start + " · 正常到期", "最后观测已用 \(used)% · 到期未用约 \(remaining)%")
@@ -106,8 +107,10 @@ final class QuotaCycleHistoryView: NSView {
         case .gap: return (start + " · 观测缺口", "最后观测已用 \(used)%")
         case .unconfirmed: return (start + " · 套餐/额度变更", "最后观测已用 \(used)%")
         case nil:
-            let status = cycle.startKind == .afterPlanChange ? "套餐/额度变更后，开始未知" : (cycle.startKind == .afterGap ? "缺口后首次观测" : "进行中")
-            return (start + " · " + status, "已用 \(used)% · 当前剩余 \(remaining)%")
+            let origin = cycle.startKind == .afterPlanChange ? "套餐/额度变更后，开始未知" : (cycle.startKind == .afterGap ? "缺口后首次观测" : "进行中")
+            let expired = cycle.expectedResetAt < now
+            let status = expired ? (cycle.startKind == .afterPlanChange ? "套餐变更后 · 等待重置确认" : "等待重置确认") : origin
+            return (start + " · " + status, expired ? "最后观测已用 \(used)% · 剩余 \(remaining)%" : "已用 \(used)% · 当前剩余 \(remaining)%")
         }
     }
 }
@@ -120,11 +123,12 @@ private final class QuotaCycleAccessibilityItem: NSAccessibilityElement {
 final class QuotaCycleChart: NSView {
     private let state: QuotaCycleUIState
     private let snapshot: QuotaCycleSnapshot
+    private let now: Date
     var changed: (() -> Void)?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    init(state: QuotaCycleUIState, snapshot: QuotaCycleSnapshot) {
-        self.state = state; self.snapshot = snapshot; super.init(frame: .zero)
+    init(state: QuotaCycleUIState, snapshot: QuotaCycleSnapshot, now: Date) {
+        self.state = state; self.snapshot = snapshot; self.now = now; super.init(frame: .zero)
         setAccessibilityElement(true); setAccessibilityRole(.group)
         setAccessibilityLabel("额度周期双柱图，使用左右方向键选择周期")
     }
@@ -172,7 +176,7 @@ final class QuotaCycleChart: NSView {
             item.setAccessibilityFrame(window.convertToScreen(frameInWindow))
             item.setAccessibilityParent(self)
             item.setAccessibilityRole(.button)
-            let detail = QuotaCycleHistoryView.detail(cycle, pending: snapshot.state.current?.id == cycle.id ? snapshot.state.pendingTransition : nil)
+            let detail = QuotaCycleHistoryView.detail(cycle, pending: snapshot.state.current?.id == cycle.id ? snapshot.state.pendingTransition : nil, now: now)
             item.setAccessibilityLabel(detail.0 + "，" + detail.1 + "，最后观测 " + QuotaCycleHistoryView.date(cycle.lastObservedAt))
             item.onPress = { [weak self] in self?.state.browser.select(cycle.id); self?.state.hover = nil; self?.changed?() }
             return item
