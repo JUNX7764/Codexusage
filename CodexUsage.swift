@@ -312,6 +312,17 @@ struct QuotaData {
     var error: String?
 }
 
+// Only the 7d value from this particular response can enter history, never the merged UI cache.
+enum QuotaHistoryAdapter {
+    static func observation(_ result: QuotaData, requestStartedAt: Date, observedAt: Date) -> QuotaObservation? {
+        guard result.error == nil, result.sevenDayError == nil, !result.sevenDayUnavailable,
+              let window = result.sevenDay, let reset = window.reset else { return nil }
+        let value = QuotaObservation(requestStartedAt: requestStartedAt, observedAt: observedAt,
+            usedPercent: window.usedPercent, resetAt: reset, planType: result.planType)
+        return value.isValid ? value : nil
+    }
+}
+
 /// 重置卡（官方名：额度重置卡）明细端点返回的一张有效卡
 struct ResetCard {
     var expires: Date    // 过期时间（expires_at）
@@ -3945,6 +3956,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let pendingResetKey = "pendingResetRedemptionV1"
     private var accountIdentity: String?
     private var accountGeneration = 0
+    private var quotaHistoryCoordinator: QuotaCycleCoordinator?
+    private var quotaHistorySnapshot = QuotaCycleSnapshot(state: QuotaCycleState(), isLoading: false, isSaved: true)
     private var lastAttemptAt = Date()
     private let launchAgentLabel = "com.local.codex-usage"
     // 深浅主题切换重画（GlmUsage 同款）：菜单栏是彩色非模板图，不随系统明暗自动变色。
@@ -3971,6 +3984,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
         panelController.onConfirmUpdate = { [weak self] tag, notes in self?.startConfirmedUpdate(tag: tag, notes: notes) }
         panelController.onUseReset = { [weak self] in self?.beginUseReset() }
+        quotaHistoryCoordinator = QuotaHistoryStartup.make(visualPreview: visualPreview) {
+            let historyRoot = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                .appendingPathComponent("Library/Application Support/CodexUsage/quota-history", isDirectory: true)
+            return QuotaCycleCoordinator(root: historyRoot, writer: { data, url in
+                try AtomicJSONFile.replace(data, at: url.path)
+            }, deliver: { [weak self] snapshot in
+                guard let self = self else { return }
+                self.quotaHistorySnapshot = snapshot
+                self.rebuildMenu() // no renderBar / status.json write
+            })
+        }
         if visualPreview {
             configureVisualPreview()
             return
@@ -4273,11 +4297,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastAttemptAt = Date()
         updateUI()
         let group = DispatchGroup()
+        let quotaRequestStartedAt = Date()
         group.enter()
         Fetcher.fetchQuota(auth: auth) { [weak self] r in
             DispatchQueue.main.async {
                 if let self = self {
-                    if self.acceptAccountResponse(generation: generation, identity: identity) { self.applyQuota(r) }
+                    if self.acceptAccountResponse(generation: generation, identity: identity) {
+                        self.applyQuota(r)
+                        if let identity = identity, let sample = QuotaHistoryAdapter.observation(r, requestStartedAt: quotaRequestStartedAt, observedAt: Date()) {
+                            self.quotaHistoryCoordinator?.observe(sample, identity: identity, generation: generation)
+                        }
+                    }
                 }
                 group.leave()
             }
@@ -4346,6 +4376,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard current != accountIdentity else { return }
         accountIdentity = current
         accountGeneration += 1
+        quotaHistorySnapshot = QuotaCycleSnapshot(state: QuotaCycleState(), isLoading: current != nil, isSaved: true)
+        quotaHistoryCoordinator?.activate(accountIdentity: current, generation: accountGeneration)
         AccountIsolation.clear(&usage)
         fiveHourLastOK = nil; sevenDayLastOK = nil; resetCardsLastOK = nil
     }
@@ -4874,11 +4906,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard CodexAuth.identity(CodexAuth.load()) == identity else {
             synchronizeAccount(); updateUI(); return
         }
+        let requestedAt: Date? = pending == nil ? Date() : pending?["createdAt"] as? Date
+        let baselineID = pending == nil ? quotaHistorySnapshot.state.current?.id :
+            (pending?["baselineCycleID"] as? String).flatMap(UUID.init(uuidString:))
         if pending == nil {
-            defaults.set(["identity": identity, "cardID": cardID, "key": key], forKey: pendingResetKey)
+            var values: [String: Any] = ["identity": identity, "cardID": cardID, "key": key, "createdAt": requestedAt!]
+            if let baselineID = baselineID { values["baselineCycleID"] = baselineID.uuidString }
+            defaults.set(values, forKey: pendingResetKey)
             guard defaults.synchronize() else {
                 panelController.setUpdateMessage("无法保存请求状态，未使用重置卡", dismissAfter: 7); return
             }
+        }
+        let operationHash = QuotaCycleCoordinator.operationHash(key)
+        let operationGeneration = accountGeneration
+        if pending == nil {
+            quotaHistoryCoordinator?.recordRedemption(QuotaRedemptionEvidence(operationHash: operationHash,
+                originalRequestedAt: requestedAt, responseAt: requestedAt!, status: .requested,
+                baselineCycleID: baselineID), identity: identity, generation: operationGeneration)
         }
         resetUseInFlight = true
         rebuildMenu()
@@ -4886,6 +4930,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.resetUseInFlight = false
+                let status: QuotaRedemptionStatus
+                switch result {
+                case .success: status = .reset
+                case .alreadyRedeemed: status = .alreadyRedeemed
+                case .nothingToReset: status = .nothingToReset
+                case .noCredit: status = .noCredit
+                case .unknown: status = .unknown
+                }
+                self.quotaHistoryCoordinator?.recordRedemption(QuotaRedemptionEvidence(operationHash: operationHash,
+                    originalRequestedAt: requestedAt, responseAt: Date(), status: status,
+                    baselineCycleID: baselineID), identity: identity, generation: operationGeneration)
                 if result != .unknown { defaults.removeObject(forKey: self.pendingResetKey); defaults.synchronize() }
                 let message: String
                 switch result {
@@ -4897,6 +4952,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.synchronizeAccount()
                 if self.accountIdentity == identity {
                     self.accountGeneration += 1 // Discard card/quota reads started before redemption finished.
+                    self.quotaHistoryCoordinator?.activate(accountIdentity: identity, generation: self.accountGeneration)
                     self.usage.resetCards = nil
                     self.resetCardsLastOK = nil
                     self.panelController.setUpdateMessage(message, dismissAfter: result == .unknown ? 15 : 6)
@@ -5270,6 +5326,29 @@ enum CodexOfflineRegression {
             try expect(neutralInkCount(darkImage, white: true) > 0,
                        "dark appearance override did not draw light menu bar text")
 
+            var previewCreatedStore = false
+            let previewHistory = QuotaHistoryStartup.make(visualPreview: true) {
+                previewCreatedStore = true
+                return QuotaCycleCoordinator(root: root.appendingPathComponent("preview-must-not-exist"),
+                    writer: { _, _ in throw Failure(description: "preview writer called") }, deliver: { _ in })
+            }
+            try expect(previewHistory == nil && !previewCreatedStore &&
+                       !FileManager.default.fileExists(atPath: root.appendingPathComponent("preview-must-not-exist").path),
+                       "preview created history storage")
+            var historyFixture = QuotaData()
+            historyFixture.sevenDay = QuotaWindow(usedPercent: 35, reset: now.addingTimeInterval(1000))
+            try expect(QuotaHistoryAdapter.observation(historyFixture, requestStartedAt: now, observedAt: now) != nil,
+                       "valid fresh 7d not accepted by history adapter")
+            historyFixture.error = "failed"
+            try expect(QuotaHistoryAdapter.observation(historyFixture, requestStartedAt: now, observedAt: now) == nil,
+                       "failed response entered history")
+            historyFixture.error = nil
+            historyFixture.sevenDay = nil
+            try expect(QuotaHistoryAdapter.observation(historyFixture, requestStartedAt: now, observedAt: now) == nil,
+                       "missing 7d must not use prior cached window")
+            historyFixture.sevenDay = QuotaWindow(usedPercent: 35, reset: nil)
+            try expect(QuotaHistoryAdapter.observation(historyFixture, requestStartedAt: now, observedAt: now) == nil,
+                       "missing reset entered history")
             let missing = Fetcher.parseUsage([:], now: now, email: nil)
             try expect(missing.fiveHour == nil && missing.fiveHourError != nil, "missing 5H was not rejected")
             try expect(missing.sevenDay == nil && missing.sevenDayError != nil, "missing 7D was not rejected")

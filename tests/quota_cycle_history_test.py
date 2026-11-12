@@ -54,3 +54,6 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_browser(self):
         self.run_case('browser')
+
+    def test_coordinator_failure(self):
+        self.run_case('coordinatorFailure')

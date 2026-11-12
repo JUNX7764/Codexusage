@@ -86,7 +86,7 @@ case "redemption":
     reducer.record(event, into: &state)
     reducer.record(event, into: &state)
     reducer.record(QuotaRedemptionEvidence(operationHash: "hash", originalRequestedAt: nil, responseAt: t.addingTimeInterval(11), status: .alreadyRedeemed, baselineCycleID: id), into: &state)
-    check(state.redemptions.count == 1 && state.closed.isEmpty, "dedup, no fabricated cycle")
+    check(state.redemptions.count == 1 && state.redemptions[0].status == .reset && state.closed.isEmpty, "dedup preserves reset, no fabricated cycle")
     reducer.ingest(sample(10, 2, 605800), into: &state)
     check(state.closed.isEmpty, "request before response is not post-redemption")
     reducer.ingest(sample(20, 2, 605800), into: &state)
@@ -128,6 +128,20 @@ case "store":
         try store.save(state, accountKey: key)
         let loaded = try store.load(accountKey: key)
         check(loaded == state, "roundtrip")
+        var pendingState = state
+        reducer.ingest(sample(100, 2, 605800), into: &pendingState)
+        try store.save(pendingState, accountKey: key)
+        let pendingReload = try store.load(accountKey: key)
+        check(pendingReload.pendingTransition == pendingState.pendingTransition, "pending survives restart")
+        try store.save(state, accountKey: key)
+        var ended = QuotaCycleState()
+        reducer.ingest(sample(604700, 0), into: &ended)
+        reducer.ingest(sample(604810, 0, 1209600), into: &ended)
+        reducer.ingest(sample(604830, 0, 1209600), into: &ended)
+        let endedKey = String(repeating: "c", count: 64)
+        try store.save(ended, accountKey: endedKey)
+        let endedReload = try store.load(accountKey: endedKey)
+        check(endedReload.closed.first?.end == .natural, "confirmed cycle survives validation and reload")
         let other = try store.load(accountKey: String(repeating: "b", count: 64))
         check(other.current == nil, "partition")
         let path = root.appendingPathComponent(key).appendingPathComponent("history-v1.json")
@@ -194,8 +208,9 @@ case "coordinator":
     }
     let a = "account:a|workspace", b = "account:b|workspace"
     coordinator.activate(accountIdentity: a, generation: 1); drain()
+    coordinator.observe(sample(0, 91), identity: a, generation: 1); drain()
     coordinator.activate(accountIdentity: b, generation: 2); drain(); deliver()
-    check(snapshots.allSatisfy { $0.state.current == nil }, "old account load never delivered")
+    check(snapshots.allSatisfy { $0.state.current == nil }, "old account load/data never delivered")
     snapshots = []
     coordinator.observe(sample(0, 20), identity: a, generation: 1)
     coordinator.observe(sample(0, 30), identity: b, generation: 2); drain(); deliver()
@@ -212,9 +227,13 @@ case "coordinator":
     check(!snapshots.contains(where: { $0.isLoading }) && snapshots.last?.state.current?.lastObservedUsedPercent == 30, "same identity generation preserves state")
     coordinator.observe(sample(320, 40), identity: b, generation: 2); drain(); deliver()
     check(snapshots.last?.state.current?.lastObservedUsedPercent == 30, "old generation refused")
+    let operation = QuotaRedemptionEvidence(operationHash: QuotaCycleCoordinator.operationHash("test"), originalRequestedAt: t.addingTimeInterval(315), responseAt: t.addingTimeInterval(316), status: .reset, baselineCycleID: snapshots.last?.state.current?.id)
+    coordinator.recordRedemption(operation, identity: b, generation: 3)
+    coordinator.activate(accountIdentity: b, generation: 4); drain(); deliver()
+    check(snapshots.last?.state.redemptions.count == 1 && snapshots.last?.state.current?.lastObservedUsedPercent == 30, "generation preserves redemption and current state")
     let before = writes
-    coordinator.activate(accountIdentity: "token:unstable", generation: 4)
-    coordinator.observe(sample(400, 90), identity: "token:unstable", generation: 4); drain(); deliver()
+    coordinator.activate(accountIdentity: "token:unstable", generation: 5)
+    coordinator.observe(sample(400, 90), identity: "token:unstable", generation: 5); drain(); deliver()
     check(writes == before, "unstable identity cannot write")
 case "browser":
     for count in [0, 1, 5, 6, 7, 12, 13, 25] {
@@ -236,5 +255,32 @@ case "browser":
             check(browser.visible.last?.id == s.current!.id, "newer reaches latest")
         }
     }
+case "coordinatorFailure":
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    var fail = true
+    var writes = 0
+    var latest: QuotaCycleSnapshot?
+    let c = QuotaCycleCoordinator(root: root, writer: { data, url in
+        writes += 1
+        if fail { throw NSError(domain: "failure", code: 1) }
+        try data.write(to: url, options: .atomic)
+    }, schedule: { $0() }, deliver: { latest = $0 })
+    func wait() { let sem = DispatchSemaphore(value: 0); c.drain { sem.signal() }; check(sem.wait(timeout: .now() + 5) == .success, "wait") }
+    let identity = "account:failure|workspace"
+    c.activate(accountIdentity: identity, generation: 1); wait()
+    c.observe(sample(0, 5), identity: identity, generation: 1); wait()
+    check(latest?.isSaved == false && latest?.state.current != nil, "failed writer keeps in-memory state")
+    fail = false
+    c.observe(sample(10, 5), identity: identity, generation: 1); wait()
+    check(latest?.isSaved == true && writes == 2, "later retry recovers")
+    let key = QuotaCycleCoordinator.accountKey(identity)!
+    let path = root.appendingPathComponent(key).appendingPathComponent("history-v1.json")
+    let bad = Data("not JSON".utf8); try! bad.write(to: path)
+    let c2 = QuotaCycleCoordinator(root: root, writer: { _, _ in check(false, "corrupt partition must never be overwritten") }, schedule: { $0() }, deliver: { latest = $0 })
+    func wait2() { let sem = DispatchSemaphore(value: 0); c2.drain { sem.signal() }; check(sem.wait(timeout: .now() + 5) == .success, "wait2") }
+    c2.activate(accountIdentity: identity, generation: 2); wait2()
+    c2.observe(sample(20, 10), identity: identity, generation: 2); wait2()
+    check(latest?.isSaved == false && (try! Data(contentsOf: path)) == bad, "corrupt file preserved")
 default: exit(2)
 }

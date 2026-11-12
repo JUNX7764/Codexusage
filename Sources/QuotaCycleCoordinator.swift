@@ -1,6 +1,12 @@
 import Foundation
 import CryptoKit
 
+enum QuotaHistoryStartup {
+    static func make(visualPreview: Bool, create: () -> QuotaCycleCoordinator) -> QuotaCycleCoordinator? {
+        visualPreview ? nil : create()
+    }
+}
+
 struct QuotaCycleSnapshot {
     let state: QuotaCycleState
     let isLoading: Bool

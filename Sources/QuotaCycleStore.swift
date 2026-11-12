@@ -16,6 +16,10 @@ final class QuotaCycleStore {
     private func valid(_ state: QuotaCycleState) -> Bool {
         guard state.schemaVersion == 1, finite(state.lastRequestStartedAt),
               state.previous?.isValid ?? true, state.anomalies.allSatisfy(\.isValid) else { return false }
+        if let previous = state.previous {
+            guard let current = state.current, state.lastRequestStartedAt == previous.requestStartedAt,
+                  previous.observedAt >= current.lastObservedAt else { return false }
+        } else if state.current != nil || state.lastRequestStartedAt != nil { return false }
         let records = state.closed + (state.current.map { [$0] } ?? [])
         guard Set(records.map(\.id)).count == records.count,
               state.closed.allSatisfy({ $0.end != nil }), state.current?.end == nil else { return false }
@@ -28,14 +32,20 @@ final class QuotaCycleStore {
                   zip(r.evidence, r.evidence.dropFirst()).allSatisfy({ $0.observedAt <= $1.observedAt && $0.requestStartedAt < $1.requestStartedAt }),
                   r.evidence.first!.observedAt == r.firstObservedAt,
                   r.evidence.last!.observedAt <= r.lastObservedAt,
+                  r.evidence.last!.usedPercent == r.lastObservedUsedPercent,
+                  (r.startKind == .inferred) == (r.inferredStartAt != nil),
+                  (r.end == nil && r.boundaryLower == nil && r.boundaryUpper == nil) ||
+                    (r.end != nil && r.boundaryLower != nil && r.boundaryUpper != nil),
                   r.boundaryLower.map({ $0 >= r.lastObservedAt }) ?? true,
                   (r.boundaryLower == nil || r.boundaryUpper == nil || r.boundaryLower! <= r.boundaryUpper!) else { return false }
         }
         guard zip(records, records.dropFirst()).allSatisfy({ $0.firstObservedAt <= $1.firstObservedAt }),
               Set(state.redemptions.map(\.operationHash)).count == state.redemptions.count,
-              state.redemptions.allSatisfy({ event in !event.operationHash.isEmpty && finite(event.originalRequestedAt) && finite(event.responseAt) && (event.originalRequestedAt.map { $0 <= event.responseAt } ?? true) }) else { return false }
+              state.redemptions.allSatisfy({ event in event.operationHash.count == 64 && event.operationHash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) && finite(event.originalRequestedAt) && finite(event.responseAt) && (event.originalRequestedAt.map { $0 <= event.responseAt } ?? true) }) else { return false }
         if let pending = state.pendingTransition {
-            guard pending.first.isValid, pending.baselineCycleID == state.current?.id else { return false }
+            guard pending.first.isValid, pending.baselineCycleID == state.current?.id,
+                  pending.first.observedAt >= state.current!.lastObservedAt,
+                  state.previous.map({ pending.first.requestStartedAt <= $0.requestStartedAt }) ?? false else { return false }
         }
         return true
     }

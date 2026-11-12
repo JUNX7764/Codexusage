@@ -34,6 +34,9 @@
 # 离线自检：只用临时目录和假凭据，不读真实 Codex 凭据、不联网
 ./CodexUsage.app/Contents/MacOS/CodexUsage --self-test
 
+# 周期状态机／仓库／协调器：仅使用假账号和临时目录
+python3 -m unittest discover -s tests -p 'quota_cycle_history_test.py' -v
+
 # 脚本回归：PATH mock 故障注入，不操作真实 app、LaunchAgent 或 GitHub
 python3 -m unittest discover -s tests -p '*_test.py'
 
@@ -83,6 +86,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 | `CodexUsage.swift` | 入口、AppKit UI、原有数据层、更新控制和离线自检 |
 | `Sources/OfficialUsage.swift` | 账号用量只读请求、账号快照校验和严格解析 |
 | `Sources/DailyUsageView.swift` | 日期图表、悬停／键盘查看和工具占比条 |
+| `Sources/QuotaCycleHistory.swift` / `QuotaCycleStore.swift` / `QuotaCycleCoordinator.swift` | 额度轮次状态机、隔离存储与异步协调；卡片 UI 尚未接入 |
 | `Sources/UsageAttribution.swift` / `UsageComparison.swift` | 来源归属及比较计算 |
 | `vendor/zstddeclib.c` | 上游 zstd v1.5.7 单文件解码源，许可见 `vendor/zstd-LICENSE` |
 | `vendor/zstd_bridge.c` / `.h` | zstd 解码的 C 桥接层 |
@@ -101,6 +105,8 @@ Codex 会话按 `token_count` 事件的本地日期统计，累计值按同一�
 官方用量通过 `GET /backend-api/wham/profiles/me` 只读请求，使用已有认证快照及 `ChatGPT-Account-ID`，查询本身不续期；401 等待额度链路按既有规则处理。请求结果接受前后核对账号身份和凭据，失败保留同账号上次成功值。官方数据及本机扫描随约五分钟调度，鼠标与控件交互只使用缓存。图表及比较遵循[官方客户端稀疏活动桶显示行为](https://github.com/openai/codex/blob/2c502d8b3d382dd609179164f31396d95deee55c/codex-rs/tui/src/analytics/activity_chart.rs)：非空官方日数组范围内缺桶按零，范围外与未知来源不外推；以本地今日为 D，官方日桶尚未含当日时以与用量情况同口径的本机合并今日用量（Codex 与外部工具之和）补足（描边空心柱，界面文案不标注来源），源日期时区未确认不阻止相邻标签计算。缺失范围、空数据或查询过期时显示数据不足。
 
 构建时在专属临时目录生成合法 `main.swift` 并编译 `Sources/`；真实只读能力可通过 `--official-usage-check` 检查，该命令联网，只输出成功或失败类别及日／周比较是否可计算的布尔值，不输出日期、账号或个人用量。
+
+额度周期历史只消费现有 7d 请求中本次有效的数据，以稳定账户身份派生哈希分区；缺少稳定身份时不落盘。首次周期开始时间是推算，提前重置来源未确认，跨观测缺口不补造轮次。重置卡 `already_redeemed` 仅确认原请求，单独出现时即使携带原请求时间也不独立生成边界；已有同操作的 `reset` 证据不会被覆盖。该功能目前仅完成数据链路，尚无周期历史卡片。
 
 更新脚本接收已确认的 Release 标签和正在运行的应用路径，校验包身份、构建版本和实际安装版本后仅处理目标进程。离线脚本测试使用临时应用、伪造进程和网络命令，**不能替代真实安装环境中的更新、回滚和面板点击验收**。
 
