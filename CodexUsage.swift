@@ -2853,6 +2853,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var externalExpanded = false
     private var dailyExpanded = true
     private let quotaHistoryUI = QuotaCycleUIState()
+    private var quotaHistoryReopenExpected: (UUID?, Int)?
     private var toolPeriod = 0
     private var savedScrollOrigin = NSPoint.zero
     private var expandedCodexBuckets: Set<Int> = []
@@ -3626,6 +3627,16 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return dailyExpanded && descendants(stack).compactMap({ $0 as? DailyUsageChart }).count == 1
     }
 
+    func prepareQuotaReopenForPreview() {
+        quotaHistoryUI.browser.earlier()
+        if let last = quotaHistoryUI.browser.visible.last { quotaHistoryUI.browser.select(last.id) }
+        quotaHistoryReopenExpected = (quotaHistoryUI.browser.selectedCycleID, quotaHistoryUI.browser.olderPage)
+    }
+    func verifyQuotaReopenForPreview() -> Bool {
+        guard let expected = quotaHistoryReopenExpected else { return true }
+        quotaHistoryReopenExpected = nil
+        return quotaHistoryUI.browser.selectedCycleID == expected.0 && quotaHistoryUI.browser.olderPage == expected.1
+    }
     func prepareReopenStateForPreview() { if dailyExpanded { toggleDaily() } }
     func verifyReopenStateForPreview() -> Bool {
         let intact = !dailyExpanded && externalExpanded && toolPeriod == 1
@@ -4353,6 +4364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains(where: { $0.hasPrefix("--visual-preview-quota-history") }) && quotaHistorySnapshot.state.closed.count >= 12 {
             guard panelController.verifyQuotaHistoryEventsForPreview() else { return fail("quota history event interaction failed") }
             print("CodexUsage quota history event test: PASS (mouse selection/hover, keyboard paging, load earlier, collapse, refresh/account reset)")
+            panelController.prepareQuotaReopenForPreview()
         }
         panelController.prepareReopenStateForPreview()
         guard let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
@@ -4368,6 +4380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.panelController.toggle(anchoredTo: button)
             guard self.panelController.isOpen else { return fail("panel did not reopen") }
             guard self.panelController.verifyReopenStateForPreview() else { return fail("section or period state lost after reopen") }
+            guard self.panelController.verifyQuotaReopenForPreview() else { return fail("quota history selection or page lost after reopen") }
             guard let outside = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero,
                 modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
                 eventNumber: 0, clickCount: 1, pressure: 1) else {

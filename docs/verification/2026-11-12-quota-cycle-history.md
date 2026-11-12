@@ -6,7 +6,7 @@
 
 - `python3 -m unittest discover -s tests -p '*_test.py' -v`：50 项通过。包括周期状态机、账户隔离、读取/写入故障、候选恢复和既有脚本 mock。
 - `./build.sh` 与 `./CodexUsage.app/Contents/MacOS/CodexUsage --self-test`：通过；`lipo -archs` 显示 x86_64、arm64，`codesign --verify --deep --strict CodexUsage.app` 通过；`bash -n build.sh scripts/update.sh scripts/release.sh` 通过。链接器警告 compatibility packs 缺 x86_64 slice，但双架构构建成功。
-- `--visual-preview --visual-preview-quota-history --visual-preview-events`、`--visual-preview-dark --visual-preview-quota-history=25 --visual-preview-events` 和 `--visual-preview-narrow --visual-preview-quota-history=25 --visual-preview-events`：最后一轮均通过。NSEvent 分发覆盖双柱组点击、悬停到空白区恢复固定选择、方向键跨页、更早记录、按钮翻页、折叠、模型刷新及账号 UI 状态重置，也回归原有布局与关闭交互。
+- `--visual-preview --visual-preview-quota-history --visual-preview-events`、`--visual-preview-dark --visual-preview-quota-history=25 --visual-preview-events` 和 `--visual-preview-narrow --visual-preview-quota-history=25 --visual-preview-events`：最后一轮均通过。NSEvent 分发覆盖双柱组点击、悬停到空白区恢复固定选择、方向键跨页、更早记录、按钮翻页、折叠、模型刷新、账号 UI 状态重置，以及 Esc 关闭后重开保持历史选择和页码，也回归原有布局与关闭交互。
 - 固定假数据截图已检查浅色、深色、320pt 窄面板、空数据、套餐变更待确认和历史未保存；均为生成预览，并非真实账号。
 
 ## 限制与待父会话验收
