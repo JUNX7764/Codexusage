@@ -33,17 +33,23 @@ echo "== 编译内置 zstd 解码（vendor/zstddeclib.c，上游 v1.5.7，BSD-3-
 # 用户环境都完整计入压缩会话
 BUILD_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/codexusage-build.XXXXXXXX")"
 trap 'rm -rf "$BUILD_TEMP"' EXIT
-ZSTD_OBJ="$BUILD_TEMP/zstd_bridge.o"
-# cc 目标与 swiftc 保持一致（macos13.0），否则链接时版本不匹配告警
-/usr/bin/cc -O2 -target arm64-apple-macos13.0 -I "$DIR/vendor" -c "$DIR/vendor/zstd_bridge.c" -o "$ZSTD_OBJ"
+# universal 双架构：arm64 + x86_64 各编译一遍后 lipo 合并，Intel Mac 原生运行。
+# 源码无架构专属代码，双架构只增加编译遍数；update.sh 下载单一 zip，链路零改动
+for ARCH in arm64 x86_64; do
+    # cc 目标与 swiftc 保持一致（macos13.0），否则链接时版本不匹配告警
+    /usr/bin/cc -O2 -target ${ARCH}-apple-macos13.0 -I "$DIR/vendor" -c "$DIR/vendor/zstd_bridge.c" -o "$BUILD_TEMP/zstd_${ARCH}.o"
+done
 
-echo "== 编译 Swift 源码 =="
+echo "== 编译 Swift 源码（universal: arm64 + x86_64）=="
 # 必须显式指定部署目标：本机 CLT 默认 target 是 macosx28.0（比当前系统 macOS 27 新），
 # 缺省编译出的二进制 minos=28.0 会被 LaunchServices 拒绝（"不能与此版本 macOS 配合使用"）。
 cp "$DIR/CodexUsage.swift" "$BUILD_TEMP/main.swift"
-swiftc -O -target arm64-apple-macos13.0 -import-objc-header "$DIR/vendor/zstd_bridge.h" \
-    -o "$DIR/CodexUsage-bin" "$BUILD_TEMP/main.swift" "$DIR/Sources/OfficialUsage.swift" "$DIR/Sources/DailyUsageView.swift" "$DIR/Sources/UsageAttribution.swift" "$DIR/Sources/UsageComparison.swift" "$ZSTD_OBJ"
-rm -f "$ZSTD_OBJ"
+for ARCH in arm64 x86_64; do
+    swiftc -O -target ${ARCH}-apple-macos13.0 -import-objc-header "$DIR/vendor/zstd_bridge.h" \
+        -o "$BUILD_TEMP/CodexUsage-${ARCH}" "$BUILD_TEMP/main.swift" "$DIR/Sources/OfficialUsage.swift" "$DIR/Sources/DailyUsageView.swift" "$DIR/Sources/UsageAttribution.swift" "$DIR/Sources/UsageComparison.swift" "$BUILD_TEMP/zstd_${ARCH}.o"
+done
+lipo -create -output "$DIR/CodexUsage-bin" \
+    "$BUILD_TEMP/CodexUsage-arm64" "$BUILD_TEMP/CodexUsage-x86_64"
 
 echo "== 打包 .app =="
 rm -rf "$APP"
