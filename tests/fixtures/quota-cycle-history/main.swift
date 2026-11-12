@@ -37,6 +37,8 @@ case "earlyReset":
 case "transitions":
     reducer.ingest(sample(604700, 0), into: &state)
     reducer.ingest(sample(604810, 0, 1209600), into: &state)
+    check(state.closed.isEmpty, "natural requires another independent observation")
+    reducer.ingest(sample(604830, 0, 1209600), into: &state)
     check(state.closed.first?.end == .natural, "natural zero to zero")
     state = QuotaCycleState()
     reducer.ingest(sample(0, 70), into: &state)
@@ -47,6 +49,19 @@ case "transitions":
     check(state.current?.wasObservedFull == false, "rounded full is not full")
     reducer.ingest(sample(10, 20, 600000), into: &state)
     check(state.closed.isEmpty && state.pendingTransition != nil, "deadline rollback is uncertain")
+case "reviewBoundaries":
+    reducer.ingest(sample(604700, 0), into: &state)
+    reducer.ingest(sample(604810, 0), into: &state)
+    reducer.ingest(sample(604820, 0, 1209600), into: &state)
+    check(state.closed.isEmpty, "old expired reset must await confirmation")
+    reducer.ingest(sample(604840, 0, 1209600), into: &state)
+    check(state.closed.first?.end == .natural, "expired old reset must not block natural transition")
+    check(state.closed.first?.boundaryLower == sample(604810, 0).observedAt && state.closed.first?.boundaryUpper == sample(604820, 0).observedAt, "boundary interval")
+    state = QuotaCycleState()
+    reducer.ingest(sample(0, 72), into: &state)
+    reducer.ingest(sample(100, 2, 605800), into: &state)
+    reducer.ingest(sample(120, 1, 605800), into: &state)
+    check(state.closed.isEmpty, "declining new window is not stable")
 case "candidates":
     reducer.ingest(sample(0, 72), into: &state)
     reducer.ingest(sample(100, 2, 605800), into: &state)

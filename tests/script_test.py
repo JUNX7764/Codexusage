@@ -667,6 +667,14 @@ echo "build" >> "$MOCK_LOG"
         self.assertNotIn("appearance:", render_bar)
 
     def test_codesign_failure_blocks_build(self):
+        self._mock("lipo", r'''
+echo "lipo $*" >> "$MOCK_LOG"
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-output" ]; then shift; : > "$1"; exit 0; fi
+    shift
+done
+exit 2
+''')
         project = self.base / "build-project"
         (project / "scripts").mkdir(parents=True)
         shutil.copy2(BUILD, project / "build.sh")
@@ -682,6 +690,7 @@ echo "build" >> "$MOCK_LOG"
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("== 完成:", result.stdout)
+        self.assertTrue(any(line.startswith("lipo ") for line in self.log_lines()))
         self.assertTrue(any("--sign" in line for line in self.log_lines()))
 
 

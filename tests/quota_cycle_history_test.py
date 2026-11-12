@@ -42,3 +42,6 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_anomalies(self):
         self.run_case('anomalies')
+
+    def test_review_boundaries(self):
+        self.run_case('reviewBoundaries')
