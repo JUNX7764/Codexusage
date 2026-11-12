@@ -65,7 +65,8 @@ final class QuotaCycleStore {
         _ = try load(accountKey: accountKey)
         let fm = FileManager.default
         try fm.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.deletingLastPathComponent().path)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         try writer(encoder.encode(state), url)

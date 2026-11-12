@@ -173,5 +173,68 @@ case "store":
         check(unchanged == future, "future file remains")
         do { try store.save(state, accountKey: "../escape"); check(false, "reject path") } catch {}
     } catch { check(false, "store error: \(error)") }
+case "coordinator":
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let lock = NSLock()
+    var pending: [() -> Void] = []
+    var snapshots: [QuotaCycleSnapshot] = []
+    var writes = 0
+    let coordinator = QuotaCycleCoordinator(root: root, writer: { data, url in
+        writes += 1; try data.write(to: url, options: .atomic)
+    }, schedule: { action in lock.lock(); pending.append(action); lock.unlock() }, deliver: { snapshots.append($0) })
+    func drain() {
+        let signal = DispatchSemaphore(value: 0)
+        coordinator.drain { signal.signal() }
+        check(signal.wait(timeout: .now() + 5) == .success, "coordinator drain")
+    }
+    func deliver() {
+        lock.lock(); let jobs = pending; pending = []; lock.unlock()
+        for job in jobs { job() }
+    }
+    let a = "account:a|workspace", b = "account:b|workspace"
+    coordinator.activate(accountIdentity: a, generation: 1); drain()
+    coordinator.activate(accountIdentity: b, generation: 2); drain(); deliver()
+    check(snapshots.allSatisfy { $0.state.current == nil }, "old account load never delivered")
+    snapshots = []
+    coordinator.observe(sample(0, 20), identity: a, generation: 1)
+    coordinator.observe(sample(0, 30), identity: b, generation: 2); drain(); deliver()
+    check(snapshots.last?.state.current?.lastObservedUsedPercent == 30, "accepted current account")
+    let initialWrites = writes
+    for i in 1...20 { coordinator.observe(sample(Double(i * 10), 30), identity: b, generation: 2) }
+    drain(); deliver()
+    check(writes == initialWrites, "repeated polls do not write")
+    coordinator.observe(sample(310, 30), identity: b, generation: 2); drain(); deliver()
+    check(writes == initialWrites + 1, "heartbeat write (initial=\(initialWrites), writes=\(writes), saved=\(snapshots.last?.isSaved as Any))")
+    check(snapshots.last?.state.current?.evidence.count == 1, "duplicate evidence suppressed")
+    snapshots = []
+    coordinator.activate(accountIdentity: b, generation: 3); drain(); deliver()
+    check(!snapshots.contains(where: { $0.isLoading }) && snapshots.last?.state.current?.lastObservedUsedPercent == 30, "same identity generation preserves state")
+    coordinator.observe(sample(320, 40), identity: b, generation: 2); drain(); deliver()
+    check(snapshots.last?.state.current?.lastObservedUsedPercent == 30, "old generation refused")
+    let before = writes
+    coordinator.activate(accountIdentity: "token:unstable", generation: 4)
+    coordinator.observe(sample(400, 90), identity: "token:unstable", generation: 4); drain(); deliver()
+    check(writes == before, "unstable identity cannot write")
+case "browser":
+    for count in [0, 1, 5, 6, 7, 12, 13, 25] {
+        var records: [QuotaCycleRecord] = []
+        for i in 0..<count {
+            var s = QuotaCycleState(); reducer.ingest(sample(Double(i * 1000), 10), into: &s)
+            records.append(s.current!)
+        }
+        var browser = QuotaCycleBrowser(); browser.update(records)
+        check(browser.visible.count == min(6, count), "latest page")
+        if count > 6 {
+            browser.earlier()
+            check(browser.visible.last?.id == records[count - 7].id, "earlier page anchor")
+            let fixed = browser.visible.map(\.id)
+            var s = QuotaCycleState(); reducer.ingest(sample(30000, 50), into: &s)
+            browser.update(records + [s.current!])
+            check(browser.visible.map(\.id) == fixed, "historical page stable after refresh")
+            browser.newer()
+            check(browser.visible.last?.id == s.current!.id, "newer reaches latest")
+        }
+    }
 default: exit(2)
 }

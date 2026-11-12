@@ -10,7 +10,7 @@ class QuotaCycleHistoryTest(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
         cls.runner = pathlib.Path(cls.temp.name) / 'runner'
-        subprocess.run(['swiftc', str(ROOT / 'Sources/QuotaCycleHistory.swift'), str(ROOT / 'Sources/QuotaCycleStore.swift'), str(ROOT / 'tests/fixtures/quota-cycle-history/main.swift'), '-o', str(cls.runner)], check=True, cwd=ROOT)
+        subprocess.run(['swiftc', str(ROOT / 'Sources/QuotaCycleHistory.swift'), str(ROOT / 'Sources/QuotaCycleStore.swift'), str(ROOT / 'Sources/QuotaCycleCoordinator.swift'), str(ROOT / 'tests/fixtures/quota-cycle-history/main.swift'), '-o', str(cls.runner)], check=True, cwd=ROOT)
 
     @classmethod
     def tearDownClass(cls):
@@ -48,3 +48,9 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_store(self):
         self.run_case('store')
+
+    def test_coordinator(self):
+        self.run_case('coordinator')
+
+    def test_browser(self):
+        self.run_case('browser')

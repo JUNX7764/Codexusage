@@ -177,3 +177,39 @@ struct QuotaCycleReducer {
         state.previous = sample
     }
 }
+
+// UI state stays outside the persisted history and is keyed by stable cycle IDs.
+struct QuotaCycleBrowser {
+    private(set) var records: [QuotaCycleRecord] = []
+    private(set) var visibleLimit = 12
+    private(set) var olderPage = 0
+    private(set) var selectedCycleID: UUID?
+    private var pageAnchor: UUID?
+    var visible: [QuotaCycleRecord] {
+        guard !records.isEmpty else { return [] }
+        let upper: Int
+        if let anchor = pageAnchor, let index = records.firstIndex(where: { $0.id == anchor }) { upper = index + 1 }
+        else { upper = max(0, records.count - olderPage * 6) }
+        let lowerLimit = max(0, records.count - visibleLimit)
+        return Array(records[max(lowerLimit, upper - 6)..<max(lowerLimit, upper)])
+    }
+    mutating func update(_ newRecords: [QuotaCycleRecord]) {
+        if pageAnchor != nil && newRecords.count > records.count { visibleLimit += newRecords.count - records.count }
+        records = newRecords
+        if let id = selectedCycleID, !records.contains(where: { $0.id == id }) { selectedCycleID = nil }
+        if selectedCycleID == nil { selectedCycleID = records.last?.id }
+        if let id = pageAnchor, !records.contains(where: { $0.id == id }) { pageAnchor = nil; olderPage = 0 }
+    }
+    mutating func select(_ id: UUID) { if records.contains(where: { $0.id == id }) { selectedCycleID = id } }
+    mutating func earlier() {
+        guard let first = visible.first, let index = records.firstIndex(where: { $0.id == first.id }), index > max(0, records.count - visibleLimit) else { return }
+        pageAnchor = records[index - 1].id; olderPage += 1
+    }
+    mutating func newer() {
+        guard olderPage > 0, let last = visible.last, let index = records.firstIndex(where: { $0.id == last.id }) else { return }
+        let next = min(records.count - 1, index + 6)
+        olderPage -= 1
+        pageAnchor = olderPage == 0 ? nil : records[next].id
+    }
+    mutating func loadEarlier() { visibleLimit = min(records.count, visibleLimit + 12) }
+}
