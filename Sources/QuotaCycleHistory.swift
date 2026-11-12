@@ -45,29 +45,89 @@ struct QuotaCyclePolicy {
     var maximumContinuousGap: TimeInterval = 15 * 60
     var heartbeatInterval: TimeInterval = 5 * 60
 }
+enum QuotaPendingReason: String, Codable { case early, anomaly, planChange }
+struct QuotaPendingTransition: Codable, Equatable {
+    let baselineCycleID: UUID
+    let first: QuotaObservation
+    let reason: QuotaPendingReason
+}
 struct QuotaCycleState: Codable, Equatable {
     var schemaVersion = 1
     var closed: [QuotaCycleRecord] = []
     var current: QuotaCycleRecord?
     var previous: QuotaObservation?
     var lastRequestStartedAt: Date?
+    var pendingTransition: QuotaPendingTransition?
 }
 struct QuotaCycleReducer {
     let policy: QuotaCyclePolicy
+    private func makeCycle(_ sample: QuotaObservation, kind: QuotaCycleStart) -> QuotaCycleRecord {
+        QuotaCycleRecord(id: UUID(), startKind: kind,
+            inferredStartAt: kind == .inferred ? sample.resetAt.addingTimeInterval(-604800) : nil,
+            firstObservedAt: sample.observedAt, expectedResetAt: sample.resetAt,
+            lastObservedAt: sample.observedAt, lastObservedUsedPercent: sample.usedPercent,
+            boundaryLower: nil, boundaryUpper: nil, end: nil, incomplete: kind == .inferred || kind == .afterGap,
+            evidence: [sample])
+    }
+    private func close(_ state: inout QuotaCycleState, first: QuotaObservation, reason: QuotaCycleEnd, kind: QuotaCycleStart) {
+        guard var old = state.current else { return }
+        old.end = reason
+        old.boundaryLower = old.lastObservedAt
+        old.boundaryUpper = first.observedAt
+        state.closed.append(old)
+        state.current = makeCycle(first, kind: kind)
+        state.pendingTransition = nil
+    }
     func ingest(_ sample: QuotaObservation, into state: inout QuotaCycleState) {
-        guard sample.isValid, state.lastRequestStartedAt.map({ sample.requestStartedAt > $0 }) ?? true else { return }
+        guard sample.isValid, state.lastRequestStartedAt.map({ sample.requestStartedAt > $0 }) ?? true,
+              state.previous.map({ sample.observedAt >= $0.observedAt }) ?? true else { return }
         state.lastRequestStartedAt = sample.requestStartedAt
-        guard var current = state.current else {
-            state.current = QuotaCycleRecord(id: UUID(), startKind: .inferred, inferredStartAt: sample.resetAt.addingTimeInterval(-604800), firstObservedAt: sample.observedAt, expectedResetAt: sample.resetAt, lastObservedAt: sample.observedAt, lastObservedUsedPercent: sample.usedPercent, boundaryLower: nil, boundaryUpper: nil, end: nil, incomplete: true, evidence: [sample])
+        guard var current = state.current, let previous = state.previous else {
+            state.current = makeCycle(sample, kind: .inferred)
             state.previous = sample
             return
         }
-        if abs(sample.resetAt.timeIntervalSince(current.expectedResetAt)) <= policy.resetJitter && sample.usedPercent >= current.lastObservedUsedPercent {
+        let changed = abs(sample.resetAt.timeIntervalSince(current.expectedResetAt)) > policy.resetJitter
+        let samePlan = current.evidence.last?.planType == sample.planType
+        if changed && samePlan && sample.observedAt.timeIntervalSince(current.lastObservedAt) > policy.maximumContinuousGap {
+            close(&state, first: sample, reason: .gap, kind: .afterGap)
+            state.previous = sample
+            return
+        }
+        if changed && !samePlan {
+            state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .planChange)
+            state.previous = sample
+            return
+        }
+        if let pending = state.pendingTransition, pending.reason == .early {
+            let delay = sample.observedAt.timeIntervalSince(pending.first.observedAt)
+            let stable = abs(sample.resetAt.timeIntervalSince(pending.first.resetAt)) <= policy.resetJitter
+            if stable && delay >= policy.confirmationMinDelay && delay <= policy.confirmationMaxDelay && sample.usedPercent < current.lastObservedUsedPercent && samePlan {
+                close(&state, first: pending.first, reason: .earlyUnknown, kind: .observedTransition)
+                current = state.current!
+                current.lastObservedAt = sample.observedAt
+                current.lastObservedUsedPercent = sample.usedPercent
+                current.evidence.append(sample)
+                state.current = current
+                state.previous = sample
+                return
+            }
+            if delay > policy.confirmationMaxDelay || !stable { state.pendingTransition = nil }
+            else { state.previous = sample; return }
+        }
+        if changed && sample.resetAt > current.expectedResetAt && previous.observedAt <= current.expectedResetAt && sample.observedAt >= current.expectedResetAt && samePlan {
+            close(&state, first: sample, reason: .natural, kind: .observedTransition)
+        } else if changed && sample.resetAt > current.expectedResetAt && sample.observedAt < current.expectedResetAt && current.lastObservedUsedPercent - sample.usedPercent >= policy.meaningfulDrop && samePlan {
+            state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .early)
+        } else if changed || sample.usedPercent < current.lastObservedUsedPercent {
+            state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .anomaly)
+        } else {
+            state.pendingTransition = nil
             current.lastObservedAt = sample.observedAt
             current.lastObservedUsedPercent = sample.usedPercent
             current.evidence.append(sample)
             state.current = current
-            state.previous = sample
         }
+        state.previous = sample
     }
 }

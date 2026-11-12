@@ -24,3 +24,12 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_same_window(self):
         self.run_case('sameWindow')
+
+    def test_early_reset(self):
+        self.run_case('earlyReset')
+
+    def test_transitions(self):
+        self.run_case('transitions')
+
+    def test_candidates(self):
+        self.run_case('candidates')
