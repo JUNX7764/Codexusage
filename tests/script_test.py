@@ -159,7 +159,9 @@ if [ "${MOCK_OTHER_COPY:-0}" = 1 ]; then echo "99998 /other/${MOCK_APP_NAME}/Con
 ''')
         self._mock("pgrep", '[ -e "$MOCK_STATE" ]\n')
         self._mock("pkill", 'echo "pkill $*" >> "$MOCK_LOG"\nrm -f "$MOCK_STATE"\n')
-        self._mock("sleep", "exit 0\n")
+        # Keep tests fast, but give a background self-test process time to be scheduled;
+        # a zero-delay 120-iteration poll can otherwise report a spurious timeout.
+        self._mock("sleep", "exec /bin/sleep 0.01\n")
         self._mock("cp", r'''
 echo "cp $*" >> "$MOCK_LOG"
 if [ "${MOCK_CP_FAIL:-0}" = 1 ]; then
