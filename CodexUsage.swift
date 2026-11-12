@@ -5480,6 +5480,28 @@ enum CodexOfflineRegression {
             let waiting = fixtureSnapshot.state.current!
             let waitingDetail = QuotaCycleHistoryView.detail(waiting, pending: nil, now: waiting.expectedResetAt.addingTimeInterval(1))
             try expect(waitingDetail.0.contains("等待重置确认"), "expired reset was shown as active")
+            let redeemedFixture = fixtureSnapshot.state.closed.first { $0.end == .redeemed }!
+            let redeemedText = QuotaCycleHistoryView.detail(redeemedFixture, pending: nil, now: now)
+            let endLabel = QuotaCycleHistoryView.date(redeemedFixture.boundaryUpper!, format: "MM/dd")
+            try expect(redeemedText.0.contains(endLabel) && redeemedText.0.contains("主动用卡") && redeemedText.0.contains("–"),
+                       "historical cycle did not show start and ending boundary")
+            let currentText = QuotaCycleHistoryView.detail(waiting, pending: nil, now: waiting.firstObservedAt)
+            try expect(currentText.0.contains("至今") && currentText.0.contains(QuotaCycleHistoryView.date(waiting.expectedResetAt, format: "MM/dd")),
+                       "current cycle did not show start and expected end")
+            let fullDetail = QuotaCycleHistoryView.fullDescription(redeemedFixture, pending: nil, now: now)
+            let preciseFormat = "yyyy/MM/dd HH:mm"
+            try expect(fullDetail.contains(QuotaCycleHistoryView.date(redeemedFixture.boundaryLower!, format: preciseFormat)) &&
+                       fullDetail.contains(QuotaCycleHistoryView.date(redeemedFixture.boundaryUpper!, format: preciseFormat)),
+                       "cycle tooltip and accessibility omitted boundary interval")
+            try expect(QuotaCycleChart.isCurrent(waiting, snapshot: fixtureSnapshot) &&
+                       !QuotaCycleChart.isCurrent(redeemedFixture, snapshot: fixtureSnapshot),
+                       "current marker was tied to selection instead of current cycle")
+            var wideBoundary = redeemedFixture
+            wideBoundary.boundaryUpper = wideBoundary.boundaryLower!.addingTimeInterval(2 * 86400)
+            let wideText = QuotaCycleHistoryView.detail(wideBoundary, pending: nil, now: now)
+            try expect(wideText.0.contains(QuotaCycleHistoryView.date(wideBoundary.boundaryLower!, format: "MM/dd")) &&
+                       wideText.0.contains(QuotaCycleHistoryView.date(wideBoundary.boundaryUpper!, format: "MM/dd")) &&
+                       wideText.0.contains("间"), "multi-day boundary falsely collapsed to a point")
             let planChange = fixtureSnapshot.state.closed.first { $0.end == .unconfirmed }!
             let planDetail = QuotaCycleHistoryView.detail(planChange, pending: nil)
             try expect(planDetail.0.contains("套餐/额度变更") && !planDetail.1.contains("到期未用"), "plan change mislabeled as waste")
