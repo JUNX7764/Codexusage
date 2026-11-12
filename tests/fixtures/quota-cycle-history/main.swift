@@ -244,6 +244,16 @@ case "browser":
         }
         var browser = QuotaCycleBrowser(); browser.update(records)
         check(browser.visible.count == min(6, count), "latest page")
+        if count == 25 {
+            check(browser.visible.map(\.id) == Array(records[19..<25]).map(\.id), "25 newest")
+            browser.earlier()
+            check(browser.visible.map(\.id) == Array(records[13..<19]).map(\.id), "25 prior")
+            browser.earlier()
+            check(browser.visible.map(\.id) == Array(records[13..<19]).map(\.id), "default 12 limit")
+            browser.loadEarlier(); browser.earlier()
+            check(browser.visible.map(\.id) == Array(records[7..<13]).map(\.id), "older records expand")
+            browser.newer(); browser.newer()
+        }
         if count > 6 {
             browser.earlier()
             check(browser.visible.last?.id == records[count - 7].id, "earlier page anchor")
