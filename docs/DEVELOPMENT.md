@@ -20,7 +20,7 @@
 
 ## 构建
 
-需要 macOS 13 或更新版本、Apple Silicon 和 Xcode Command Line Tools。
+需要 macOS 13 或更新版本和 Xcode Command Line Tools。`build.sh` 产出 arm64 + x86_64 的 universal 双架构（在 Apple Silicon 上交叉编译 x86_64，无需 Intel 机器）；x86_64 切片可用 Rosetta 跑 `--self-test` 验证。
 
 ```bash
 ./build.sh

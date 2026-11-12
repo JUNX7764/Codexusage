@@ -4,7 +4,7 @@
 
 无需反复打开网页：查看剩余额度和重置时间，管理重置卡，也能回顾近期 Token 趋势与工具分布。
 
-**[下载 CodexUsage](https://github.com/JUNX7764/Codexusage/releases/latest)** 
+**[下载 CodexUsage](https://github.com/JUNX7764/Codexusage/releases/latest)** · macOS 13 或更高版本 · Apple Silicon 或 Intel 芯片
 
 <img src="docs/images/codex-usage.png" alt="CodexUsage 当前面板：额度、重置卡、重置动态、周期用量和官方用量简析" width="330"> <img src="docs/images/codex-usage-tools.png" alt="CodexUsage 工具明细：各客户端 Token 用量与占比" width="330">
 

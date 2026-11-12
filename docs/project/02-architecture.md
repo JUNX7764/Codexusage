@@ -1,11 +1,11 @@
 # CodexUsage 当前架构概览
 
-> 状态：当前架构摘要。最后核对：2026-11-10。
+> 状态：当前架构摘要。最后核对：2026-11-12。
 > 本文解释模块和边界，不复制函数级规格；具体行为以源码和测试为准。
 
 ## 1. 应用形态
 
-CodexUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 Swift Package 和第三方包管理依赖。主入口和现有功能位于 `CodexUsage.swift`，新统计模块位于 `Sources/`，zstd 解码通过 `vendor/` 下的 C 源码和桥接层编译进主二进制。
+CodexUsage 是 macOS 13+、universal 双架构（Apple Silicon + Intel）的原生 AppKit 菜单栏应用，无 Swift Package 和第三方包管理依赖。主入口和现有功能位于 `CodexUsage.swift`，新统计模块位于 `Sources/`，zstd 解码通过 `vendor/` 下的 C 源码和桥接层编译进主二进制。
 
 应用身份保持为：
 
