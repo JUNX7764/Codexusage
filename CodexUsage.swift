@@ -2703,8 +2703,10 @@ final class ResetCardSectionView: PanelCardView {
         for rowModel in model.rows {
             let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
             let color: NSColor = rowModel.warning ? PanelAccent.codex.color : .labelColor
-            // 即将到期只用语义色区分，不加 ⚠ 前缀：长卡名（如"完全重置（每周 + 5 小时）"）会因此换行
-            let name = PanelUI.label(rowModel.name, size: 12, color: color)
+            // 即将到期只用语义色区分，不加 ⚠ 前缀：长卡名（如"完全重置（每周 + 5 小时）"）会因此换行。
+            // 卡名单行+尾部截断：这行余量仅 ~17pt，老版本 macOS 字体度量偏宽会把卡名挤到换行
+            // （2026-11-12 Intel 用户实测），截断兜底保证任何系统上布局不破
+            let name = PanelUI.label(rowModel.name, size: 12, color: color, wrapping: false)
             row.addArrangedSubview(name)
             row.addArrangedSubview(PanelUI.spacer())
             // 日期用次要色，"过期"标签单独用橙色加粗，主次分明
