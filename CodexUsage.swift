@@ -3469,7 +3469,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         refreshPanelLayout()
     }
 
-    /// 六个业务模块均使用原生卡片，展开／折叠只改变卡片内容，不改变模块顺序。
+    /// 七个业务模块均使用原生卡片，展开／折叠只改变卡片内容，不改变模块顺序。
     func verifyCardLayoutForPreview() -> Bool {
         stack.layoutSubtreeIfNeeded()
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
