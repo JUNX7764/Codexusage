@@ -80,6 +80,11 @@ struct QuotaCycleReducer {
         state.current = makeCycle(first, kind: kind)
         state.pendingTransition = nil
     }
+    private func appendAnomaly(_ sample: QuotaObservation, into state: inout QuotaCycleState) {
+        if let last = state.anomalies.last, last.usedPercent == sample.usedPercent &&
+            last.planType == sample.planType && abs(last.resetAt.timeIntervalSince(sample.resetAt)) <= policy.resetJitter { return }
+        state.anomalies.append(sample)
+    }
     func record(_ event: QuotaRedemptionEvidence, into state: inout QuotaCycleState) {
         guard !event.operationHash.isEmpty, event.responseAt.timeIntervalSince1970.isFinite,
               event.originalRequestedAt.map({ $0.timeIntervalSince1970.isFinite && $0 <= event.responseAt }) ?? true else { return }
@@ -121,7 +126,7 @@ struct QuotaCycleReducer {
             return
         }
         if changed && !samePlan {
-            state.anomalies.append(sample)
+            appendAnomaly(sample, into: &state)
             state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .planChange)
             state.previous = sample
             return
@@ -134,13 +139,15 @@ struct QuotaCycleReducer {
                 current = state.current!
                 current.lastObservedAt = sample.observedAt
                 current.lastObservedUsedPercent = sample.usedPercent
-                current.evidence.append(sample)
+                if sample.usedPercent != pending.first.usedPercent || sample.planType != pending.first.planType {
+                    current.evidence.append(sample)
+                }
                 state.current = current
                 state.previous = sample
                 return
             }
             if stable && sample.usedPercent < pending.first.usedPercent {
-                state.anomalies.append(sample)
+                appendAnomaly(sample, into: &state)
                 state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: pending.reason)
                 state.previous = sample
                 return
@@ -151,10 +158,10 @@ struct QuotaCycleReducer {
         if changed && sample.resetAt > current.expectedResetAt && sample.observedAt >= current.expectedResetAt && samePlan {
             state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .natural)
         } else if changed && sample.resetAt > current.expectedResetAt && sample.observedAt < current.expectedResetAt && current.lastObservedUsedPercent - sample.usedPercent >= policy.meaningfulDrop && samePlan {
-            state.anomalies.append(sample)
+            appendAnomaly(sample, into: &state)
             state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .early)
         } else if changed || sample.usedPercent < current.lastObservedUsedPercent {
-            state.anomalies.append(sample)
+            appendAnomaly(sample, into: &state)
             state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .anomaly)
         } else {
             state.pendingTransition = nil

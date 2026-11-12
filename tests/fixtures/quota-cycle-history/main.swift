@@ -118,5 +118,60 @@ case "anomalies":
     reducer.ingest(sample(0, 70), into: &state)
     reducer.ingest(sample(10, 2, 604900), into: &state)
     check(state.closed.isEmpty && state.pendingTransition?.reason == .anomaly, "jitter and drop alone uncertain")
+case "store":
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let key = String(repeating: "a", count: 64)
+    let store = QuotaCycleStore(root: root) { data, url in try data.write(to: url, options: .atomic) }
+    reducer.ingest(sample(0, 43), into: &state)
+    do {
+        try store.save(state, accountKey: key)
+        let loaded = try store.load(accountKey: key)
+        check(loaded == state, "roundtrip")
+        let other = try store.load(accountKey: String(repeating: "b", count: 64))
+        check(other.current == nil, "partition")
+        let path = root.appendingPathComponent(key).appendingPathComponent("history-v1.json")
+        let bytes = try Data(contentsOf: path)
+        let mode = (try FileManager.default.attributesOfItem(atPath: path.path)[.posixPermissions] as! NSNumber).intValue
+        let dirMode = (try FileManager.default.attributesOfItem(atPath: path.deletingLastPathComponent().path)[.posixPermissions] as! NSNumber).intValue
+        check(mode & 0o777 == 0o600 && dirMode & 0o777 == 0o700, "permissions")
+        let failing = QuotaCycleStore(root: root) { _, _ in throw NSError(domain: "injected", code: 1) }
+        do { try failing.save(state, accountKey: key); check(false, "writer must fail") } catch {}
+        let afterFailure = try Data(contentsOf: path)
+        check(afterFailure == bytes, "writer failure preserves file")
+        var duplicate = state
+        duplicate.closed = [state.current!, state.current!]
+        duplicate.closed[0].end = .natural; duplicate.closed[1].end = .natural
+        do { try store.save(duplicate, accountKey: key); check(false, "duplicate IDs") } catch {}
+        var invalid = state
+        invalid.current?.lastObservedUsedPercent = 101
+        do { try store.save(invalid, accountKey: key); check(false, "invalid percent") } catch {}
+        var json = try JSONSerialization.jsonObject(with: bytes) as! [String: Any]
+        var corrupt = json
+        var badCurrent = corrupt["current"] as! [String: Any]
+        badCurrent["lastObservedUsedPercent"] = 101
+        corrupt["current"] = badCurrent
+        let invalidBytes = try JSONSerialization.data(withJSONObject: corrupt)
+        try invalidBytes.write(to: path)
+        do { _ = try store.load(accountKey: key); check(false, "invalid decoded number") } catch {}
+        do { try store.save(state, accountKey: key); check(false, "invalid file must not be overwritten") } catch {}
+        let protected = try Data(contentsOf: path)
+        check(protected == invalidBytes, "corrupt file preserved")
+        corrupt = json
+        var closed = corrupt["current"] as! [String: Any]
+        closed["end"] = "natural"
+        corrupt["closed"] = [closed]
+        try JSONSerialization.data(withJSONObject: corrupt).write(to: path)
+        do { _ = try store.load(accountKey: key); check(false, "duplicate decoded IDs") } catch {}
+        try bytes.write(to: path)
+        json["schemaVersion"] = 2
+        let future = try JSONSerialization.data(withJSONObject: json)
+        try future.write(to: path)
+        do { _ = try store.load(accountKey: key); check(false, "future schema") } catch {}
+        do { try store.save(state, accountKey: key); check(false, "do not overwrite future file") } catch {}
+        let unchanged = try Data(contentsOf: path)
+        check(unchanged == future, "future file remains")
+        do { try store.save(state, accountKey: "../escape"); check(false, "reject path") } catch {}
+    } catch { check(false, "store error: \(error)") }
 default: exit(2)
 }
