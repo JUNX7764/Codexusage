@@ -33,3 +33,12 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_candidates(self):
         self.run_case('candidates')
+
+    def test_redemption(self):
+        self.run_case('redemption')
+
+    def test_redemption_safety(self):
+        self.run_case('redemptionSafety')
+
+    def test_anomalies(self):
+        self.run_case('anomalies')

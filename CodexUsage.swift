@@ -691,7 +691,8 @@ enum Fetcher {
     }
 
     enum ResetUseResult: Equatable {
-        case success, nothingToReset, noCredit, unknown
+        case success, alreadyRedeemed, nothingToReset, noCredit, unknown
+        var acknowledgesRedemption: Bool { self == .success || self == .alreadyRedeemed }
     }
 
     static func resetUseRequest(auth: CodexAuth.Snapshot, cardID: String, key: String) -> URLRequest? {
@@ -714,7 +715,8 @@ enum Fetcher {
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let code = obj["code"] as? String else { return .unknown }
         switch code {
-        case "reset", "already_redeemed": return .success
+        case "reset": return .success
+        case "already_redeemed": return .alreadyRedeemed
         case "nothing_to_reset": return .nothingToReset
         case "no_credit": return .noCredit
         default: return .unknown
@@ -4887,7 +4889,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if result != .unknown { defaults.removeObject(forKey: self.pendingResetKey); defaults.synchronize() }
                 let message: String
                 switch result {
-                case .success: message = "重置卡已使用，正在刷新额度"
+                case .success, .alreadyRedeemed: message = "重置卡已使用，正在刷新额度"
                 case .nothingToReset: message = "当前没有可重置的额度窗口"
                 case .noCredit: message = "该重置卡已不可用，请核对卡数"
                 case .unknown: message = "使用结果未知，请核对上次使用；不要重复发起新请求"
@@ -4901,7 +4903,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.updateUI()
                 self.refresh(tokens: true, manual: true)
-                if result == .success {
+                if result.acknowledgesRedemption {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                         self?.refresh(tokens: true, manual: true)
                     }
@@ -5436,7 +5438,7 @@ enum CodexOfflineRegression {
                        && request.value(forHTTPHeaderField: "ChatGPT-Account-ID") == "fixture-account", "reset request contract changed")
             func resetResponse(_ code: String) -> Data { Data("{\"code\":\"\(code)\"}".utf8) }
             try expect(Fetcher.parseResetUseResponse(status: 200, data: resetResponse("reset")) == .success
-                       && Fetcher.parseResetUseResponse(status: 200, data: resetResponse("already_redeemed")) == .success
+                       && Fetcher.parseResetUseResponse(status: 200, data: resetResponse("already_redeemed")) == .alreadyRedeemed
                        && Fetcher.parseResetUseResponse(status: 200, data: resetResponse("nothing_to_reset")) == .nothingToReset
                        && Fetcher.parseResetUseResponse(status: 200, data: resetResponse("no_credit")) == .noCredit
                        && Fetcher.parseResetUseResponse(status: 500, data: resetResponse("reset")) == .unknown

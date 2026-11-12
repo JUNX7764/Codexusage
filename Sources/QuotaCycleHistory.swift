@@ -58,6 +58,7 @@ struct QuotaCycleState: Codable, Equatable {
     var previous: QuotaObservation?
     var lastRequestStartedAt: Date?
     var pendingTransition: QuotaPendingTransition?
+    var redemptions: [QuotaRedemptionEvidence] = []
 }
 struct QuotaCycleReducer {
     let policy: QuotaCyclePolicy
@@ -78,6 +79,20 @@ struct QuotaCycleReducer {
         state.current = makeCycle(first, kind: kind)
         state.pendingTransition = nil
     }
+    func record(_ event: QuotaRedemptionEvidence, into state: inout QuotaCycleState) {
+        guard !event.operationHash.isEmpty, event.responseAt.timeIntervalSince1970.isFinite,
+              event.originalRequestedAt.map({ $0.timeIntervalSince1970.isFinite && $0 <= event.responseAt }) ?? true else { return }
+        if let index = state.redemptions.firstIndex(where: { $0.operationHash == event.operationHash }) {
+            let old = state.redemptions[index]
+            // An idempotency response cannot replace a previously observed fresh reset.
+            if old.status == .reset { return }
+            guard event.responseAt >= old.responseAt else { return }
+            state.redemptions[index] = QuotaRedemptionEvidence(operationHash: event.operationHash,
+                originalRequestedAt: old.originalRequestedAt ?? event.originalRequestedAt,
+                responseAt: event.responseAt, status: event.status,
+                baselineCycleID: old.baselineCycleID ?? event.baselineCycleID)
+        } else { state.redemptions.append(event) }
+    }
     func ingest(_ sample: QuotaObservation, into state: inout QuotaCycleState) {
         guard sample.isValid, state.lastRequestStartedAt.map({ sample.requestStartedAt > $0 }) ?? true,
               state.previous.map({ sample.observedAt >= $0.observedAt }) ?? true else { return }
@@ -89,6 +104,16 @@ struct QuotaCycleReducer {
         }
         let changed = abs(sample.resetAt.timeIntervalSince(current.expectedResetAt)) > policy.resetJitter
         let samePlan = current.evidence.last?.planType == sample.planType
+        if samePlan, let redemption = state.redemptions.last(where: {
+            $0.status == .reset && $0.baselineCycleID == current.id &&
+            $0.originalRequestedAt != nil && sample.requestStartedAt >= $0.responseAt
+        }), redemption.originalRequestedAt! >= current.firstObservedAt,
+           (changed || current.lastObservedUsedPercent - sample.usedPercent >= policy.meaningfulDrop),
+           sample.observedAt.timeIntervalSince(current.lastObservedAt) <= policy.maximumContinuousGap {
+            close(&state, first: sample, reason: .redeemed, kind: .redeemed)
+            state.previous = sample
+            return
+        }
         if changed && samePlan && sample.observedAt.timeIntervalSince(current.lastObservedAt) > policy.maximumContinuousGap {
             close(&state, first: sample, reason: .gap, kind: .afterGap)
             state.previous = sample
