@@ -59,6 +59,7 @@ struct QuotaCycleState: Codable, Equatable {
     var lastRequestStartedAt: Date?
     var pendingTransition: QuotaPendingTransition?
     var redemptions: [QuotaRedemptionEvidence] = []
+    var anomalies: [QuotaObservation] = []
 }
 struct QuotaCycleReducer {
     let policy: QuotaCyclePolicy
@@ -120,6 +121,7 @@ struct QuotaCycleReducer {
             return
         }
         if changed && !samePlan {
+            state.anomalies.append(sample)
             state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .planChange)
             state.previous = sample
             return
@@ -143,8 +145,10 @@ struct QuotaCycleReducer {
         if changed && sample.resetAt > current.expectedResetAt && previous.observedAt <= current.expectedResetAt && sample.observedAt >= current.expectedResetAt && samePlan {
             close(&state, first: sample, reason: .natural, kind: .observedTransition)
         } else if changed && sample.resetAt > current.expectedResetAt && sample.observedAt < current.expectedResetAt && current.lastObservedUsedPercent - sample.usedPercent >= policy.meaningfulDrop && samePlan {
+            state.anomalies.append(sample)
             state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .early)
         } else if changed || sample.usedPercent < current.lastObservedUsedPercent {
+            state.anomalies.append(sample)
             state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .anomaly)
         } else {
             state.pendingTransition = nil

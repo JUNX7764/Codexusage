@@ -53,7 +53,7 @@ case "candidates":
     reducer.ingest(sample(100, 2, 605800), into: &state)
     check(state.closed.isEmpty, "replay cannot confirm")
     reducer.ingest(sample(120, 73), into: &state)
-    check(state.closed.isEmpty && state.current?.lastObservedUsedPercent == 73, "rollback")
+    check(state.closed.isEmpty && state.current?.lastObservedUsedPercent == 73 && state.anomalies.count == 1, "rollback retains anomaly")
     state = QuotaCycleState()
     reducer.ingest(sample(0, 72), into: &state)
     reducer.ingest(sample(100, 2, 605800), into: &state)
