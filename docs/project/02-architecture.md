@@ -23,8 +23,10 @@ CodexUsage 是 macOS 13+、universal 双架构（Apple Silicon + Intel）的原�
 | `ExternalTokenScanner` | 只读扫描 Proma、Claude Code 和 Hermes，并从去重后的缓存归属工具 |
 | `OfficialUsageReader` | 原生只读获取账号累计和日桶，并核对身份快照 |
 | `DailyUsageChart` / `UsageComparison` | 日图交互和受数据完整性约束的比较计算 |
+| `QuotaCycleReducer` / `QuotaCycleStore` / `QuotaCycleCoordinator` | 额度观测状态机、账户隔离存储与代际校验 |
+| `QuotaCycleHistoryView` / `QuotaCycleChart` | 周期双柱图与原生浏览交互；UI 状态由控制器持有 |
 | `UsageAttribution` | 处理重叠来源路径的唯一归属 |
-| `PanelCardView` / `PanelComparisonStack` 等卡片组件 | 六个统计板块的原生卡片容器、比较条与徽标 |
+| `PanelCardView` / `PanelComparisonStack` 等卡片组件 | 七个业务板块的原生卡片容器、比较条与徽标 |
 | `TiboDisplay` 与相关模型 | AIHOT 重置动态的解析、排序和展示 |
 | `UpdateChecker` | 检查 GitHub Release 及更新资产 |
 | `UpdateProgressController` | 启动后台更新并恢复、展示进度 |
@@ -39,6 +41,8 @@ CodexUsage 是 macOS 13+、universal 双架构（Apple Silicon + Intel）的原�
 ### 额度与重置卡
 
 `~/.codex/auth.json` → 内存中的认证快照 → OpenAI 请求 → 账户与请求代际校验 → UI 和诊断状态。
+
+本次有效 7d 响应另经代际校验进入周期协调器，不新增额度请求；历史按稳定账户哈希隔离，预览不创建真实仓库。
 
 凭据不得写入日志、状态文件、测试夹具或提交。401 续期是当前唯一允许的 `~/.codex/` 写回路径；重置卡使用属于账户状态变更，必须有明确确认和未知结果处理。
 

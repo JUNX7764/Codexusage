@@ -12,7 +12,7 @@
 | `docs/project/02-architecture.md` | 模块、数据流和信任边界 | 当前架构概览，细节以源码为准 |
 | `docs/project/07-standards.md` | 修改、测试、凭据和文档约定 | 当前维护约定 |
 | `docs/project/10-release.md` | 发布资产、门禁和回滚边界 | 当前发布清单 |
-| `docs/project/11-15`（PRD、核验、交接、评审） | 用量总览专项的设计与验收过程记录 | **历史记录**；11 号 PRD 的六卡片布局与验收口径仍是现行基准 |
+| `docs/project/11-15`（PRD、核验、交接、评审） | 用量总览专项的设计与验收过程记录 | **历史记录**；11 号 PRD 的基础卡片样式仍适用，周期扩展见 17 号文档 |
 | `PLAN.md` | 初始任务书及历次设计记录 | **历史资料，不代表当前行为** |
 | `VISUAL_OPTIMIZATION_PLAN.md`、`docs/features/` | 已完成专项的实施记录 | **历史资料，不代表当前行为** |
 
@@ -69,6 +69,9 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-popover-test=/tmp/codex-popover
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-empty --visual-preview-empty-failure --visual-preview-tools
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-models
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-quota-history
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-dark --visual-preview-quota-history=25
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-narrow --visual-preview-quota-history=25 --visual-preview-events
 ```
 
 面板截图与事件回归：
@@ -86,7 +89,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 | `CodexUsage.swift` | 入口、AppKit UI、原有数据层、更新控制和离线自检 |
 | `Sources/OfficialUsage.swift` | 账号用量只读请求、账号快照校验和严格解析 |
 | `Sources/DailyUsageView.swift` | 日期图表、悬停／键盘查看和工具占比条 |
-| `Sources/QuotaCycleHistory.swift` / `QuotaCycleStore.swift` / `QuotaCycleCoordinator.swift` | 额度轮次状态机、隔离存储与异步协调；卡片 UI 尚未接入 |
+| `Sources/QuotaCycleHistory.swift` / `QuotaCycleStore.swift` / `QuotaCycleCoordinator.swift` / `QuotaCycleHistoryView.swift` | 额度轮次状态机、隔离存储、异步协调与原生图表 |
 | `Sources/UsageAttribution.swift` / `UsageComparison.swift` | 来源归属及比较计算 |
 | `vendor/zstddeclib.c` | 上游 zstd v1.5.7 单文件解码源，许可见 `vendor/zstd-LICENSE` |
 | `vendor/zstd_bridge.c` / `.h` | zstd 解码的 C 桥接层 |
@@ -106,7 +109,7 @@ Codex 会话按 `token_count` 事件的本地日期统计，累计值按同一�
 
 构建时在专属临时目录生成合法 `main.swift` 并编译 `Sources/`；真实只读能力可通过 `--official-usage-check` 检查，该命令联网，只输出成功或失败类别及日／周比较是否可计算的布尔值，不输出日期、账号或个人用量。
 
-额度周期历史只消费现有 7d 请求中本次有效的数据，以稳定账户身份派生哈希分区；缺少稳定身份时不落盘。首次周期开始时间是推算，提前重置来源未确认，跨观测缺口不补造轮次。重置卡 `already_redeemed` 仅确认原请求，单独出现时即使携带原请求时间也不独立生成边界；已有同操作的 `reset` 证据不会被覆盖。该功能目前仅完成数据链路，尚无周期历史卡片。
+额度周期历史只消费现有 7d 请求中本次有效的数据，以稳定账户身份派生哈希分区；缺少稳定身份时不落盘。首次周期开始时间是推算，提前重置来源未确认，跨观测缺口不补造轮次。重置卡 `already_redeemed` 仅确认原请求，单独出现时即使携带原请求时间也不独立生成边界；已有同操作的 `reset` 证据不会被覆盖。面板内每屏显示 6 轮，初始浏览最近 12 轮，可继续加载更早轮次；预览不创建真实历史仓库。
 
 更新脚本接收已确认的 Release 标签和正在运行的应用路径，校验包身份、构建版本和实际安装版本后仅处理目标进程。离线脚本测试使用临时应用、伪造进程和网络命令，**不能替代真实安装环境中的更新、回滚和面板点击验收**。
 
