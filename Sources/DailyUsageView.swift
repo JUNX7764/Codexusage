@@ -1,6 +1,12 @@
 import AppKit
 
 private final class ChartHoverLabel: NSView {
+    /// 悬停数值：有 token 数的日桶走数值过渡，「暂无数据」等文本立即到位。
+    enum Value {
+        case amount(Double, suffix: String)
+        case text(String)
+    }
+
     private let horizontalInset: CGFloat = 8
     private let verticalInset: CGFloat = 6
     private let lineSpacing: CGFloat = 2
@@ -8,15 +14,87 @@ private final class ChartHoverLabel: NSView {
     private let valueFont = NSFont.systemFont(ofSize: 10, weight: .medium)
     private var date = ""
     private var value = ""
+    private var transition = TokenValueTransition()
+    private var suffix = ""
+    private var plainText: String?
+    private var timer: Timer?
     var stringValue: String { "\(date)\n\(value)" }
     override var isFlipped: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-    func setText(date: String, value: String) {
+    /// 气泡可见且前后都是数值时做 320ms 过渡（从当前显示值重定向）；首次显示/缺数/减少动态效果立即到位。
+    func setText(date: String, value: Value, animated: Bool) {
         self.date = date
-        self.value = value
+        stopTimer()
+        switch value {
+        case .text(let text):
+            plainText = text
+            transition.set(nil, at: ProcessInfo.processInfo.systemUptime, animated: false)
+            suffix = ""
+            render()
+        case .amount(let amount, let targetSuffix):
+            plainText = nil
+            let wasVisible = !isHidden && transition.display != nil
+            let allowed = animated && wasVisible && window != nil
+                && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            transition.set(amount, at: ProcessInfo.processInfo.systemUptime, animated: allowed)
+            suffix = targetSuffix
+            render()
+            if transition.isAnimating { startTimer() }
+        }
+    }
+
+    /// 隐藏气泡与视图离窗时立即定格到目标值，不留活跃 timer。
+    func finishImmediately() {
+        stopTimer()
+        if transition.isAnimating {
+            transition.set(transition.target, at: ProcessInfo.processInfo.systemUptime, animated: false)
+        }
+        render()
+    }
+
+    private func render() {
+        if let plain = plainText {
+            value = plain
+        } else if let display = transition.display {
+            // 过渡期间保留「Token」计量词，结尾定性后缀（未结束/无活动记录）在定格后出现，避免中途自相矛盾。
+            value = Fmt.tokensAbbr(display) + (transition.isAnimating ? " Token" : suffix)
+        } else {
+            value = ""
+        }
         needsDisplay = true
     }
+
+    /// 气泡尺寸按「起点与终值中较宽者」计算：动画期间只改文本不改 frame，
+    /// 从大值缩到小值+长后缀的中间帧也不会被截断（缩短方向的中值宽度介于两者之间）。
+    private var finalText: String {
+        if let plain = plainText { return plain }
+        guard let target = transition.target else { return "" }
+        return Fmt.tokensAbbr(target) + suffix
+    }
+
+    private func startTimer() {
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.transition.advance(at: ProcessInfo.processInfo.systemUptime)
+            self.render()
+            if !self.transition.isAnimating { self.stopTimer() }
+        }
+        timer = t
+        RunLoop.main.add(t, forMode: .common)
+    }
+
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { finishImmediately() }
+    }
+
+    deinit { stopTimer() }
 
     private func size(of text: String, font: NSFont) -> NSSize {
         (text as NSString).size(withAttributes: [.font: font])
@@ -24,9 +102,13 @@ private final class ChartHoverLabel: NSView {
 
     func fitToContent() {
         let dateSize = size(of: date, font: dateFont)
-        let valueSize = size(of: value, font: valueFont)
-        frame.size = NSSize(width: ceil(max(dateSize.width, valueSize.width)) + horizontalInset * 2,
-                            height: ceil(dateSize.height + valueSize.height + lineSpacing) + verticalInset * 2)
+        var valueWidth = size(of: finalText, font: valueFont).width
+        if transition.isAnimating, let start = transition.display {
+            valueWidth = max(valueWidth, size(of: Fmt.tokensAbbr(start) + " Token", font: valueFont).width)
+        }
+        let valueHeight = size(of: finalText.isEmpty ? " " : finalText, font: valueFont).height
+        frame.size = NSSize(width: ceil(max(dateSize.width, valueWidth)) + horizontalInset * 2,
+                            height: ceil(dateSize.height + valueHeight + lineSpacing) + verticalInset * 2)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -137,16 +219,31 @@ final class DailyUsageChart: NSView {
         else { super.keyDown(with: event) }
     }
     private func updateAccessibility() {
-        guard let index = selection else { hover.isHidden = true; return }
+        guard let index = selection else {
+            hover.isHidden = true
+            hover.finishImmediately()
+            return
+        }
         let day = days[index]
         let value: String
+        let hoverValue: ChartHoverLabel.Value
         switch day.1 {
-        case .reported(let amount): value = Fmt.tokensAbbr(amount) + " Token" + (day.0 == todayKey ? "（今日未结束）" : "")
-        case .scanned(let amount): value = Fmt.tokensAbbr(amount) + " Token（今日未结束）"
-        case .inferredZero: value = "0 Token（无活动记录）"
-        case .missing: value = "暂无数据"
+        case .reported(let amount):
+            let suffix = day.0 == todayKey ? " Token（今日未结束）" : " Token"
+            value = Fmt.tokensAbbr(amount) + suffix
+            hoverValue = .amount(amount, suffix: suffix)
+        case .scanned(let amount):
+            value = Fmt.tokensAbbr(amount) + " Token（今日未结束）"
+            hoverValue = .amount(amount, suffix: " Token（今日未结束）")
+        case .inferredZero:
+            value = "0 Token（无活动记录）"
+            hoverValue = .amount(0, suffix: " Token（无活动记录）")
+        case .missing:
+            value = "暂无数据"
+            hoverValue = .text("暂无数据")
         }
-        hover.setText(date: day.0, value: value)
+        // 辅功能值始终是目标准确值；气泡文字按显示规则做 320ms 过渡。
+        hover.setText(date: day.0, value: hoverValue, animated: true)
         hover.fitToContent()
         hover.frame.size.width = min(hover.frame.width, bounds.width)
         // Keep the overlay on the opposite side where possible; it does not affect layout or hit testing.
@@ -189,7 +286,8 @@ final class DailyUsageChart: NSView {
             if let value = dayValue {
                 let minimum: CGFloat = open ? (value == 0 ? 2 : 3) : (value == 0 ? 1 : 2)
                 let height = max(minimum, CGFloat(value / maxValue) * 46)
-                let bar = NSBezierPath(roundedRect: NSRect(x: x + barInset, y: 46 - height, width: barWidth, height: height), xRadius: 1, yRadius: 1)
+                // 仅顶部 1.5pt 微圆角、底部齐平（基线）；今日空心描边柱同一路径。
+                let bar = PanelVisuals.dailyBarPath(in: NSRect(x: x + barInset, y: 46 - height, width: barWidth, height: height))
                 if open {
                     orange.setStroke(); bar.lineWidth = 1; bar.stroke()
                 } else {

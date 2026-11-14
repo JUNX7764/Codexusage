@@ -32,8 +32,9 @@ final class QuotaCycleHistoryView: NSView {
         earlier.action = #selector(showEarlier); newer.action = #selector(showNewer); more.action = #selector(showMore)
         earlier.setAccessibilityLabel("更早的额度周期"); newer.setAccessibilityLabel("更新的额度周期")
         more.setAccessibilityLabel("加载更早的额度周期")
-        let legendText = NSMutableAttributedString(string: "■ 上限   ", attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor])
-        legendText.append(NSAttributedString(string: "■ 已用   ● 当前", attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: PanelAccent.codex.color]))
+        let legendText = NSMutableAttributedString(string: "■ 已用   ", attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: PanelAccent.codex.color])
+        legendText.append(NSAttributedString(string: "■ 距上限   ", attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor]))
+        legendText.append(NSAttributedString(string: "● 当前", attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: PanelAccent.codex.color]))
         legend.attributedStringValue = legendText
         for field in [detail1] {
             field.font = .systemFont(ofSize: 10); field.lineBreakMode = .byTruncatingTail
@@ -164,7 +165,7 @@ final class QuotaCycleChart: NSView {
     init(state: QuotaCycleUIState, snapshot: QuotaCycleSnapshot, now: Date) {
         self.state = state; self.snapshot = snapshot; self.now = now; super.init(frame: .zero)
         setAccessibilityElement(true); setAccessibilityRole(.group)
-        setAccessibilityLabel("额度周期双柱图，使用左右方向键选择周期")
+        setAccessibilityLabel("额度周期图，使用左右方向键选择周期")
     }
     required init?(coder: NSCoder) { fatalError() }
     override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); window?.acceptsMouseMovedEvents = true }
@@ -227,12 +228,19 @@ final class QuotaCycleChart: NSView {
                 PanelAccent.codex.color.withAlphaComponent(0.09).setFill()
                 NSBezierPath(roundedRect: NSRect(x: x, y: 0, width: width, height: 64), xRadius: 4, yRadius: 4).fill()
             }
-            let barWidth = min(7, max(3, (width - 8) / 3)), left = x + (width - barWidth * 2 - 3) / 2
+            // 单根额度槽：居中 12pt 灰槽，绿色按该轮自身上限归一化的已用比例从底部填充；0% 不画绿色。
+            let geometry = PanelVisuals.capacityTrack(in: NSRect(x: x, y: 2, width: width, height: 58),
+                usedPercent: cycle.lastObservedUsedPercent)
+            let trackPath = NSBezierPath(roundedRect: geometry.track, xRadius: 2, yRadius: 2)
             NSColor.secondaryLabelColor.withAlphaComponent(0.25).setFill()
-            NSBezierPath(roundedRect: NSRect(x: left, y: 2, width: barWidth, height: 58), xRadius: 1, yRadius: 1).fill()
-            PanelAccent.codex.color.setFill()
-            let height = max(1, CGFloat(cycle.lastObservedUsedPercent / 100) * 58)
-            NSBezierPath(roundedRect: NSRect(x: left + barWidth + 3, y: 60 - height, width: barWidth, height: height), xRadius: 1, yRadius: 1).fill()
+            trackPath.fill()
+            if let fill = geometry.fill {
+                NSGraphicsContext.saveGraphicsState()
+                trackPath.addClip()
+                PanelAccent.codex.color.setFill()
+                NSBezierPath(roundedRect: fill, xRadius: 2, yRadius: 2).fill()
+                NSGraphicsContext.restoreGraphicsState()
+            }
             let date = cycle.inferredStartAt ?? cycle.firstObservedAt
             let label = (cycle.inferredStartAt == nil ? "" : "~") + QuotaCycleHistoryView.date(date, format: "MM/dd")
             let text = label as NSString, size = text.size(withAttributes: attrs)

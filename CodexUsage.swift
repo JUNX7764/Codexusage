@@ -2418,19 +2418,84 @@ private enum PanelSurface {
 }
 
 private final class PanelComparisonStack: NSStackView {
-    override var wantsUpdateLayer: Bool { true }
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
+    private struct Entry {
+        let caption: NSTextField
+        let chip: PanelDeltaChip
+        let row: NSStackView
+    }
+    private var entries: [Entry] = []
+    private var divider: NSBox?
+    private var dividerHeight: NSLayoutConstraint?
+    private var stackHeight: NSLayoutConstraint!
+    private var isTwoRows = false
+
+    /// pairs：(说明文字, 环比值, 对比口径说明)。值配色沿用方向动态色的调用方结果。
+    init(pairs: [(caption: String, text: String, color: NSColor, description: String)]) {
+        super.init(frame: .zero)
         orientation = .horizontal; alignment = .centerY; spacing = 4
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true; layer?.cornerRadius = 6
+        stackHeight = heightAnchor.constraint(equalToConstant: 32)
+        stackHeight.isActive = true
+        for (index, pair) in pairs.enumerated() {
+            if index > 0 {
+                let separator = NSBox(); separator.boxType = .separator
+                separator.translatesAutoresizingMaskIntoConstraints = false
+                addArrangedSubview(separator)
+                let height = separator.heightAnchor.constraint(equalToConstant: 18)
+                divider = separator; dividerHeight = height
+                NSLayoutConstraint.activate([separator.widthAnchor.constraint(equalToConstant: 1), height])
+            }
+            let caption = PanelUI.label(pair.caption, size: 11, color: .secondaryLabelColor, wrapping: false)
+            caption.alignment = .center
+            caption.setContentHuggingPriority(.init(1), for: .horizontal)
+            caption.toolTip = pair.description
+            caption.setAccessibilityHelp(pair.description)
+            // 数值语义仍可被 VoiceOver 读取：说明文字携带完整值，胶囊本身是装饰元素。
+            caption.setAccessibilityValue(pair.text)
+            let chip = PanelDeltaChip(text: pair.text, foreground: pair.color)
+            let row = NSStackView(views: [caption, chip])
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 4
+            row.translatesAutoresizingMaskIntoConstraints = false
+            addArrangedSubview(row)
+            entries.append(Entry(caption: caption, chip: chip, row: row))
+        }
+        // 左右两半等宽，保持与旧版两列一致的对齐。
+        if entries.count == 2 {
+            entries[0].row.widthAnchor.constraint(equalTo: entries[1].row.widthAnchor).isActive = true
+        }
     }
+
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance { layer?.backgroundColor = PanelSurface.comparisonFill.cgColor }
     }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance(); needsDisplay = true
+    }
+    override func layout() {
+        super.layout()
+        guard bounds.width > 0, entries.count == 2 else { return }
+        let available = bounds.width - 8 - 1
+        let halfWidth = max(0, available / 2)
+        // 用固有文本宽度而不是当前被压缩后的 frame 决策，避免来回抖动；极端长值（如「由 0 增至 …」）转两行且不截断数字。
+        let next = entries.contains {
+            PanelDeltaChip.requiresTwoRows(halfWidth: halfWidth,
+                captionWidth: $0.caption.intrinsicContentSize.width,
+                chipWidth: $0.chip.intrinsicContentSize.width)
+        }
+        guard next != isTwoRows else { return }
+        isTwoRows = next
+        for entry in entries {
+            entry.row.orientation = next ? .vertical : .horizontal
+            entry.row.alignment = next ? .centerX : .centerY
+            entry.row.spacing = next ? 1 : 4
+        }
+        stackHeight.constant = next ? 46 : 32
+        dividerHeight?.constant = next ? 34 : 18
     }
 }
 
@@ -2521,7 +2586,7 @@ private final class PlanBadgeLabel: NSTextField {
 }
 
 final class PanelHeaderView: NSView {
-    init(model: UsagePanelModel, backgroundTarget: AnyObject? = nil, backgroundAction: Selector? = nil) {
+    init(model: UsagePanelModel, settingsTarget: AnyObject? = nil, settingsAction: Selector? = nil) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 12)
@@ -2557,12 +2622,12 @@ final class PanelHeaderView: NSView {
         }
         row.addArrangedSubview(titles)
         row.addArrangedSubview(PanelUI.spacer())
-        if let target = backgroundTarget, let action = backgroundAction {
-            let image = NSImage(systemSymbolName: "paintpalette", accessibilityDescription: "背景样式")?
-                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+        if let target = settingsTarget, let action = settingsAction {
+            let image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "面板设置")?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
             let button = NSButton(image: image ?? NSImage(), target: target, action: action)
             button.isBordered = false; button.contentTintColor = .secondaryLabelColor
-            button.toolTip = "背景样式"; button.setAccessibilityLabel("背景样式")
+            button.toolTip = "面板设置"; button.setAccessibilityLabel("面板设置")
             button.widthAnchor.constraint(equalToConstant: 24).isActive = true
             button.heightAnchor.constraint(equalToConstant: 24).isActive = true
             row.addArrangedSubview(button)
@@ -2724,20 +2789,13 @@ final class ResetCardSectionView: PanelCardView {
             let name = PanelUI.label(rowModel.name, size: 12, color: color, wrapping: false)
             row.addArrangedSubview(name)
             row.addArrangedSubview(PanelUI.spacer())
-            // 日期用次要色，"过期"标签单独用橙色加粗，主次分明
-            let expiresText = rowModel.expires.hasSuffix(" 过期")
-                ? String(rowModel.expires.dropLast(3)) : rowModel.expires
-            let dateLabel = PanelUI.label(expiresText, size: 11,
+            // 「过期」只是日期列的说明词（该时间即卡的过期时间），不是状态徽标：
+            // 与日期同用次要色，不做语义色，避免被误读成卡片已失效（2026-11-14 用户反馈）。
+            let dateLabel = PanelUI.label(rowModel.expires, size: 11,
                 color: .secondaryLabelColor, wrapping: false, monospacedDigits: true)
             dateLabel.setContentHuggingPriority(.required, for: .horizontal)
             dateLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
             row.addArrangedSubview(dateLabel)
-            if rowModel.expires.hasSuffix(" 过期") {
-                let badge = PanelUI.label("过期", size: 10, weight: .medium,
-                    color: PanelAccent.codex.color, wrapping: false)
-                badge.setContentHuggingPriority(.required, for: .horizontal)
-                row.addArrangedSubview(badge)
-            }
             contentStack.addArrangedSubview(row)
         }
         for notice in PanelUI.notices(model.notices) {
@@ -2859,6 +2917,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var expandedCodexBuckets: Set<Int> = []
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
+    // 卡片显隐与排序（「···」→ 卡片显示与排序）；隐藏 ≠ 收起，隐藏的卡片仍照常获取数据。
+    private(set) var panelLayout: PanelCardLayout
+    private var showingCardSettings = false
+    private var cardSettingsEditor: PanelCardSettingsView?
+    // 编辑器复用跨 10s 重建时，旧卡片栈的宽度约束要显式失活，避免约束随编辑器逐轮滞留。
+    private var cardSettingsWidthConstraint: NSLayoutConstraint?
+    /// 预览与离线回归不读也不写生产偏好；判定收敛为单一属性避免多处谓词漂移。
+    private let isPreviewMode = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
     var previewWidth: CGFloat?
     var isOpen: Bool { popover.isShown }
     var previewWindowNumber: Int { contentController.view.window?.windowNumber ?? 0 }
@@ -2879,6 +2945,19 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var panelWidth = UsagePanelController.maximumWidth
 
     override init() {
+        // 预览与离线回归必须是默认布局基线：不读生产偏好；截图可用 --visual-preview-hide-cards=daily,tools 注入隐藏。
+        if isPreviewMode {
+            panelLayout = .default
+            if let argument = CommandLine.arguments.first(where: { $0.hasPrefix("--visual-preview-hide-cards=") }) {
+                var layout = PanelCardLayout.default
+                for name in String(argument.dropFirst("--visual-preview-hide-cards=".count)).split(separator: ",") {
+                    if let id = PanelCardID(rawValue: String(name)) { layout.setVisible(false, for: id) }
+                }
+                panelLayout = layout
+            }
+        } else {
+            panelLayout = PanelCardLayout.load()
+        }
         super.init()
         configureContent()
         if let argument = CommandLine.arguments.first(where: { $0.hasPrefix("--visual-preview-background=") }) {
@@ -2980,7 +3059,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         clear(container: headerContainer)
         clear(container: footerContainer)
 
-        let header = PanelHeaderView(model: model, backgroundTarget: self, backgroundAction: #selector(showBackgroundStyleMenu(_:)))
+        let header = PanelHeaderView(model: model, settingsTarget: self, settingsAction: #selector(showPanelSettingsMenu(_:)))
         let headerLine = PanelUI.separator()
         headerContainer.addSubview(header)
         headerContainer.addSubview(headerLine)
@@ -3016,6 +3095,15 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private func rebuildContent() {
         guard let model = model else { return }
+        // 设置页打开时的 10s 重建：编辑器实例被复用，但移窗会打断焦点，先记录、加回后恢复。
+        var settingsFocusOwner: NSView?
+        if showingCardSettings, let owner = contentController.view.window?.firstResponder as? NSView {
+            var current: NSView? = owner
+            while let view = current {
+                if view === cardSettingsEditor { settingsFocusOwner = owner; break }
+                current = view.superview
+            }
+        }
         installChrome(model: model)
         for row in stack.arrangedSubviews {
             stack.removeArrangedSubview(row)
@@ -3031,19 +3119,40 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             button.heightAnchor.constraint(equalToConstant: 30).isActive = true
             addContentRow(button)
         }
-        addContentRow(QuotaCardSectionView(quotas: model.quotas))
-        if let reset = model.resetCards {
-            addContentRow(ResetCardSectionView(model: reset, target: self, action: #selector(requestUseReset)))
+        if showingCardSettings {
+            addContentRow(makeCardSettingsSection())
+            settingsFocusOwner?.window?.makeFirstResponder(settingsFocusOwner)
+        } else {
+            let visible = panelLayout.visibleOrder
+            if visible.isEmpty {
+                addContentRow(makeEmptyCardsState())
+            } else {
+                for id in visible {
+                    switch id {
+                    case .quota:
+                        addContentRow(QuotaCardSectionView(quotas: model.quotas))
+                    case .resetCards:
+                        if let reset = model.resetCards {
+                            addContentRow(ResetCardSectionView(model: reset, target: self, action: #selector(requestUseReset)))
+                        }
+                    case .tibo:
+                        if let tibo = model.tibo {
+                            addContentRow(makeTiboSection(tibo))
+                        }
+                    case .tokens:
+                        addContentRow(makeCardSection(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
+                            expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
+                            bucketAction: #selector(toggleCodexBucket(_:)))))
+                    case .daily:
+                        addContentRow(makeCardSection(makeDailySection(model)))
+                    case .quotaHistory:
+                        addContentRow(makeCardSection(makeQuotaHistorySection(model)))
+                    case .tools:
+                        addContentRow(makeCardSection(makeToolSection(model)))
+                    }
+                }
+            }
         }
-        if let tibo = model.tibo {
-            addContentRow(makeTiboSection(tibo))
-        }
-        addContentRow(makeCardSection(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
-            expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
-            bucketAction: #selector(toggleCodexBucket(_:)))))
-        addContentRow(makeCardSection(makeDailySection(model)))
-        addContentRow(makeCardSection(makeQuotaHistorySection(model)))
-        addContentRow(makeCardSection(makeToolSection(model)))
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
     }
@@ -3054,9 +3163,121 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return card
     }
 
+    // MARK: - 面板设置（「···」菜单：卡片显示与排序 + 背景样式）
+
+    private func persistPanelLayout() {
+        guard !isPreviewMode else { return }
+        panelLayout.save()
+    }
+
+    /// 统一「···」菜单：卡片显示与排序入口 + 背景样式子菜单。
+    private func makePanelSettingsMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let cards = NSMenuItem(title: "卡片显示与排序…", action: #selector(showCardSettings), keyEquivalent: "")
+        cards.target = self
+        cards.isEnabled = !showingCardSettings
+        menu.addItem(cards)
+        let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
+        background.submenu = makeBackgroundStyleMenu()
+        menu.addItem(background)
+        return menu
+    }
+
+    @objc private func showPanelSettingsMenu(_ sender: NSButton) {
+        let menu = makePanelSettingsMenu()
+        // 菜单跟踪会抢走 transient Popover 的 key；沿用背景菜单的做法先摘监控，结束后恢复。
+        let hadMonitors = localMonitor != nil || globalMonitor != nil
+        if hadMonitors { removeMonitors() }
+        menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.maxX, y: -6), in: sender)
+        if hadMonitors && isOpen { installMonitors() }
+    }
+
+    @objc private func showCardSettings() {
+        showingCardSettings = true
+        refreshPanelLayout()
+        // 打开设置页必须接管焦点：否则焦点残留「···」按钮，Space 会再次弹菜单，
+        // 菜单跟踪期间 transient Popover 失 key 被关闭（真实按键验收发现的缺陷）。
+        func scan(_ view: NSView) -> PanelCardSettingsView? {
+            if let editor = view as? PanelCardSettingsView { return editor }
+            for subview in view.subviews {
+                if let found = scan(subview) { return found }
+            }
+            return nil
+        }
+        if let editor = scan(contentController.view) {
+            editor.initialKeyView.window?.makeFirstResponder(editor.initialKeyView)
+        }
+    }
+
+    @objc private func finishCardSettings() {
+        showingCardSettings = false
+        cardSettingsEditor = nil
+        cardSettingsWidthConstraint?.isActive = false
+        cardSettingsWidthConstraint = nil
+        refreshPanelLayout()
+    }
+
+    /// 空态（全部卡片隐藏）仍提供明确的恢复入口，不留无法解释的空白。
+    @objc private func resetCardLayout() {
+        panelLayout = .default
+        persistPanelLayout()
+        refreshPanelLayout()
+    }
+
+    private func makeCardSettingsSection() -> PanelCardView {
+        // 10s 数据刷新会整体重建面板；设置页打开期间复用同一编辑器，避免打断键盘操作。
+        let editor: PanelCardSettingsView
+        if let existing = cardSettingsEditor {
+            editor = existing
+            cardSettingsWidthConstraint?.isActive = false
+            cardSettingsWidthConstraint = nil
+        } else {
+            editor = PanelCardSettingsView(layout: panelLayout)
+            editor.onChange = { [weak self] layout in
+                guard let self = self else { return }
+                self.panelLayout = layout
+                self.persistPanelLayout()
+            }
+            editor.onFinish = { [weak self] in self?.finishCardSettings() }
+            cardSettingsEditor = editor
+        }
+        let card = PanelCardView(padding: 8)
+        // 先挂进父栈再激活约束：两端有共同祖先，避免 NSLayoutConstraint 激活异常。
+        card.contentStack.addArrangedSubview(editor)
+        let width = editor.widthAnchor.constraint(equalTo: card.contentStack.widthAnchor)
+        width.isActive = true
+        cardSettingsWidthConstraint = width
+        return card
+    }
+
+    private func makeEmptyCardsState() -> PanelCardView {
+        // 与业务卡片一致使用 8pt 内边距（AGENTS.md：卡片间距与内边距均为 8pt）。
+        let card = PanelCardView(padding: 8)
+        let row = PanelUI.stack(spacing: 6)
+        PanelUI.addFullWidth(PanelUI.label("全部卡片已隐藏", size: 12, weight: .semibold, wrapping: false), to: row)
+        PanelUI.addFullWidth(PanelUI.label("卡片可在「···」→ 卡片显示与排序中重新开启。", size: 10, color: .secondaryLabelColor), to: row)
+        let restore = PanelActionButton()
+        restore.style = .plain
+        restore.target = self
+        restore.action = #selector(resetCardLayout)
+        restore.wantsLayer = true
+        restore.layer?.cornerRadius = 6
+        restore.isBordered = false
+        restore.focusRingType = .none
+        restore.attributedTitle = NSAttributedString(string: "恢复默认卡片布局", attributes: [
+            .font: NSFont.systemFont(ofSize: 12),
+            .foregroundColor: NSColor.labelColor
+        ])
+        restore.heightAnchor.constraint(greaterThanOrEqualToConstant: 26).isActive = true
+        PanelUI.addFullWidth(restore, to: row)
+        PanelUI.addFullWidth(row, to: card.contentStack)
+        return card
+    }
+
     private func makeQuotaHistorySection(_ model: UsagePanelModel) -> NSView {
         let root = PanelUI.stack(spacing: 6)
-        let heading = PanelSectionHeading.make(title: "额度周期回顾", symbol: "chart.bar.fill",
+        let heading = PanelSectionHeading.make(title: "额度周期回顾", symbol: PanelVisuals.historySymbol,
             color: PanelAccent.codex.color, expanded: quotaHistoryUI.expanded, target: self,
             action: #selector(toggleQuotaHistory), toolTip: "根据额度实际观测轮次记录；开始和结束可能不精确")
         PanelUI.addFullWidth(heading, to: root)
@@ -3071,7 +3292,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private func makeDailySection(_ model: UsagePanelModel) -> NSView {
         let root = PanelUI.stack(spacing: 6)
-        let heading = PanelSectionHeading.make(title: "用量简析", symbol: "chart.bar.fill",
+        let heading = PanelSectionHeading.make(title: "用量简析", symbol: PanelVisuals.dailySymbol,
             color: PanelAccent.codex.color, expanded: dailyExpanded, target: self,
             action: #selector(toggleDaily), toolTip: "官方账号累计和每日 Token；覆盖范围与源时区尚未确认")
         PanelUI.addFullWidth(heading, to: root)
@@ -3090,26 +3311,16 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         totalRow.addArrangedSubview(PanelUI.spacer())
         PanelUI.addFullWidth(totalRow, to: root)
         PanelUI.addFullWidth(DailyUsageChart(snapshot: model.official, scannedToday: model.officialTodayFill), to: root)
-        let comparison = PanelComparisonStack()
         let compared = UsageComparison.evaluate(snapshot: model.official, now: Date(), todayFill: model.officialTodayFill)
         func comparisonColor(_ value: UsageComparison.Value) -> NSColor {
             if case .percent(let amount) = value { return amount < 0 ? RemainingColorTier.green.color() : PanelAccent.codex.color }
             if case .fromZero = value { return PanelAccent.codex.color }
             return .secondaryLabelColor
         }
-        let left = PanelUI.label("日环比  " + compared.0.value.text, size: 11, color: comparisonColor(compared.0.value), wrapping: false)
-        let right = PanelUI.label("7日环比  " + compared.1.value.text, size: 11, color: comparisonColor(compared.1.value), wrapping: false)
-        left.toolTip = compared.0.description; right.toolTip = compared.1.description
-        left.setAccessibilityHelp(compared.0.description); right.setAccessibilityHelp(compared.1.description)
-        left.alignment = .center; right.alignment = .center
-        left.setContentHuggingPriority(.init(1), for: .horizontal)
-        right.setContentHuggingPriority(.init(1), for: .horizontal)
-        comparison.addArrangedSubview(left)
-        let separator = NSBox(); separator.boxType = .separator; separator.translatesAutoresizingMaskIntoConstraints = false
-        separator.widthAnchor.constraint(equalToConstant: 1).isActive = true; separator.heightAnchor.constraint(equalToConstant: 18).isActive = true
-        comparison.addArrangedSubview(separator); comparison.addArrangedSubview(right)
-        left.widthAnchor.constraint(equalTo: right.widthAnchor).isActive = true
-        comparison.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        let comparison = PanelComparisonStack(pairs: [
+            ("日环比", compared.0.value.text, comparisonColor(compared.0.value), compared.0.description),
+            ("7日环比", compared.1.value.text, comparisonColor(compared.1.value), compared.1.description)
+        ])
         PanelUI.addFullWidth(comparison, to: root)
         if let error = model.officialError { PanelUI.addFullWidth(PanelUI.label(error, size: 10, color: .secondaryLabelColor), to: root) }
         if let snapshot = model.official, Date().timeIntervalSince(snapshot.fetchedAt) > UsageFreshness.staleSeconds {
@@ -3284,6 +3495,79 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return updateConfirmation == nil && calls.count == 1
     }
 
+    /// 卡片设置页离线回归：菜单结构、焦点交接、Space 键不关面板、显隐/排序/恢复默认与完成重建。
+    func verifyPanelSettingsForPreview() -> Bool {
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+        func editor() -> PanelCardSettingsView? { descendants(contentController.view).compactMap { $0 as? PanelCardSettingsView }.first }
+        func fail(_ message: String) -> Bool { print("CODEX_CARD_SETTINGS \(message)"); return false }
+
+        // 统一「···」菜单：卡片设置入口 + 背景样式子菜单；未进入设置页时入口可用
+        let menu = makePanelSettingsMenu()
+        guard menu.items.map(\.title) == ["卡片显示与排序…", "背景样式"], menu.items[0].isEnabled,
+              let backgroundMenu = menu.items[1].submenu,
+              backgroundMenu.items.map(\.title).contains("纯色"),
+              backgroundMenu.items.contains(where: { $0.title.hasPrefix("液态玻璃") }) else { return fail("menu structure") }
+
+        // 打开设置页：焦点必须落在首行复选框上（焦点残留「···」按钮会让 Space 重弹菜单并关闭面板）
+        showCardSettings()
+        guard showingCardSettings, let settings = editor() else { return fail("settings page missing") }
+        guard let window = contentController.view.window, window.firstResponder === settings.initialKeyView else {
+            return fail("focus handoff")
+        }
+
+        // Space 触发首行复选框：面板保持打开，显隐状态随之切换
+        guard let space = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: " ", charactersIgnoringModifiers: " ",
+                isARepeat: false, keyCode: 49) else { return fail("space event") }
+        window.sendEvent(space)
+        guard isOpen, panelLayout.isVisible(.quota) == false else { return fail("space toggle") }
+        window.sendEvent(space)
+        guard isOpen, panelLayout.isVisible(.quota) else { return fail("space untoggle") }
+
+        // 排序：把「工具明细」上移，末位变成「额度周期回顾」；重建行后焦点必须落回同一行的上移按钮
+        guard let toolsUp = descendants(settings).compactMap({ $0 as? NSButton }).first(where: { $0.accessibilityLabel() == "上移工具明细" }),
+              toolsUp.isEnabled, let focusWindow = toolsUp.window else { return fail("up button") }
+        toolsUp.performClick(nil)
+        guard panelLayout.visibleOrder.last == .quotaHistory else { return fail("move up") }
+        let movedFocus = descendants(settings).compactMap({ $0 as? NSButton }).first(where: { $0.accessibilityLabel() == "上移工具明细" })
+        guard let movedFocus, focusWindow.firstResponder === movedFocus, movedFocus.isEnabled else {
+            return fail("focus restore after move")
+        }
+
+        // 10s 数据刷新重建面板：编辑器实例被复用，行内焦点必须原样保留
+        guard let model = model, let focusedControl = focusWindow.firstResponder as? NSView else { return fail("model") }
+        update(model: model)
+        guard focusWindow.firstResponder === focusedControl, isOpen, editor() != nil else {
+            return fail("focus across rebuild")
+        }
+
+        // 隐藏两张卡并「完成」：重建后实际卡片随之变化
+        panelLayout.setVisible(false, for: .daily)
+        panelLayout.setVisible(false, for: .tools)
+        finishCardSettings()
+        guard !showingCardSettings, editor() == nil else { return fail("finish") }
+        stack.layoutSubtreeIfNeeded()
+        let cards = stack.arrangedSubviews.compactMap { $0 as? PanelCardView }
+        guard cards.count == 5, verifyCardLayoutForPreview() else { return fail("rebuild after finish count=\(cards.count)") }
+
+        // 重开设置页：内存布局保留（隐藏与顺序都在）
+        showCardSettings()
+        guard let reopened = editor(), reopened.layout.isVisible(.daily) == false,
+              reopened.layout.visibleOrder.last == .quotaHistory else { return fail("layout retained") }
+
+        // 恢复默认 + 完成：回到 7 卡默认布局
+        guard let reset = descendants(reopened).compactMap({ $0 as? NSButton }).first(where: { $0.title == "恢复默认卡片布局" }) else {
+            return fail("reset button")
+        }
+        reset.performClick(nil)
+        guard panelLayout == .default else { return fail("reset layout") }
+        finishCardSettings()
+        stack.layoutSubtreeIfNeeded()
+        let restored = stack.arrangedSubviews.compactMap { $0 as? PanelCardView }
+        guard restored.count == 7, verifyCardLayoutForPreview() else { return fail("restored count=\(restored.count)") }
+        return true
+    }
+
     private static var supportsLiquidGlass: Bool {
         if #available(macOS 26.0, *) { return true }
         return false
@@ -3294,7 +3578,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         solid.isHidden = effective != .solid
         effect.isHidden = effective != .classicMaterial
     }
-    @objc private func showBackgroundStyleMenu(_ sender: NSButton) {
+    private func makeBackgroundStyleMenu() -> NSMenu {
         let menu = NSMenu(); menu.autoenablesItems = false
         for style in PanelBackgroundStyle.allCases {
             let unavailable = style == .liquidGlass && !Self.supportsLiquidGlass
@@ -3305,10 +3589,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             item.isEnabled = !unavailable
             menu.addItem(item)
         }
-        let hadMonitors = localMonitor != nil || globalMonitor != nil
-        if hadMonitors { removeMonitors() }
-        menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.maxX, y: -6), in: sender)
-        if hadMonitors && isOpen { installMonitors() }
+        return menu
     }
     @objc private func selectBackgroundStyle(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let style = PanelBackgroundStyle(rawValue: raw),
@@ -3465,38 +3746,68 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     func expandToolsForPreview() { externalExpanded = true }
     func collapseDailyForPreview() { dailyExpanded = false }
+    /// 截图辅助：展示原位卡片设置页（不参与事件断言）。
+    func showCardSettingsForPreview() { showCardSettings() }
     func expandAllTokenBucketsForPreview() {
         expandedCodexBuckets = [0, 1, 2]
         refreshPanelLayout()
     }
 
-    /// 七个业务模块均使用原生卡片，展开／折叠只改变卡片内容，不改变模块顺序。
+    /// 业务模块均使用原生卡片；期望卡片集合由当前布局（显隐 + 顺序）与数据可用性共同决定。
     func verifyCardLayoutForPreview() -> Bool {
         stack.layoutSubtreeIfNeeded()
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         let cards = stack.arrangedSubviews.compactMap { $0 as? PanelCardView }
+        guard let model = model else { return false }
+        var expected: [PanelCardID] = []
+        for id in panelLayout.visibleOrder {
+            switch id {
+            case .quota: expected.append(.quota)
+            case .resetCards: if model.resetCards != nil { expected.append(.resetCards) }
+            case .tibo: if model.tibo != nil { expected.append(.tibo) }
+            default: expected.append(id)
+            }
+        }
         let hasSectionSeparator = stack.arrangedSubviews.contains { ($0 as? NSBox)?.boxType == .separator }
-        let dailyButtons = descendants(cards.count > 4 ? cards[4] : NSView()).compactMap { $0 as? PanelDisclosureButton }
-            .filter { $0.action == #selector(toggleDaily) }
-        let historyButtons = descendants(cards.count > 5 ? cards[5] : NSView()).compactMap { $0 as? PanelDisclosureButton }
-            .filter { $0.action == #selector(toggleQuotaHistory) }
-        let toolButtons = descendants(cards.count > 6 ? cards[6] : NSView()).compactMap { $0 as? PanelDisclosureButton }
-            .filter { $0.action == #selector(toggleExternal) }
         let hasFooterSeparator = footerContainer.subviews.contains { ($0 as? NSBox)?.boxType == .separator }
         let hasConsistentSpacing = zip(cards, cards.dropFirst()).allSatisfy { previous, card in
             abs(previous.frame.minY - card.frame.maxY - stack.spacing) < 0.01
         }
-        guard cards.count == 7, !hasSectionSeparator, hasFooterSeparator,
-              stack.spacing == 8, hasConsistentSpacing,
-              cards[0] is QuotaCardSectionView, cards[1] is ResetCardSectionView,
-              descendants(cards[0]).compactMap({ $0 as? QuotaWindowView }).count == model?.quotas.count,
-              descendants(cards[3]).contains(where: { $0 is TokenSectionView }),
-              dailyButtons.count == 2, historyButtons.count == 2, toolButtons.count == 2 else {
-            print("CODEX_CARD_LAYOUT structureFailed cards=\(cards.count) separators=\(hasSectionSeparator) footer=\(hasFooterSeparator) spacing=\(hasConsistentSpacing)")
+        guard cards.count == expected.count, !hasSectionSeparator, hasFooterSeparator,
+              stack.spacing == 8, hasConsistentSpacing else {
+            print("CODEX_CARD_LAYOUT structureFailed cards=\(cards.count) expected=\(expected.count) separators=\(hasSectionSeparator) footer=\(hasFooterSeparator) spacing=\(hasConsistentSpacing)")
             return false
         }
-        if quotaHistoryUI.expanded && abs(cards[5].frame.height - 178) > 0.01 {
-            print("CODEX_CARD_LAYOUT quota height=\(cards[5].frame.height)"); return false
+        var historyCardHeight: CGFloat?
+        for (index, id) in expected.enumerated() {
+            let card = cards[index]
+            let inner = descendants(card)
+            let ok: Bool
+            switch id {
+            case .quota:
+                ok = card is QuotaCardSectionView
+                    && inner.compactMap({ $0 as? QuotaWindowView }).count == model.quotas.count
+            case .resetCards: ok = card is ResetCardSectionView
+            case .tibo: ok = inner.contains(where: { ($0 as? NSTextField)?.stringValue == "Tibo 重置动态" })
+            case .tokens: ok = inner.contains(where: { $0 is TokenSectionView })
+            case .daily:
+                let buttons = inner.compactMap { $0 as? PanelDisclosureButton }.filter { $0.action == #selector(toggleDaily) }
+                ok = buttons.count == 2
+            case .quotaHistory:
+                let buttons = inner.compactMap { $0 as? PanelDisclosureButton }.filter { $0.action == #selector(toggleQuotaHistory) }
+                if quotaHistoryUI.expanded { historyCardHeight = card.frame.height }
+                ok = buttons.count == 2
+            case .tools:
+                let buttons = inner.compactMap { $0 as? PanelDisclosureButton }.filter { $0.action == #selector(toggleExternal) }
+                ok = buttons.count == 2
+            }
+            guard ok else {
+                print("CODEX_CARD_LAYOUT mismatch index=\(index) id=\(id.rawValue)")
+                return false
+            }
+        }
+        if quotaHistoryUI.expanded, let height = historyCardHeight, abs(height - 178) > 0.01 {
+            print("CODEX_CARD_LAYOUT quota height=\(height)"); return false
         }
         return cards.enumerated().allSatisfy { index, card in
             card.layoutSubtreeIfNeeded()
@@ -3836,6 +4147,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         savedScrollOrigin = scrollView.contentView.bounds.origin
         updateConfirmation = nil
+        showingCardSettings = false
+        cardSettingsEditor = nil
+        cardSettingsWidthConstraint?.isActive = false
+        cardSettingsWidthConstraint = nil
         removeMonitors()
         anchorButton = nil
     }
@@ -4302,6 +4617,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 print("CodexUsage confirmation test: PASS"); exit(0)
             }
+            if arguments.contains("--visual-preview-card-settings-test") {
+                guard self.panelController.verifyPanelSettingsForPreview() else {
+                    fputs("CodexUsage card settings test: FAIL\n", stderr); exit(1)
+                }
+                print("CodexUsage card settings test: PASS"); exit(0)
+            }
             let outputPrefix = "--visual-preview-output="
             if let argument = arguments.first(where: { $0.hasPrefix(outputPrefix) }) {
                 let path = String(argument.dropFirst(outputPrefix.count))
@@ -4309,6 +4630,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if arguments.contains(where: { $0.hasPrefix("--visual-preview-quota-history") }) { self.panelController.scrollQuotaHistoryForPreview() }
                     if arguments.contains("--visual-preview-scroll-end") {
                         _ = self.panelController.scrollToEndForPreview()
+                    }
+                    if arguments.contains("--visual-preview-show-card-settings") {
+                        self.panelController.showCardSettingsForPreview()
                     }
                     let hoverPrefix = "--visual-preview-hover-index="
                     if let arg = arguments.first(where: { $0.hasPrefix(hoverPrefix) }) {
@@ -5401,7 +5725,8 @@ enum CodexOfflineRegression {
                        "valid zero card count was rejected")
 
             for appearanceName in [NSAppearance.Name.aqua, .darkAqua] {
-                let card = PanelCardView(); let strip = PanelComparisonStack()
+                let card = PanelCardView()
+                let strip = PanelComparisonStack(pairs: [("日环比", "+18%", PanelAccent.codex.color, "对比口径")])
                 card.appearance = NSAppearance(named: appearanceName); strip.appearance = NSAppearance(named: appearanceName)
                 card.updateLayer(); strip.updateLayer()
                 try expect(card.layer?.backgroundColor != nil && strip.layer?.backgroundColor != nil
@@ -6401,7 +6726,91 @@ enum CodexOfflineRegression {
                        && Fmt.webURL("") == nil,
                        "non-web tibo link scheme was accepted")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/per-model attribution/model switching/.zst archives/real-frame decode/tail-read, external usage model/parse/per-model scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist)")
+            // 面板卡片布局：默认、显隐、排序、持久化与损坏回退（独立 UserDefaults suite，不碰生产偏好）
+            let layoutSuite = "CodexUsage-self-test-layout-\(UUID().uuidString)"
+            let layoutStore = UserDefaults(suiteName: layoutSuite)!
+            defer { layoutStore.removePersistentDomain(forName: layoutSuite) }
+            try expect(PanelCardLayout.default.order == PanelCardID.allCases && PanelCardLayout.default.hidden.isEmpty,
+                       "layout default order")
+            try expect(PanelCardLayout.default.visibleOrder == PanelCardID.allCases, "layout default visibility")
+            var customLayout = PanelCardLayout.default
+            customLayout.setVisible(false, for: .tools)
+            try expect(!customLayout.isVisible(.tools) && !customLayout.visibleOrder.contains(.tools),
+                       "hidden card excluded from visible order")
+            try expect(customLayout.visibleOrder.count == PanelCardID.allCases.count - 1, "hidden count")
+            customLayout.move(.daily, direction: .up)
+            try expect(customLayout.order.firstIndex(of: .daily)! < customLayout.order.firstIndex(of: .tokens)!,
+                       "move up swaps neighbor")
+            for _ in 0..<6 { customLayout.move(.daily, direction: .up) }
+            try expect(customLayout.order.first == .daily, "move up clamps at top")
+            customLayout.move(.daily, direction: .up)
+            try expect(customLayout.order.first == .daily, "move at top is a no-op")
+            for _ in 0..<8 { customLayout.move(.daily, direction: .down) }
+            try expect(customLayout.order.last == .daily, "move down clamps at bottom")
+            customLayout.save(store: layoutStore)
+            try expect(PanelCardLayout.load(store: layoutStore) == customLayout, "layout roundtrip")
+            layoutStore.set(Data("not json".utf8), forKey: PanelCardLayout.defaultsKey)
+            try expect(PanelCardLayout.load(store: layoutStore) == .default, "corrupt layout falls back to default")
+            if let encoded = PanelCardLayout.default.encoded() {
+                var payload = try JSONSerialization.jsonObject(with: encoded) as! [String: Any]
+                payload["order"] = ["quota", "daily", "nonsense-id"]
+                let unknownData = try JSONSerialization.data(withJSONObject: payload)
+                try expect(PanelCardLayout.decoded(from: unknownData) == nil,
+                           "unknown card id rejects layout")
+                payload["order"] = ["daily"]
+                let patched = PanelCardLayout.decoded(from: try JSONSerialization.data(withJSONObject: payload))
+                try expect(patched?.order == [.daily] + PanelCardID.allCases.filter { $0 != .daily },
+                           "missing cards appended in default order")
+            } else {
+                throw Failure(description: "layout encode failed")
+            }
+
+            // 每日数值 320ms 过渡：首显直接到位、交互过渡、中途重定向不归零、缺数取消
+            var transition = TokenValueTransition()
+            transition.set(100, at: 0, animated: true)
+            try expect(transition.display == 100 && !transition.isAnimating, "first display snaps")
+            transition.set(200, at: 10, animated: true)
+            try expect(transition.isAnimating && transition.advance(at: 10) == 100, "interaction animates from current")
+            let midpoint = transition.advance(at: 10.160)!
+            try expect(abs(midpoint - 187.5) < 0.001, "320ms cubic ease-out midpoint")
+            transition.set(50, at: 10.160, animated: true)
+            try expect(abs(transition.display! - midpoint) < 0.001, "retarget continues from displayed value")
+            try expect(transition.advance(at: 10.481) == 50 && !transition.isAnimating, "latest target wins")
+            transition.set(nil, at: 11, animated: true)
+            try expect(transition.display == nil && transition.target == nil && !transition.isAnimating, "missing cancels")
+            transition.set(30, at: 12, animated: true)
+            try expect(transition.display == 30 && !transition.isAnimating, "recovery snaps after missing")
+            transition.set(.nan, at: 13, animated: true)
+            try expect(transition.target == nil && !transition.isAnimating, "nonfinite does not animate")
+
+            // 视觉原语：柱顶圆角几何与单根额度槽归一化（纯坐标计算，不依赖视图）
+            let dailyRect = NSRect(x: 0, y: 0, width: 6, height: 20)
+            let dailyPath = PanelVisuals.dailyBarPath(in: dailyRect)
+            try expect(dailyPath.bounds == dailyRect, "daily rounding preserves bounds")
+            try expect(dailyPath.contains(NSPoint(x: 0.05, y: 10)) && !dailyPath.contains(NSPoint(x: 0.05, y: 0.05)),
+                       "top corner rounded, bottom flush")
+            let tinyPath = PanelVisuals.dailyBarPath(in: NSRect(x: 0, y: 0, width: 6, height: 0.4))
+            try expect(tinyPath.bounds.maxY <= 0.4 + 0.0001, "short bar stays in bounds")
+            let column = NSRect(x: 20, y: 0, width: 43, height: 58)
+            let zeroTrack = PanelVisuals.capacityTrack(in: column, usedPercent: 0)
+            try expect(zeroTrack.track.width == 12 && zeroTrack.track.midX == column.midX && zeroTrack.fill == nil,
+                       "0% keeps centered track without fabricated fill")
+            let halfTrack = PanelVisuals.capacityTrack(in: column, usedPercent: 50)
+            try expect(abs(halfTrack.fill!.height / halfTrack.track.height - 0.5) < 0.0001,
+                       "fill normalized to its own capacity")
+            try expect(halfTrack.fill!.maxY == halfTrack.track.maxY && halfTrack.fill!.width == halfTrack.track.width,
+                       "fill anchored at track bottom")
+            let fullTrack = PanelVisuals.capacityTrack(in: column, usedPercent: 100)
+            try expect(fullTrack.fill == fullTrack.track, "100% fills the slot")
+            try expect(PanelVisuals.capacityTrack(in: column, usedPercent: 0.4).fill!.height < 1,
+                       "tiny use is not inflated")
+            try expect(PanelVisuals.capacityTrack(in: column, usedPercent: .nan).fill == nil, "nonfinite does not fill")
+            try expect(PanelVisuals.dailySymbol == "chart.bar.fill" && PanelVisuals.historySymbol != PanelVisuals.dailySymbol,
+                       "history and daily symbols differ")
+            try expect(NSImage(systemSymbolName: PanelVisuals.historySymbol, accessibilityDescription: nil) != nil,
+                       "history symbol exists on this runtime")
+
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/per-model attribution/model switching/.zst archives/real-frame decode/tail-read, external usage model/parse/per-model scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist, panel card layout/normalize/persist-fallback, token value transition, panel visuals geometry/symbols)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
