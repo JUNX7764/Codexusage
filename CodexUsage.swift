@@ -820,7 +820,8 @@ enum TiboDisplay {
     /// 预告不展示，与页面「当前没有等待生效的重置」口径一致；有预估窗口就只显示
     /// 「预估 <窗口文案>」（无预估时回退事件标题）；预估窗口已过但未确认 → 追加
     /// 「（窗口已过，待确认）」（schedule 不随时间自动完成）；已确认（confirmed）只展示
-    /// 最近一条。空列表 → 占位行。
+    /// 最近一条。空列表 → 「暂无重置动态」；有事件但全部被过滤（如仅剩窗口已过的
+    /// likely_completed 预告）→ 「暂无等待生效的重置」，卡片不留空白。
     static func rows(_ events: [TiboEvent], now: Date) -> [(text: String, link: String, confirmed: Bool)] {
         guard !events.isEmpty else { return [("暂无重置动态", "", false)] }
         var out: [(text: String, link: String, confirmed: Bool)] = []
@@ -834,6 +835,9 @@ enum TiboDisplay {
             let day = latest.occurredAt.map { Fmt.day($0) } ?? ""
             out.append((text: (day.isEmpty ? "" : day + " ") + latest.title, link: latest.link, confirmed: true))
         }
+        // 有事件但不满足任何展示条件（如仅剩窗口已过的 likely_completed 预告）→ 占位行，
+        // 不能让卡片只剩标题的空白（与 AIHOT 页「当前没有等待生效的重置」同语义）
+        if out.isEmpty { return [("暂无等待生效的重置", "", false)] }
         return out
     }
 
@@ -6157,6 +6161,16 @@ enum CodexOfflineRegression {
                        "expired tibo estimate window was not marked pending")
             try expect(TiboDisplay.rows([], now: duringWindow).first?.text == "暂无重置动态",
                        "empty tibo events did not render the placeholder")
+            // 有事件但全部被过滤（仅剩窗口已过的 likely_completed 预告）→ 占位行不留空白卡
+            let filteredOut = [TiboEvent(id: "t-only-expired", type: "direct_reset", status: "announced",
+                title: "重置卡已发放", estimateLabel: "北京时间 11月13日 07:00–10:00",
+                estimateFrom: Fmt.isoFrac.date(from: "2026-11-13T07:00:00.000+08:00"),
+                estimateThrough: Fmt.isoFrac.date(from: "2026-11-13T10:00:00.000+08:00"),
+                presentationStatus: "likely_completed", occurredAt: nil, link: "https://aihot.news/codex-reset")]
+            let rowsFilteredOut = TiboDisplay.rows(filteredOut, now: afterWindow)
+            try expect(rowsFilteredOut.count == 1 && rowsFilteredOut[0].text == "暂无等待生效的重置"
+                       && rowsFilteredOut[0].link.isEmpty && !rowsFilteredOut[0].confirmed,
+                       "all-filtered tibo events left the card blank instead of a placeholder row")
 
             // 三态合并：fresh 推进成功时间；unchanged(304) 保留旧值但推进成功时间；failure 保留旧值旧时间
             let tiboOldOK = now.addingTimeInterval(-1_000)
