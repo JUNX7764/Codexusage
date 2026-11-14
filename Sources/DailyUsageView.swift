@@ -202,7 +202,8 @@ final class DailyUsageChart: NSView {
         let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor]
         for index in [0, 15, 29] where index < days.count {
             let text = String(days[index].0.suffix(5)) as NSString
-            let x = min(max(0, CGFloat(index) * width - text.size(withAttributes: attributes).width / 2), bounds.width - text.size(withAttributes: attributes).width)
+            let textSize = text.size(withAttributes: attributes)
+            let x = min(max(0, CGFloat(index) * width - textSize.width / 2), bounds.width - textSize.width)
             text.draw(at: NSPoint(x: x, y: 49), withAttributes: attributes)
         }
     }

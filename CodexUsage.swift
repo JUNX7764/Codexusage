@@ -206,19 +206,22 @@ enum CodexAuth {
         return (obj["OPENAI_API_KEY"] as? String).map { !$0.isEmpty } ?? false
     }
 
+    /// JWT 第二段 Base64URL 解码 → payload 字典；解不出返回空字典，
+    /// 失败语义（身份兜底 / email 跳过）由调用方决定
+    private static func jwtPayload(_ jwt: String?) -> [String: Any] {
+        guard let jwt = jwt, jwt.split(separator: ".").count > 1 else { return [:] }
+        var part = String(jwt.split(separator: ".")[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        part += String(repeating: "=", count: (4 - part.count % 4) % 4)
+        guard let data = Data(base64Encoded: part),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+        return obj
+    }
+
     // Only use stable identity when both the user and workspace can be identified.
     // Otherwise the in-memory access token is a conservative boundary, never persisted.
     static func identity(_ snapshot: Snapshot?) -> String? {
         guard let tokens = snapshot?.tokens else { return nil }
-        func claims(_ jwt: String?) -> [String: Any] {
-            guard let jwt = jwt, jwt.split(separator: ".").count > 1 else { return [:] }
-            var part = String(jwt.split(separator: ".")[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-            part += String(repeating: "=", count: (4 - part.count % 4) % 4)
-            guard let data = Data(base64Encoded: part),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
-            return obj
-        }
-        let id = claims(tokens.idToken), access = claims(tokens.accessToken)
+        let id = jwtPayload(tokens.idToken), access = jwtPayload(tokens.accessToken)
         let auth = access["https://api.openai.com/auth"] as? [String: Any] ?? [:]
         let subject = (id["sub"] as? String) ?? (access["sub"] as? String)
         let account = tokens.accountID ?? (auth["chatgpt_account_id"] as? String)
@@ -273,16 +276,9 @@ enum CodexAuth {
         return (accessToken, true)
     }
 
-    /// JWT 第二段 Base64URL 解码 → payload claim "https://api.openai.com/profile".email
+    /// JWT payload claim "https://api.openai.com/profile".email（解码复用 jwtPayload）
     private static func jwtEmail(_ jwt: String) -> String? {
-        let parts = jwt.split(separator: ".")
-        guard parts.count >= 2 else { return nil }
-        var seg = String(parts[1])
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        seg += String(repeating: "=", count: (4 - seg.count % 4) % 4)
-        guard let data = Data(base64Encoded: seg),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let obj = jwtPayload(jwt)
         let profile = obj["https://api.openai.com/profile"] as? [String: Any]
         guard let email = (profile?["email"] as? String) ?? (obj["email"] as? String), !email.isEmpty else { return nil }
         return email
@@ -821,7 +817,7 @@ enum TiboDisplay {
     /// 展示最近 1 条（AIHOT 确认只发新事件、不翻旧 status，不能等它翻转；缺窗口回退
     /// occurredAt；不能按 occurredAt 排——排序看窗口不看记录时间）——其中 presentation
     /// 标记 likely_completed（窗口已过、大概率已生效，AIHOT 页面按「已生效」渲染）的
-    /// 预告不再展示，与页面「当前没有等待生效的重置」口径一致；有预估窗口就只显示
+    /// 预告不展示，与页面「当前没有等待生效的重置」口径一致；有预估窗口就只显示
     /// 「预估 <窗口文案>」（无预估时回退事件标题）；预估窗口已过但未确认 → 追加
     /// 「（窗口已过，待确认）」（schedule 不随时间自动完成）；已确认（confirmed）只展示
     /// 最近一条。空列表 → 占位行。
@@ -1342,7 +1338,7 @@ enum ExternalTokenScanner {
 
                 guard let fh = try? FileHandle(forReadingFrom: url) else { rootFailed = true; continue }
                 fh.seek(toFileOffset: fs.offset)
-                // 与 TokenScanner 同款分块读 + 行缓冲：首见的大文件不再整份载入内存；
+                // 与 TokenScanner 同款分块读 + 行缓冲：首见的大文件不整份载入内存；
                 // 只消费到最后一个完整换行，正在被写入的残缺行留给下次
                 var pending = Data()
                 var consumed = fs.offset
@@ -1800,7 +1796,7 @@ enum Fmt {
 
 // 从应用直接启动更新子进程，保留 TCC 的责任应用归属。
 // nohup 与独立的临时脚本确保应用退出换包后，子进程仍能完成更新或回滚。
-// 进度在下拉面板内原位展示（更新按钮变进度行），不再弹独立窗口、不抢占焦点：
+// 进度在下拉面板内原位展示（更新按钮变进度行），不弹独立窗口、不抢占焦点：
 // 任务与 UI 解耦，关闭面板不影响更新，重开面板时根据这里的状态恢复进度行；
 // 失败另用 alert 兜底，因为那一刻面板可能已经关闭。
 final class UpdateProgressController: NSObject {
@@ -1917,7 +1913,7 @@ final class UpdateProgressController: NSObject {
                 setPhase(.finished)
             } else if log.contains("4/5") || log.contains("5/5") {
                 // 停机/换包阶段失败由 wrapper 弹系统对话框兜底（那一刻本进程可能已被替换），
-                // 这里只恢复面板按钮状态，不再重复弹模态框
+                // 这里只恢复面板按钮状态，不重复弹模态框
                 directory = nil
                 setPhase(.failed)
             } else {
@@ -2725,14 +2721,14 @@ final class ResetCardSectionView: PanelCardView {
             row.addArrangedSubview(name)
             row.addArrangedSubview(PanelUI.spacer())
             // 日期用次要色，"过期"标签单独用橙色加粗，主次分明
-            let expiresText = rowModel.expires.hasSuffix(" 过期")
-                ? String(rowModel.expires.dropLast(3)) : rowModel.expires
+            let expiring = rowModel.expires.hasSuffix(" 过期")
+            let expiresText = expiring ? String(rowModel.expires.dropLast(3)) : rowModel.expires
             let dateLabel = PanelUI.label(expiresText, size: 11,
                 color: .secondaryLabelColor, wrapping: false, monospacedDigits: true)
             dateLabel.setContentHuggingPriority(.required, for: .horizontal)
             dateLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
             row.addArrangedSubview(dateLabel)
-            if rowModel.expires.hasSuffix(" 过期") {
+            if expiring {
                 let badge = PanelUI.label("过期", size: 10, weight: .medium,
                     color: PanelAccent.codex.color, wrapping: false)
                 badge.setContentHuggingPriority(.required, for: .horizontal)
@@ -2841,6 +2837,9 @@ private final class ToolPeriodButton: NSButton {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
+
+/// 面板预览／事件回归共用的子视图枚举（含自身）
+private func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
 
 final class UsagePanelController: NSObject, NSPopoverDelegate {
     var onCheckUpdate: (() -> Void)?
@@ -3137,14 +3136,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if !items.contains(where: { ($0.total ?? 0) > 0 }) {
             PanelUI.addFullWidth(PanelUI.label("该周期暂无可统计用量", size: 11, color: .secondaryLabelColor), to: root)
         }
+        // 每个工具用不同颜色，方便一眼区分占比
+        let toolColors: [NSColor] = [
+            PanelAccent.codex.color,
+            PanelAccent.external.color,
+            NSColor.systemTeal,
+            NSColor.systemPurple,
+        ]
         for (itemIndex, item) in items.enumerated() where (item.total ?? 0) > 0 || item.status == .failed {
-            // 每个工具用不同颜色，方便一眼区分占比
-            let toolColors: [NSColor] = [
-                PanelAccent.codex.color,
-                PanelAccent.external.color,
-                NSColor.systemTeal,
-                NSColor.systemPurple,
-            ]
             let barColor = toolColors[itemIndex % toolColors.count]
             let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
             let name = PanelUI.label(item.name, size: 11, wrapping: false); name.widthAnchor.constraint(equalToConstant: 76).isActive = true
@@ -3165,7 +3164,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         toolPeriod = sender.tag
         refreshPanelLayout()
         if restoreFocus {
-            func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
             if let button = descendants(stack).compactMap({ $0 as? ToolPeriodButton }).first(where: { $0.tag == toolPeriod }) {
                 button.window?.makeFirstResponder(button)
             }
@@ -3473,7 +3471,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     /// 七个业务模块均使用原生卡片，展开／折叠只改变卡片内容，不改变模块顺序。
     func verifyCardLayoutForPreview() -> Bool {
         stack.layoutSubtreeIfNeeded()
-        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         let cards = stack.arrangedSubviews.compactMap { $0 as? PanelCardView }
         let hasSectionSeparator = stack.arrangedSubviews.contains { ($0 as? NSBox)?.boxType == .separator }
         let dailyButtons = descendants(cards.count > 4 ? cards[4] : NSView()).compactMap { $0 as? PanelDisclosureButton }
@@ -3515,7 +3512,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     func scrollQuotaHistoryForPreview() {
-        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         if let view = descendants(stack).compactMap({ $0 as? QuotaCycleHistoryView }).first {
             var card: NSView? = view
             while card != nil && !(card is PanelCardView) { card = card?.superview }
@@ -3524,7 +3520,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     func verifyQuotaHistoryEventsForPreview() -> Bool {
-        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         guard let chart = descendants(stack).compactMap({ $0 as? QuotaCycleChart }).first,
               let window = chart.window, quotaHistoryUI.browser.records.count >= 13 else { return false }
         chart.scrollToVisible(chart.bounds); chart.updateTrackingAreas()
@@ -3585,7 +3580,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     /// 面板事件回归：核对模型行、工具周期和简析开合状态。
     func verifyTokenBucketInteractionsForPreview() -> Bool {
-        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         func rows() -> [TokenBucketRow] {
             descendants(stack).compactMap { $0 as? TokenBucketRow }.filter { $0.action == #selector(toggleCodexBucket(_:)) }.sorted { $0.tag < $1.tag }
         }
@@ -3646,7 +3640,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     func verifyChartInteractionsForPreview() -> Bool {
-        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         guard let chart = descendants(stack).compactMap({ $0 as? DailyUsageChart }).first,
               let window = chart.window else { return false }
         chart.scrollToVisible(chart.bounds)
@@ -3671,7 +3664,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     /// 固定假数据截图：显示指定日列的浮层并检查其不越界。
     func showChartHoverForPreview(index: Int) -> Bool {
-        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         guard (0..<30).contains(index), let chart = descendants(stack).compactMap({ $0 as? DailyUsageChart }).first,
               let window = chart.window else { return false }
         chart.scrollToVisible(chart.bounds)
@@ -3703,7 +3695,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
         var height = window.frame.height
         func rows() -> [TokenBucketRow] {
-            func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
             return descendants(stack).compactMap { $0 as? TokenBucketRow }.filter { $0.action == #selector(toggleCodexBucket(_:)) }.sorted { $0.tag < $1.tag }
         }
         func snapshot(_ name: String) {
@@ -4718,8 +4709,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func renderBar() {
         renderBarImage()
         guard !visualPreview else { return }
-        let fiveRemaining = Fmt.remaining(usage.fiveHour?.usedPercent)
-        let sevenRemaining = Fmt.remaining(usage.sevenDay?.usedPercent)
         let line1Label = fiveHourStale ? "⚠ 5H" : "5H"
         let line2Label = sevenDayStale ? "⚠ 7D" : "7D"
         let line1Value = Fmt.remainingPct(usage.fiveHour?.usedPercent)
@@ -4728,7 +4717,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             line1: usage.fiveHourNotApplicable ? "\(line2Label) \(line2Value)" : "\(line1Label) \(line1Value)",
             line2: usage.fiveHourNotApplicable ? "" : "\(line2Label) \(line2Value)"
         )
-        _ = fiveRemaining; _ = sevenRemaining // 保留供未来 writeStatus 直接使用
     }
 
     // 自诊断：把渲染内容写到本地，便于排查（绝不写任何凭证值）
@@ -5201,7 +5189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             let exec = Bundle.main.executablePath ?? ""
-            // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
+            // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不复活进程
             let plist = """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

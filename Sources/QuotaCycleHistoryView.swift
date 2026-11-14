@@ -70,10 +70,11 @@ final class QuotaCycleHistoryView: NSView {
         more.isHidden = state.browser.visibleLimit >= records.count
         let selected = state.hover ?? state.browser.selectedCycleID
         if let cycle = records.first(where: { $0.id == selected }) {
-            let lines = Self.detail(cycle, pending: snapshot.state.current?.id == cycle.id ? snapshot.state.pendingTransition : nil, now: now)
+            let pending = snapshot.state.current?.id == cycle.id ? snapshot.state.pendingTransition : nil
+            let lines = Self.detail(cycle, pending: pending, now: now)
             let status = !snapshot.isSaved ? "历史未保存 · " : (snapshot.isLoading ? "正在读取历史 · " : "")
             detail1.stringValue = status + lines.0
-            let fullDescription = status + Self.fullDescription(cycle, pending: snapshot.state.current?.id == cycle.id ? snapshot.state.pendingTransition : nil, now: now)
+            let fullDescription = status + Self.fullDescription(cycle, pending: pending, now: now)
             detail1.toolTip = fullDescription
             detail1.setAccessibilityHelp(fullDescription)
             chart.setAccessibilityValue(fullDescription)
@@ -96,12 +97,20 @@ final class QuotaCycleHistoryView: NSView {
         refresh()
     }
     @objc private func showMore() { state.browser.loadEarlier(); refresh() }
+    // 展示用 formatter 按格式缓存（Fmt 同款约定）：悬停与面板重建每轮调用十几次
+    private static var cachedFormatters: [String: DateFormatter] = [:]
+    private static func formatter(_ format: String) -> DateFormatter {
+        if let cached = cachedFormatters[format] { return cached }
+        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = format
+        cachedFormatters[format] = f
+        return f
+    }
     static func date(_ date: Date, format: String = "MM/dd HH:mm") -> String {
-        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = format; return f.string(from: date)
+        formatter(format).string(from: date)
     }
     static func detail(_ cycle: QuotaCycleRecord, pending: QuotaPendingTransition?, now: Date = Date()) -> (String, String) {
-        let used = String(format: "%.1f", cycle.lastObservedUsedPercent).replacingOccurrences(of: ".0", with: "")
-        let remaining = String(format: "%.1f", cycle.remainingAtLastObservation).replacingOccurrences(of: ".0", with: "")
+        let used = QuotaCycleChart.usedPercentage(cycle.lastObservedUsedPercent)
+        let remaining = QuotaCycleChart.usedPercentage(cycle.remainingAtLastObservation)
         let start = cycle.startKind == .afterPlanChange ? "开始未知(首观" + date(cycle.firstObservedAt, format: "MM/dd") + ")" : (cycle.inferredStartAt.map { "推算" + date($0, format: "MM/dd") } ?? "首次观测" + date(cycle.firstObservedAt, format: "MM/dd"))
         let ending: String
         if cycle.end == nil {
@@ -113,18 +122,18 @@ final class QuotaCycleHistoryView: NSView {
             ending = "结束未知"
         }
         let span = start + "–" + ending
-        if let pending = pending { return (span + " · " + (pending.reason == .planChange ? "套餐/额度变更待确认" : "重置待确认"), "最后观测已用 \(used)%") }
+        if let pending = pending { return (span + " · " + (pending.reason == .planChange ? "套餐/额度变更待确认" : "重置待确认"), "最后观测已用 \(used)") }
         switch cycle.end {
-        case .natural: return (span + " · 正常到期", "最后观测已用 \(used)% · 到期未用约 \(remaining)%")
-        case .redeemed: return (span + " · 主动用卡", "最后观测已用 \(used)% · 重置前剩余约 \(remaining)%")
-        case .earlyUnknown: return (span + " · 提前重置（来源未知）", "最后观测已用 \(used)% · 重置前剩余约 \(remaining)%")
-        case .gap: return (span + " · 观测缺口", "最后观测已用 \(used)%")
-        case .unconfirmed: return (span + " · 套餐/额度变更", "最后观测已用 \(used)%")
+        case .natural: return (span + " · 正常到期", "最后观测已用 \(used) · 到期未用约 \(remaining)")
+        case .redeemed: return (span + " · 主动用卡", "最后观测已用 \(used) · 重置前剩余约 \(remaining)")
+        case .earlyUnknown: return (span + " · 提前重置（来源未知）", "最后观测已用 \(used) · 重置前剩余约 \(remaining)")
+        case .gap: return (span + " · 观测缺口", "最后观测已用 \(used)")
+        case .unconfirmed: return (span + " · 套餐/额度变更", "最后观测已用 \(used)")
         case nil:
             let origin = cycle.startKind == .afterPlanChange ? "套餐/额度变更后，开始未知" : (cycle.startKind == .afterGap ? "缺口后首次观测" : "进行中")
             let expired = cycle.expectedResetAt < now
             let status = expired ? (cycle.startKind == .afterPlanChange ? "套餐变更后 · 等待重置确认" : "等待重置确认") : origin
-            return (span + " · " + status, expired ? "最后观测已用 \(used)% · 剩余 \(remaining)%" : "已用 \(used)% · 当前剩余 \(remaining)%")
+            return (span + " · " + status, expired ? "最后观测已用 \(used) · 剩余 \(remaining)" : "已用 \(used) · 当前剩余 \(remaining)")
         }
     }
     static func fullDescription(_ cycle: QuotaCycleRecord, pending: QuotaPendingTransition?, now: Date) -> String {
@@ -173,8 +182,9 @@ final class QuotaCycleChart: NSView {
         addTrackingArea(NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect], owner: self))
     }
     private func cycle(at event: NSEvent) -> QuotaCycleRecord? {
-        let x = convert(event.locationInWindow, from: nil).x
-        guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return nil }
+        let location = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(location) else { return nil }
+        let x = location.x
         let visible = state.browser.visible, width = max(1, (bounds.width - 22) / 6)
         let index = Int(floor((x - 22) / width)) - (6 - visible.count)
         return index >= 0 && index < visible.count ? visible[index] : nil

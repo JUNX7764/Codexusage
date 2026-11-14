@@ -5,7 +5,7 @@
 - CodexUsage 是 macOS 13+、universal 双架构（Apple Silicon + Intel）的原生 AppKit 菜单栏应用；主源码为 `CodexUsage.swift`，以 top-level 代码启动，不使用 Swift Package。拆分源码时需保留符合 Swift 多文件编译规则的入口，并同步调整 `build.sh`。
 - `Sources/QuotaCycleHistory*.swift`、`QuotaCycleStore.swift` 和 `QuotaCycleCoordinator.swift` 分别负责轮次模型、图表、存储与协调。主文件包含凭据读取/续期、额度与重置卡网络请求、Codex 和外部工具用量扫描、更新控制器、Popover UI 及离线自检。`vendor/zstd_bridge.c` 引入内置 zstd 解码，`Info.plist` 定义 Bundle 身份与菜单栏常驻属性。
 - 用户说明以 `README.md` 为入口；构建、自检和权限经验见 `docs/DEVELOPMENT.md`，当前架构、维护与发布约定见 `docs/project/`。`PLAN.md`、`VISUAL_OPTIMIZATION_PLAN.md` 和 `docs/features/` 为历史记录，判断当前行为时须核对源码与测试。
-- 主体按「用量进度 → 重置卡 → Tibo → 用量情况 → 用量简析 → 额度周期回顾 → 工具明细」排列，七个板块各自使用独立原生卡片；卡片间距与内边距均为 8pt，保留现有原生字体层级，不额外压缩行高。统计板块之间不再添加分隔线，页头／页脚分隔线沿用原样式；基础视觉约定见 `docs/project/11-usage-insights-prd.md`，周期口径见 `docs/project/17-quota-cycle-history.md`。
+- 主体按「用量进度 → 重置卡 → Tibo → 用量情况 → 用量简析 → 额度周期回顾 → 工具明细」排列，七个板块各自使用独立原生卡片；卡片间距与内边距均为 8pt，保留现有原生字体层级，不额外压缩行高。统计板块之间不添加分隔线，页头／页脚分隔线沿用原样式；基础视觉约定见 `docs/project/11-usage-insights-prd.md`，周期口径见 `docs/project/17-quota-cycle-history.md`。
 
 ## 构建与验证
 
