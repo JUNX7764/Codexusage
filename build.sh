@@ -46,7 +46,7 @@ echo "== 编译 Swift 源码（universal: arm64 + x86_64）=="
 cp "$DIR/CodexUsage.swift" "$BUILD_TEMP/main.swift"
 for ARCH in arm64 x86_64; do
     swiftc -O -target ${ARCH}-apple-macos13.0 -import-objc-header "$DIR/vendor/zstd_bridge.h" \
-        -o "$BUILD_TEMP/CodexUsage-${ARCH}" "$BUILD_TEMP/main.swift" "$DIR/Sources/OfficialUsage.swift" "$DIR/Sources/DailyUsageView.swift" "$DIR/Sources/UsageAttribution.swift" "$DIR/Sources/UsageComparison.swift" "$DIR/Sources/QuotaCycleHistory.swift" "$DIR/Sources/QuotaCycleStore.swift" "$DIR/Sources/QuotaCycleCoordinator.swift" "$DIR/Sources/QuotaCycleHistoryView.swift" "$BUILD_TEMP/zstd_${ARCH}.o"
+        -o "$BUILD_TEMP/CodexUsage-${ARCH}" "$BUILD_TEMP/main.swift" "$DIR/Sources/OfficialUsage.swift" "$DIR/Sources/DailyUsageView.swift" "$DIR/Sources/UsageAttribution.swift" "$DIR/Sources/UsageComparison.swift" "$DIR/Sources/QuotaCycleHistory.swift" "$DIR/Sources/QuotaCycleStore.swift" "$DIR/Sources/QuotaCycleCoordinator.swift" "$DIR/Sources/QuotaCycleHistoryView.swift" "$DIR/Sources/PanelVisuals.swift" "$DIR/Sources/DeltaChip.swift" "$DIR/Sources/AnimatedTokenValue.swift" "$DIR/Sources/PanelCustomization.swift" "$BUILD_TEMP/zstd_${ARCH}.o"
 done
 lipo -create -output "$DIR/CodexUsage-bin" \
     "$BUILD_TEMP/CodexUsage-arm64" "$BUILD_TEMP/CodexUsage-x86_64"

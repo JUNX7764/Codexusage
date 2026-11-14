@@ -90,6 +90,8 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 | `Sources/OfficialUsage.swift` | 账号用量只读请求、账号快照校验和严格解析 |
 | `Sources/DailyUsageView.swift` | 日期图表、悬停／键盘查看和工具占比条 |
 | `Sources/QuotaCycleHistory.swift` / `QuotaCycleStore.swift` / `QuotaCycleCoordinator.swift` / `QuotaCycleHistoryView.swift` | 额度轮次状态机、隔离存储、异步协调与原生图表 |
+| `Sources/PanelVisuals.swift` / `DeltaChip.swift` / `AnimatedTokenValue.swift` | 柱形与额度槽几何、环比胶囊、每日数值过渡的纯状态 |
+| `Sources/PanelCustomization.swift` | 卡片布局模型（显隐/顺序，JSON 持久化）与原位卡片设置页 |
 | `Sources/UsageAttribution.swift` / `UsageComparison.swift` | 来源归属及比较计算 |
 | `vendor/zstddeclib.c` | 上游 zstd v1.5.7 单文件解码源，许可见 `vendor/zstd-LICENSE` |
 | `vendor/zstd_bridge.c` / `.h` | zstd 解码的 C 桥接层 |
@@ -99,6 +101,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 | `scripts/update.sh` | 从 Release 下载、校验、暂存、替换并重启应用 |
 | `scripts/release.sh` | 创建标签、构建、自检、打包并创建或补全 GitHub Release |
 | `tests/script_test.py` | 更新、发布和签名故障的离线回归测试 |
+| `tests/ui_refinements_test.py` | 面板视觉原语、数值过渡与卡片布局模型的离线 fixture 回归 |
 | `PLAN.md` | 历史任务书，不作为当前规格 |
 
 ## 用量与更新的校验边界
@@ -110,6 +113,8 @@ Codex 会话按 `token_count` 事件的本地日期统计，累计值按同一�
 构建时在专属临时目录生成合法 `main.swift` 并编译 `Sources/`；真实只读能力可通过 `--official-usage-check` 检查，该命令联网，只输出成功或失败类别及日／周比较是否可计算的布尔值，不输出日期、账号或个人用量。
 
 额度周期历史只消费现有 7d 请求中本次有效的数据，以稳定账户身份派生哈希分区；缺少稳定身份时不落盘。首次周期开始时间是推算，提前重置来源未确认，跨观测缺口不补造轮次。重置卡 `already_redeemed` 仅确认原请求，单独出现时即使携带原请求时间也不独立生成边界；已有同操作的 `reset` 证据不会被覆盖。面板内每屏显示 6 轮，初始浏览最近 12 轮，可继续加载更早轮次；预览不创建真实历史仓库。
+
+面板卡片设置只作用于七张业务卡片的显隐与纵向顺序，改动即时写入本机偏好；「隐藏」不同于折叠，隐藏的卡片仍照常获取数据，页头、页脚、更新提示与凭据恢复区不参与排序。预览与离线回归使用默认布局基线，不读取也不写入生产偏好（截图可用 `--visual-preview-hide-cards=` 注入）。
 
 更新脚本接收已确认的 Release 标签和正在运行的应用路径，校验包身份、构建版本和实际安装版本后仅处理目标进程。离线脚本测试使用临时应用、伪造进程和网络命令，**不能替代真实安装环境中的更新、回滚和面板点击验收**。
 
