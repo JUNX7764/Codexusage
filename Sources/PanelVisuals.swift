@@ -36,7 +36,7 @@ enum PanelVisuals {
     /// column 为该轮可用绘图区（周期图是翻转视图，填充锚定在视觉底部，即 maxY 一侧）。
     /// 0% 不画绿色（不伪造最小面积），100% 填满，非有限值同样不画。
     static func capacityTrack(in column: NSRect, usedPercent: Double) -> (track: NSRect, fill: NSRect?) {
-        let width = min(CGFloat(12), max(0, column.width - 4))
+        let width = min(12, max(0, column.width - 4))
         let track = NSRect(x: column.midX - width / 2, y: column.minY, width: width, height: column.height)
         guard usedPercent.isFinite, usedPercent > 0, !track.isEmpty else { return (track, nil) }
         let fraction = CGFloat(min(100, max(0, usedPercent)) / 100)

@@ -106,7 +106,7 @@ private final class ChartHoverLabel: NSView {
         if transition.isAnimating, let start = transition.display {
             valueWidth = max(valueWidth, size(of: Fmt.tokensAbbr(start) + " Token", font: valueFont).width)
         }
-        let valueHeight = size(of: finalText.isEmpty ? " " : finalText, font: valueFont).height
+        let valueHeight = size(of: finalText, font: valueFont).height
         frame.size = NSSize(width: ceil(max(dateSize.width, valueWidth)) + horizontalInset * 2,
                             height: ceil(dateSize.height + valueHeight + lineSpacing) + verticalInset * 2)
     }
@@ -225,22 +225,22 @@ final class DailyUsageChart: NSView {
             return
         }
         let day = days[index]
-        let value: String
         let hoverValue: ChartHoverLabel.Value
         switch day.1 {
         case .reported(let amount):
-            let suffix = day.0 == todayKey ? " Token（今日未结束）" : " Token"
-            value = Fmt.tokensAbbr(amount) + suffix
-            hoverValue = .amount(amount, suffix: suffix)
+            hoverValue = .amount(amount, suffix: day.0 == todayKey ? " Token（今日未结束）" : " Token")
         case .scanned(let amount):
-            value = Fmt.tokensAbbr(amount) + " Token（今日未结束）"
             hoverValue = .amount(amount, suffix: " Token（今日未结束）")
         case .inferredZero:
-            value = "0 Token（无活动记录）"
             hoverValue = .amount(0, suffix: " Token（无活动记录）")
         case .missing:
-            value = "暂无数据"
             hoverValue = .text("暂无数据")
+        }
+        // 辅功能值与气泡终值同串：值文本从 hoverValue 派生，避免同一后缀字面量写两遍。
+        let value: String
+        switch hoverValue {
+        case .amount(let amount, let suffix): value = Fmt.tokensAbbr(amount) + suffix
+        case .text(let text): value = text
         }
         // 辅功能值始终是目标准确值；气泡文字按显示规则做 320ms 过渡。
         hover.setText(date: day.0, value: hoverValue, animated: true)
