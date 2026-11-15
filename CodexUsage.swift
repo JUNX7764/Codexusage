@@ -863,6 +863,71 @@ struct ModelTokenUsage {
     var total = 0.0
 }
 
+/// 模型响应 / 缓存命中卡的逐请求统计（token_usage_record 管线，与累计差分管线完全独立）。
+/// 字段与 FileEntry.recordDaysByModel 的扁平 14 值布局一一对应：
+/// requests, sumDur, sumOut, sumIn, sumCached, sumCacheWrite, hist[8]。
+/// 口径（docs/plans/2026-11-15-model-response-cache-cards.md「口径定义」）：
+/// usage 是逐请求终值，绝不求和 turn_token_usage/thread_token_usage 等累计值。
+struct ModelRunStats: Equatable {
+    var requests = 0.0
+    var sumDuration = 0.0
+    var sumOutput = 0.0
+    var sumInput = 0.0
+    var sumCached = 0.0
+    var sumCacheWrite = 0.0
+    var histogram = [Double](repeating: 0, count: 8)
+
+    /// 耗时直方图桶上界（秒）；dur ≤ 0 与 > 900 的记录在入桶前已被守卫剔除
+    static let bucketUpperSeconds: [Double] = [1, 2, 4, 8, 16, 32, 64, 900]
+
+    /// 加权 tok/s = SUM(output_tokens) / SUM(dur)（分母秒），按模型分组汇总口径；
+    /// 无耗时证据（如整文件回退记录）→ nil（UI 显 —）
+    var weightedTps: Double? {
+        sumDuration > 0 ? sumOutput / sumDuration : nil
+    }
+
+    /// 中位耗时：8 桶直方图累积插值——累积计数跨过 n/2 的桶内按计数占比线性插值
+    var medianSeconds: Double? {
+        guard requests > 0 else { return nil }
+        let target = requests / 2
+        var cumulative = 0.0
+        var lower = 0.0
+        for (index, count) in histogram.enumerated() {
+            if cumulative + count >= target {
+                guard count > 0 else { return lower }
+                return lower + (target - cumulative) / count * (Self.bucketUpperSeconds[index] - lower)
+            }
+            cumulative += count
+            lower = Self.bucketUpperSeconds[index]
+        }
+        return nil   // 直方图无质量：无耗时证据（回退记录）
+    }
+
+    /// 缓存证据：窗口内存在 cached > 0 或 cache_write > 0 的记录；
+    /// 无证据 → 命中率 nil（区分「没有缓存数据」与「0% 命中」）
+    var hasCacheEvidence: Bool { sumCached > 0 || sumCacheWrite > 0 }
+
+    /// 命中率 = SUM(cached_input_tokens) / SUM(input_tokens)（input 为含缓存总输入）
+    var cacheHitRate: Double? {
+        hasCacheEvidence && sumInput > 0 ? sumCached / sumInput : nil
+    }
+
+    /// 周期汇总（跨模型合计）：响应卡/缓存卡的 bucket 行与 --once 摘要共用
+    static func combine(_ runs: [String: ModelRunStats]) -> ModelRunStats {
+        var result = ModelRunStats()
+        for stats in runs.values {
+            result.requests += stats.requests
+            result.sumDuration += stats.sumDuration
+            result.sumOutput += stats.sumOutput
+            result.sumInput += stats.sumInput
+            result.sumCached += stats.sumCached
+            result.sumCacheWrite += stats.sumCacheWrite
+            for i in 0..<8 { result.histogram[i] += stats.histogram[i] }
+        }
+        return result
+    }
+}
+
 enum TokenScanner {
     struct FileEntry: Codable {
         var size: Int64 = 0
@@ -872,9 +937,19 @@ enum TokenScanner {
         var currentModel: String?
         var days: [String: [Double]] = [:]
         var daysByModel: [String: [String: [Double]]] = [:]
+        // v4：token_usage_record 双统计管线（与上方累计差分完全独立，绝不混算）。
+        // turnStartTs/boundaryTs/usageSource 持久化保证 append 增量恢复正确；
+        // recordDaysByModel: day → model → 14 值（requests, sumDur, sumOut, sumIn,
+        // sumCached, sumCacheWrite, hist[8]），随 days 一起按 cutoff30 修剪。
+        var turnStartTs: Double?
+        var boundaryTs: Double?
+        // 0=未定；1=record 源；2=整文件零 record 时回退 token_count.info.last_token_usage（先到先得）
+        var usageSource: Int = 0
+        var recordDaysByModel: [String: [String: [Double]]] = [:]
     }
     // Model dimensions require one rebuild; aggregate totals keep the original accounting rules.
-    struct State: Codable { var version: Int = 3; var files: [String: FileEntry] = [:] }
+    // v4：新增 recordDaysByModel 等 14 值布局字段；旧 v3 状态作废整体重扫（代价秒级）。
+    struct State: Codable { var version: Int = 4; var files: [String: FileEntry] = [:] }
     struct Result {
         var today = Stats()
         var seven = Stats()
@@ -887,6 +962,7 @@ enum TokenScanner {
         var total = 0.0
         var files = 0
         var models: [String: ModelTokenUsage] = [:]
+        var runs: [String: ModelRunStats] = [:]   // 模型响应/缓存命中卡（token_usage_record 管线）
     }
 
     static let sessionsRoot = NSHomeDirectory() + "/.codex/sessions"
@@ -939,6 +1015,9 @@ enum TokenScanner {
                         && entry.daysByModel.values.allSatisfy { models in
                             models.values.allSatisfy { $0.count == 3 }
                         }
+                        && entry.recordDaysByModel.values.allSatisfy { models in
+                            models.values.allSatisfy { $0.count == 14 }
+                        }
                         && (compressed || entry.offset <= UInt64(max(0, entry.size)))
                 } ?? true
                 if !valid { st.files.removeValue(forKey: path) }
@@ -950,25 +1029,111 @@ enum TokenScanner {
                 var entry = old ?? FileEntry()
                 let append = !compressed && old != nil && Int64(size) > entry.size
                 if !append { entry = FileEntry() }
+                // 逐行预筛（needle 只做粗筛，分支内严格校验 type + payload.type）：
+                // v4 新增 token_usage_record / call_output（同时覆盖 custom/function 两种
+                // tool_call_output）/ task_started——record 行不含 "total_token_usage" 子串，
+                // 不加 needle 会被整类静默跳过（数据事实 2026-11-15）
                 let needle = Data("\"total_token_usage\"".utf8)
                 let contextNeedle = Data("\"turn_context\"".utf8)
+                let recordNeedle = Data("\"token_usage_record\"".utf8)
+                // call_output 不带引号：custom_tool_call_output / function_call_output 的
+                // 值内部不含 "call_output" 字面（前置是 `_`），裸子串才能同时覆盖两种
+                let callOutputNeedle = Data("call_output".utf8)
+                let taskStartNeedle = Data("\"task_started\"".utf8)
                 var pending = Data()
                 var consumed: UInt64 = 0
+                // v4 record 管线的逐文件暂存：与 token_count 差分完全独立
+                var sawRecord = false
+                var fallback: (input: Double, cached: Double, write: Double,
+                               output: Double, day: String, model: String)?
                 func parseLine(_ line: Data) {
-                    guard line.range(of: needle) != nil || line.range(of: contextNeedle) != nil,
+                    guard line.range(of: needle) != nil || line.range(of: contextNeedle) != nil
+                        || line.range(of: recordNeedle) != nil || line.range(of: callOutputNeedle) != nil
+                        || line.range(of: taskStartNeedle) != nil,
                           let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                           let payload = obj["payload"] as? [String: Any] else { return }
-                    if obj["type"] as? String == "turn_context" {
+                    let type = obj["type"] as? String
+                    let payloadType = payload["type"] as? String
+                    if type == "turn_context" {
                         if let model = (payload["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                            !model.isEmpty {
                             entry.currentModel = model
                         }
                         return
                     }
-                    guard obj["type"] as? String == "event_msg",
-                          payload["type"] as? String == "token_count",
-                          let info = payload["info"] as? [String: Any],
-                          let usage = info["total_token_usage"] as? [String: Any],
+                    // 请求起点：turn 内首请求取 task_started；跨 turn 边界不串（task_started 重置两者）
+                    if type == "event_msg", payloadType == "task_started" {
+                        if let ts = Fmt.parseDateValue(obj["timestamp"])?.timeIntervalSince1970 {
+                            entry.turnStartTs = ts
+                            entry.boundaryTs = ts
+                        }
+                        return
+                    }
+                    // 后续请求起点取最近一次 tool_call_output；早于 turn 起点的注入输出
+                    //（environment_context 类）不推边界
+                    if type == "response_item",
+                       payloadType == "custom_tool_call_output" || payloadType == "function_call_output" {
+                        if let ts = Fmt.parseDateValue(obj["timestamp"])?.timeIntervalSince1970,
+                           let start = entry.turnStartTs, ts >= start {
+                            entry.boundaryTs = ts
+                        }
+                        return
+                    }
+                    if type == "token_usage_record" {
+                        // usageSource==2：整文件已由 last_token_usage 回退取得所有权（先到先得），
+                        // 不混入 record 防双计；record 源文件（0/1）正常写入
+                        guard entry.usageSource != 2,
+                              let usage = payload["usage"] as? [String: Any],
+                              let date = Fmt.parseDateValue(obj["timestamp"]) else { return }
+                        sawRecord = true
+                        let ts = date.timeIntervalSince1970
+                        // 端到端耗时 = record 时刻 − max(最近边界, turn 起点)；无任何边界 → dur 0 被守卫剔除
+                        var startCandidate = entry.boundaryTs
+                        if let turnStart = entry.turnStartTs {
+                            startCandidate = max(startCandidate ?? turnStart, turnStart)
+                        }
+                        let dur = ts - (startCandidate ?? ts)
+                        let input = CodexNumber.finite(usage["input_tokens"]) ?? 0
+                        let output = CodexNumber.finite(usage["output_tokens"]) ?? 0
+                        let cached = CodexNumber.finite(usage["cached_input_tokens"]) ?? 0
+                        let write = CodexNumber.finite(usage["cache_write_input_tokens"]) ?? 0
+                        // 无效记录整条剔除（timing 与缓存都不进）：dur ≤ 0、dur > 900s（挂起/休眠污染）、input ≤ 0
+                        if dur > 0, dur <= 900, input > 0 {
+                            let dayKey = dayFmt.string(from: date)   // 事件本地日；时间戳已解析成功
+                            let model = entry.currentModel ?? "未知模型"
+                            var models = entry.recordDaysByModel[dayKey] ?? [:]
+                            var bucket = models[model] ?? [Double](repeating: 0, count: 14)
+                            bucket[0] += 1
+                            bucket[1] += dur
+                            bucket[2] += output
+                            bucket[3] += input
+                            bucket[4] += cached
+                            bucket[5] += write
+                            if let index = ModelRunStats.bucketUpperSeconds.firstIndex(where: { dur <= $0 }) {
+                                bucket[6 + index] += 1
+                            }
+                            models[model] = bucket
+                            entry.recordDaysByModel[dayKey] = models
+                        }
+                        // 处理完置回退起点：连续无工具 record 的下一请求从上一 record 时刻起算
+                        entry.boundaryTs = ts
+                        return
+                    }
+                    guard type == "event_msg",
+                          payloadType == "token_count",
+                          let info = payload["info"] as? [String: Any] else { return }
+                    // v4 回退候选：info.last_token_usage（逐请求口径，含 cached 字段）。
+                    // 纯增量采集，不改下方差分语义；仅整文件零 record 时在文件级提交一次
+                    if let last = info["last_token_usage"] as? [String: Any],
+                       let lastInput = CodexNumber.finite(last["input_tokens"]), lastInput > 0 {
+                        fallback = (lastInput,
+                                    CodexNumber.finite(last["cached_input_tokens"]) ?? 0,
+                                    CodexNumber.finite(last["cache_write_input_tokens"]) ?? 0,
+                                    CodexNumber.finite(last["output_tokens"]) ?? 0,
+                                    Fmt.parseDateValue(obj["timestamp"]).map { dayFmt.string(from: $0) } ?? fallbackDay,
+                                    entry.currentModel ?? "未知模型")
+                    }
+                    guard let usage = info["total_token_usage"] as? [String: Any],
                           let input = CodexNumber.finite(usage["input_tokens"]), input >= 0,
                           let output = CodexNumber.finite(usage["output_tokens"]), output >= 0,
                           let total = CodexNumber.finite(usage["total_tokens"]), total >= 0 else { return }
@@ -1014,8 +1179,29 @@ enum TokenScanner {
                 // Pending bytes are intentionally reread when the writer finishes that line.
                 entry.offset += consumed
                 entry.size = Int64(size); entry.mtime = mtime
+                // v4 统计源声明（先到先得）：文件内出现过 record → record 源；
+                // 整文件零 record 且存在 last_token_usage 候选才整文件级回退一份
+                //（旧格式只有累计 total 的贡献为 0；回退记录无耗时证据 → tok/s 与中位 —）
+                if entry.usageSource == 0 {
+                    if sawRecord {
+                        entry.usageSource = 1
+                    } else if let fb = fallback {
+                        var models = entry.recordDaysByModel[fb.day] ?? [:]
+                        var bucket = models[fb.model] ?? [Double](repeating: 0, count: 14)
+                        bucket[0] += 1
+                        bucket[2] += fb.output
+                        bucket[3] += fb.input
+                        bucket[4] += fb.cached
+                        bucket[5] += fb.write
+                        // sumDur 与 histogram 保持 0：无耗时证据
+                        models[fb.model] = bucket
+                        entry.recordDaysByModel[fb.day] = models
+                        entry.usageSource = 2
+                    }
+                }
                 entry.days = entry.days.filter { $0.key >= cutoff30 }
                 entry.daysByModel = entry.daysByModel.filter { $0.key >= cutoff30 }
+                entry.recordDaysByModel = entry.recordDaysByModel.filter { $0.key >= cutoff30 }
                 st.files[path] = entry
             }
         }
@@ -1045,6 +1231,14 @@ enum TokenScanner {
                     if day >= cutoff30 { addModel(&r.thirty.models, name: model, values: values) }
                 }
             }
+            // v4 双统计：镜像 daysByModel 的窗口口径聚合 record 管线，绝不与累计差分混算
+            for (day, models) in e.recordDaysByModel where day <= todayKey {
+                for (model, values) in models {
+                    if day == todayKey { addRun(&r.today.runs, name: model, values: values) }
+                    if day >= cutoff7 { addRun(&r.seven.runs, name: model, values: values) }
+                    if day >= cutoff30 { addRun(&r.thirty.runs, name: model, values: values) }
+                }
+            }
         }
         return r
     }
@@ -1065,6 +1259,20 @@ enum TokenScanner {
         var stats = models[name] ?? ModelTokenUsage()
         stats.input += values[0]; stats.output += values[1]; stats.total += values[2]
         models[name] = stats
+    }
+
+    /// record 管线窗口聚合：14 值布局 → ModelRunStats（requests>0 才计入）
+    private static func addRun(_ runs: inout [String: ModelRunStats], name: String, values: [Double]) {
+        guard values.count == 14, values[0] > 0 else { return }
+        var stats = runs[name] ?? ModelRunStats()
+        stats.requests += values[0]
+        stats.sumDuration += values[1]
+        stats.sumOutput += values[2]
+        stats.sumInput += values[3]
+        stats.sumCached += values[4]
+        stats.sumCacheWrite += values[5]
+        for i in 0..<8 { stats.histogram[i] += values[6 + i] }
+        runs[name] = stats
     }
 
     /// 解压 .jsonl.zst 全量到内存后逐行处理；任何失败返回 nil，
@@ -1106,8 +1314,9 @@ enum TokenScanner {
 
     private static func loadState(at path: String) -> State {
         if path == defaultStatePath, let s = cache { return s }
+        // v3 及更旧状态直接作废（整体重扫），不尝试迁移：record 管线字段必须全量重建
         if let data = FileManager.default.contents(atPath: path),
-           let s = try? JSONDecoder().decode(State.self, from: data), s.version == 3 {
+           let s = try? JSONDecoder().decode(State.self, from: data), s.version == 4 {
             return s
         }
         return State()
@@ -1757,6 +1966,24 @@ enum Fmt {
         if v >= 10_000 { return trim(v / 1_000, 1) + "K" }
         return String(format: "%.0f", v)
     }
+
+    // MARK: 模型响应 / 缓存命中卡数值格式化（无证据显 —，空周期由调用方给 --）
+    /// 加权 tok/s：整数；无耗时证据 → —
+    static func runTps(_ s: ModelRunStats) -> String {
+        s.weightedTps.map { String(format: "%.0f", $0) } ?? "—"
+    }
+    /// 中位耗时：一位小数秒（5.3s）；直方图无质量 → —
+    static func runMedian(_ s: ModelRunStats) -> String {
+        s.medianSeconds.map { String(format: "%.1fs", $0) } ?? "—"
+    }
+    /// 命中率：整数百分比（96%）；无缓存证据 → —
+    static func runHitRate(_ s: ModelRunStats) -> String {
+        s.cacheHitRate.map { String(format: "%.0f%%", $0 * 100) } ?? "—"
+    }
+    /// 请求数 = 有效记录数（整数）
+    static func runRequests(_ s: ModelRunStats) -> String {
+        String(Int(s.requests))
+    }
     private static func trim(_ x: Double, _ digits: Int) -> String {
         var s = String(format: "%.\(digits)f", x)
         while s.hasSuffix("0") { s.removeLast() }
@@ -2197,7 +2424,15 @@ struct UsagePanelModel {
         var accent: PanelAccent
         var buckets: [TokenBucket]
         var notices: [Notice]
+        // 列标题通道：nil = 既有默认 ["周期","总量","输入","输出"]（既有卡零视觉变化）；
+        // 模型响应卡 ["周期","tok/s","耗时","请求"]、缓存命中卡 ["周期","命中","输入","请求"]
+        var columnTitles: [String]? = nil
+        // 卡头「口径说明」浮窗文案：nil = 无图标（当前仅模型响应卡）；浮窗由控制器持有并跨 10s 重建重锚定。
+        var note: String? = nil
     }
+
+    /// 「模型响应」卡头图标点击后的口径说明浮窗文案（用户定稿 2026-11-15）。
+    static let responseMetricNote = "统计口径：耗时与 tok/s 均为端到端口径（含 Prefill、首字及网络等待），非纯生成速度"
 
     var updateItem: NSMenuItem?
     var title: String
@@ -2207,6 +2442,8 @@ struct UsagePanelModel {
     var resetCards: ResetSection?
     var tibo: TiboSection?
     var codexTokens: TokenSection
+    var responseSection: TokenSection
+    var cacheSection: TokenSection
     var official: OfficialUsageSnapshot?
     var officialError: String?
     var quotaHistory: QuotaCycleSnapshot
@@ -2232,7 +2469,7 @@ enum TokenModelList {
 }
 
 enum PanelAccent {
-    case codex, external
+    case codex, external, response, cache
 
     private static func rgb(_ hex: UInt32) -> NSColor {
         NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255,
@@ -2247,6 +2484,10 @@ enum PanelAccent {
             switch self {
             case .codex: return RemainingColorTier.orange.color(for: appearance)
             case .external: return Self.rgb(dark ? 0x86BDE8 : 0x2B6F9E)
+            // 模型响应（柔青）/ 缓存命中（柔金）：取自既有柔彩色板家族，深浅色双态
+            // dynamic provider 与 .external 同款实现模式；纯色不渐变
+            case .response: return Self.rgb(dark ? 0x8FD0C4 : 0x2F7D6D)
+            case .cache: return Self.rgb(dark ? 0xE0C284 : 0x997B2F)
             }
         }
     }
@@ -2255,6 +2496,8 @@ enum PanelAccent {
         switch self {
         case .codex: return "square.stack.3d.up.fill"
         case .external: return "square.stack.3d.up"
+        case .response: return PanelVisuals.responseSymbol
+        case .cache: return PanelVisuals.cacheSymbol
         }
     }
 }
@@ -2819,7 +3062,7 @@ private final class PanelDisclosureButton: NSButton {
 private enum PanelSectionHeading {
     static func make(title: String, symbol: String, color: NSColor, expanded: Bool,
                      target: AnyObject, action: Selector, accessory: NSView? = nil,
-                     toolTip: String? = nil) -> NSStackView {
+                     inlineAccessory: NSView? = nil, toolTip: String? = nil) -> NSStackView {
         let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
         row.heightAnchor.constraint(equalToConstant: 24).isActive = true
         let iconBox = NSView()
@@ -2841,6 +3084,9 @@ private enum PanelSectionHeading {
         let accessibility = "\(expanded ? "收起" : "展开")\(title)"
         label.setAccessibilityLabel(accessibility)
         row.addArrangedSubview(label)
+        // 内联 accessory：紧跟标题文字之后（spacer 之前），用于「模型响应」的口径说明图标跟随；
+        // 与最右侧 accessory（spacer 之后、chevron 之前）并存，默认 nil 不影响既有卡头。
+        if let inlineAccessory = inlineAccessory { row.addArrangedSubview(inlineAccessory) }
         row.addArrangedSubview(PanelUI.spacer())
         if let accessory = accessory { row.addArrangedSubview(accessory) }
         let baseImage = NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil)!
@@ -2858,19 +3104,24 @@ private enum PanelSectionHeading {
 
 private final class ToolPeriodButton: NSButton {
     private let selectedPeriod: Bool
+    private let accent: PanelAccent
     private var hovered = false { didSet { needsDisplay = true } }
     override var acceptsFirstResponder: Bool { true }
     override var wantsUpdateLayer: Bool { true }
-    init(title: String, index: Int, selected: Bool, target: AnyObject, action: Selector) {
+    // accent/context 可参数化：工具明细保持默认（codex 橙 + 「工具明细」前缀），
+    // 「模型响应」「缓存命中」卡头 chips 按本卡 accent 柔彩底（GlmUsage 同款筛选视觉）。
+    init(title: String, index: Int, selected: Bool, target: AnyObject, action: Selector,
+         accent: PanelAccent = .codex, context: String = "工具明细") {
         selectedPeriod = selected
+        self.accent = accent
         super.init(frame: .zero)
         self.title = title; tag = index; self.target = target; self.action = action
         isBordered = false; wantsLayer = true; layer?.cornerRadius = 5
         translatesAutoresizingMaskIntoConstraints = false
         font = .systemFont(ofSize: 10, weight: selected ? .semibold : .regular)
-        contentTintColor = selected ? PanelAccent.codex.color : .secondaryLabelColor
+        contentTintColor = selected ? accent.color : .secondaryLabelColor
         setAccessibilityRole(.radioButton)
-        setAccessibilityLabel("工具明细，\(title)")
+        setAccessibilityLabel("\(context)，\(title)")
         setAccessibilityValue(selected ? 1 : 0)
         widthAnchor.constraint(equalToConstant: index == 2 ? 42 : 37).isActive = true
         heightAnchor.constraint(equalToConstant: 24).isActive = true
@@ -2878,7 +3129,7 @@ private final class ToolPeriodButton: NSButton {
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             if selectedPeriod {
-                layer?.backgroundColor = PanelAccent.codex.color.withAlphaComponent(0.14).cgColor
+                layer?.backgroundColor = accent.color.withAlphaComponent(0.14).cgColor
             } else if hovered {
                 layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
             } else {
@@ -2913,11 +3164,17 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var codexExpanded = true
     private var externalExpanded = false
     private var dailyExpanded = true
+    private var responseExpanded = true
+    private var cacheExpanded = true
     private let quotaHistoryUI = QuotaCycleUIState()
     private var quotaHistoryReopenExpected: (UUID?, Int)?
     private var toolPeriod = 0
     private var savedScrollOrigin = NSPoint.zero
     private var expandedCodexBuckets: Set<Int> = []
+    // 模型响应/缓存命中卡的展开状态：与 tokens 卡 codexExpanded/expandedCodexBuckets 同款模式
+    // 「模型响应」「缓存命中」卡头周期筛选（GlmUsage 同款）：内存态对齐工具明细 chip 先例，默认近 7 天。
+    private var responsePeriod = 1
+    private var cachePeriod = 1
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
     // 卡片显隐与排序（「···」→ 卡片显示与排序）；隐藏 ≠ 收起，隐藏的卡片仍照常获取数据。
@@ -2933,6 +3190,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     var previewWindowNumber: Int { contentController.view.window?.windowNumber ?? 0 }
 
     private let popover = NSPopover()
+    /// 「模型响应」口径说明浮窗：控制器级持有并跨 10s 重建重锚定（视图内持有会被面板重建打断）。
+    /// behavior 用 applicationDefined 而非 transient——transient 下点击锚点图标会先自动关浮窗再触发动作，
+    /// 开关 toggle 永远停在「开」；手动收起=再点图标，主面板关闭时随锚点移除自动收起。
+    private let metricNotePopover = NSPopover()
     private let contentController = NSViewController()
     private let effect = NSVisualEffectView()
     private let solid = PanelSolidBackgroundView()
@@ -3098,6 +3359,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private func rebuildContent() {
         guard let model = model else { return }
+        // 口径说明浮窗跨重建：行重建会摘掉锚点按钮，先记录开合并主动收起，重建完成后重锚定。
+        let metricNoteWasShown = metricNotePopover.isShown
+        if metricNoteWasShown { metricNotePopover.performClose(nil) }
         // 设置页打开时的 10s 重建：编辑器实例被复用，但移窗会打断焦点，先记录、加回后恢复。
         var settingsFocusOwner: NSView?
         if showingCardSettings, let owner = contentController.view.window?.firstResponder as? NSView {
@@ -3146,6 +3410,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                         addContentRow(makeCardSection(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
                             expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
                             bucketAction: #selector(toggleCodexBucket(_:)))))
+                    case .response:
+                        addContentRow(makeCardSection(PeriodSectionView(model: model.responseSection, selectedIndex: responsePeriod,
+                            expanded: responseExpanded, target: self, action: #selector(toggleResponse),
+                            chipAction: #selector(toggleResponsePeriod(_:)), noteAction: #selector(toggleMetricNote(_:)))))
+                    case .cache:
+                        addContentRow(makeCardSection(PeriodSectionView(model: model.cacheSection, selectedIndex: cachePeriod,
+                            expanded: cacheExpanded, target: self, action: #selector(toggleCache),
+                            chipAction: #selector(toggleCachePeriod(_:)))))
                     case .daily:
                         addContentRow(makeCardSection(makeDailySection(model)))
                     case .quotaHistory:
@@ -3157,6 +3429,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             }
         }
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
+        // 设置页/隐藏卡重建时不重锚定：找不到锚点按钮就保持收起。
+        if metricNoteWasShown, !showingCardSettings,
+           let anchor = descendants(stack).compactMap({ $0 as? NSButton }).first(where: { $0.accessibilityLabel() == "口径说明" }) {
+            showMetricNote(from: anchor)
+        }
         stack.needsLayout = true
     }
 
@@ -3525,11 +3802,12 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         window.sendEvent(space)
         guard isOpen, panelLayout.isVisible(.quota) else { return fail("space untoggle") }
 
-        // 排序：把「工具明细」上移，末位变成「额度周期回顾」；重建行后焦点必须落回同一行的上移按钮
+        // 排序：把「工具明细」上移，原末位「缓存命中」保持殿后（9 卡默认末两位 = 模型响应、缓存命中）；
+        // 重建行后焦点必须落回同一行的上移按钮
         guard let toolsUp = descendants(settings).compactMap({ $0 as? NSButton }).first(where: { $0.accessibilityLabel() == "上移工具明细" }),
               toolsUp.isEnabled, let focusWindow = toolsUp.window else { return fail("up button") }
         toolsUp.performClick(nil)
-        guard panelLayout.visibleOrder.last == .quotaHistory else { return fail("move up") }
+        guard panelLayout.visibleOrder.last == .cache else { return fail("move up") }
         let movedFocus = descendants(settings).compactMap({ $0 as? NSButton }).first(where: { $0.accessibilityLabel() == "上移工具明细" })
         guard let movedFocus, focusWindow.firstResponder === movedFocus, movedFocus.isEnabled else {
             return fail("focus restore after move")
@@ -3542,21 +3820,21 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("focus across rebuild")
         }
 
-        // 隐藏两张卡并「完成」：重建后实际卡片随之变化
+        // 隐藏两张卡并「完成」：重建后实际卡片随之变化（9 卡默认 − 隐藏 2 = 7）
         panelLayout.setVisible(false, for: .daily)
         panelLayout.setVisible(false, for: .tools)
         finishCardSettings()
         guard !showingCardSettings, editor() == nil else { return fail("finish") }
         stack.layoutSubtreeIfNeeded()
         let cards = stack.arrangedSubviews.compactMap { $0 as? PanelCardView }
-        guard cards.count == 5, verifyCardLayoutForPreview() else { return fail("rebuild after finish count=\(cards.count)") }
+        guard cards.count == 7, verifyCardLayoutForPreview() else { return fail("rebuild after finish count=\(cards.count)") }
 
         // 重开设置页：内存布局保留（隐藏与顺序都在）
         showCardSettings()
         guard let reopened = editor(), reopened.layout.isVisible(.daily) == false,
-              reopened.layout.visibleOrder.last == .quotaHistory else { return fail("layout retained") }
+              reopened.layout.visibleOrder.last == .cache else { return fail("layout retained") }
 
-        // 恢复默认 + 完成：回到 7 卡默认布局
+        // 恢复默认 + 完成：回到 9 卡默认布局
         guard let reset = descendants(reopened).compactMap({ $0 as? NSButton }).first(where: { $0.title == "恢复默认卡片布局" }) else {
             return fail("reset button")
         }
@@ -3565,7 +3843,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         finishCardSettings()
         stack.layoutSubtreeIfNeeded()
         let restored = stack.arrangedSubviews.compactMap { $0 as? PanelCardView }
-        guard restored.count == 7, verifyCardLayoutForPreview() else { return fail("restored count=\(restored.count)") }
+        guard restored.count == 9, verifyCardLayoutForPreview() else { return fail("restored count=\(restored.count)") }
         return true
     }
 
@@ -3620,9 +3898,36 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     @objc private func toggleCodex() { codexExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleExternal() { externalExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleDaily() { dailyExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleResponse() { responseExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleCache() { cacheExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleCodexBucket(_ sender: NSButton) {
         expandedCodexBuckets = toggledBucket(sender.tag, expanded: expandedCodexBuckets)
         refreshPanelLayout()
+    }
+    // 卡头周期筛选 chips（GlmUsage 同款）：切换后重建并恢复同位置焦点（对齐工具明细 selectToolPeriod）。
+    @objc private func toggleResponsePeriod(_ sender: NSButton) {
+        guard (0..<3).contains(sender.tag), sender.tag != responsePeriod else { return }
+        let restoreFocus = sender.window?.firstResponder === sender
+        responsePeriod = sender.tag
+        refreshPanelLayout()
+        if restoreFocus {
+            if let button = descendants(stack).compactMap({ $0 as? ToolPeriodButton }).first(where: {
+                $0.tag == responsePeriod && $0.accessibilityLabel()?.hasPrefix("模型响应") == true }) {
+                button.window?.makeFirstResponder(button)
+            }
+        }
+    }
+    @objc private func toggleCachePeriod(_ sender: NSButton) {
+        guard (0..<3).contains(sender.tag), sender.tag != cachePeriod else { return }
+        let restoreFocus = sender.window?.firstResponder === sender
+        cachePeriod = sender.tag
+        refreshPanelLayout()
+        if restoreFocus {
+            if let button = descendants(stack).compactMap({ $0 as? ToolPeriodButton }).first(where: {
+                $0.tag == cachePeriod && $0.accessibilityLabel()?.hasPrefix("缓存命中") == true }) {
+                button.window?.makeFirstResponder(button)
+            }
+        }
     }
     private func toggledBucket(_ index: Int, expanded: Set<Int>) -> Set<Int> {
         guard (0..<3).contains(index) else { return expanded }
@@ -3751,6 +4056,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     func showCardSettingsForPreview() { showCardSettings() }
     func expandAllTokenBucketsForPreview() {
         expandedCodexBuckets = [0, 1, 2]
+        responseExpanded = true
+        cacheExpanded = true
         refreshPanelLayout()
     }
 
@@ -3790,6 +4097,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             case .resetCards: ok = card is ResetCardSectionView
             case .tibo: ok = inner.contains(where: { ($0 as? NSTextField)?.stringValue == "Tibo 重置动态" })
             case .tokens: ok = inner.contains(where: { $0 is TokenSectionView })
+            case .cache:
+                ok = inner.contains(where: { $0 is PeriodSectionView })
+                    && inner.filter({ $0 is ToolPeriodButton }).count == 3
+            case .response:
+                ok = inner.contains(where: { $0 is PeriodSectionView })
+                    && inner.filter({ $0 is ToolPeriodButton }).count == 3
+                    && inner.contains(where: { ($0 as? NSButton)?.accessibilityLabel() == "口径说明" })
             case .daily:
                 let buttons = inner.compactMap { $0 as? PanelDisclosureButton }.filter { $0.action == #selector(toggleDaily) }
                 ok = buttons.count == 2
@@ -3910,7 +4224,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         update(model: model)
         guard expandedCodexBuckets == [0, 2] else { return false }
         toggleExternal()
-        func periods() -> [ToolPeriodButton] { descendants(stack).compactMap { $0 as? ToolPeriodButton }.sorted { $0.tag < $1.tag } }
+        // 卡头周期筛选 chips 现在有三组（工具明细/模型响应/缓存命中），按 accessibility 前缀取本组断言。
+        func periods() -> [ToolPeriodButton] {
+            descendants(stack).compactMap { $0 as? ToolPeriodButton }
+                .filter { $0.accessibilityLabel()?.hasPrefix("工具明细") == true }.sorted { $0.tag < $1.tag }
+        }
         guard externalExpanded, periods().count == 3 else { return false }
         periods()[2].performClick(nil)
         guard toolPeriod == 2, externalExpanded, expandedCodexBuckets == [0, 2], periods()[2].accessibilityValue() as? Int == 1 else { return false }
@@ -3921,6 +4239,21 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         guard !externalExpanded, periods().isEmpty, toolPeriod == 1 else { return false }
         toggleExternal()
         guard externalExpanded, periods().count == 3, periods()[1].accessibilityValue() as? Int == 1 else { return false }
+        // 「模型响应」卡头 chips：切换周期 + 选中态 + 不重选 no-op。
+        func responseChips() -> [ToolPeriodButton] {
+            descendants(stack).compactMap { $0 as? ToolPeriodButton }
+                .filter { $0.accessibilityLabel()?.hasPrefix("模型响应") == true }.sorted { $0.tag < $1.tag }
+        }
+        guard responseChips().count == 3, responseChips()[1].accessibilityValue() as? Int == 1 else { return false }
+        responseChips()[0].performClick(nil)
+        guard responsePeriod == 0, responseChips()[0].accessibilityValue() as? Int == 1,
+              responseChips()[1].accessibilityValue() as? Int == 0 else { return false }
+        responseChips()[0].performClick(nil)
+        guard responsePeriod == 0 else { return false }
+        responseChips()[2].performClick(nil)
+        guard responsePeriod == 2, responseChips()[2].accessibilityValue() as? Int == 1 else { return false }
+        responseChips()[1].performClick(nil)
+        guard responsePeriod == 1 else { return false }
         func dailyButtons() -> [PanelDisclosureButton] {
             descendants(stack).compactMap { $0 as? PanelDisclosureButton }.filter { $0.action == #selector(toggleDaily) }
         }
@@ -4138,6 +4471,39 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         popover.performClose(nil)
     }
 
+    // MARK: 「模型响应」口径说明浮窗（卡头圆圈感叹号图标）
+    @objc private func toggleMetricNote(_ sender: NSButton) {
+        if metricNotePopover.isShown { metricNotePopover.performClose(sender) }
+        else { showMetricNote(from: sender) }
+    }
+
+    private func showMetricNote(from anchor: NSView) {
+        guard anchor.window != nil else { return }
+        let pad: CGFloat = 12
+        let width: CGFloat = 264
+        let text = NSTextField(wrappingLabelWithString: UsagePanelModel.responseMetricNote)
+        text.font = .systemFont(ofSize: 11)
+        text.textColor = .labelColor
+        text.preferredMaxLayoutWidth = width - 2 * pad
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        text.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(text)
+        NSLayoutConstraint.activate([
+            text.topAnchor.constraint(equalTo: container.topAnchor, constant: pad),
+            text.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -pad),
+            text.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: pad),
+            text.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -pad)
+        ])
+        let controller = NSViewController()
+        controller.view = container
+        controller.preferredContentSize = NSSize(width: width, height: ceil(text.intrinsicContentSize.height) + 2 * pad)
+        metricNotePopover.contentViewController = controller
+        metricNotePopover.behavior = .applicationDefined
+        metricNotePopover.animates = false
+        metricNotePopover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+    }
+
     func popoverDidClose(_ notification: Notification) {
         savedScrollOrigin = scrollView.contentView.bounds.origin
         updateConfirmation = nil
@@ -4197,7 +4563,7 @@ private final class TokenBucketRow: NSButton {
     override var wantsUpdateLayer: Bool { true }
 
     init(bucket: UsagePanelModel.TokenBucket, accent: PanelAccent, expanded: Bool,
-         tag: Int, target: AnyObject, action: Selector) {
+         columnTitles: [String], tag: Int, target: AnyObject, action: Selector) {
         cells = TokenDetailRow(values: [(expanded ? "⌄ " : "› ") + bucket.summaryLabel, bucket.total, bucket.input, bucket.output],
             header: false, accent: accent)
         super.init(frame: .zero)
@@ -4217,7 +4583,8 @@ private final class TokenBucketRow: NSButton {
             cells.trailingAnchor.constraint(equalTo: trailingAnchor),
             cells.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
-        let summary = "\(bucket.detailLabel)，总量 \(bucket.total)，输入 \(bucket.input)，输出 \(bucket.output)"
+        // 无障碍摘要按列标题生成：既有默认列名下与原文案逐字一致
+        let summary = "\(bucket.detailLabel)，\(columnTitles[1]) \(bucket.total)，\(columnTitles[2]) \(bucket.input)，\(columnTitles[3]) \(bucket.output)"
         toolTip = bucket.models.isEmpty ? "暂无模型明细" : (expanded ? "收起模型明细" : "展开模型明细")
         setAccessibilityLabel(summary + (bucket.models.isEmpty ? "，无模型明细" : "，\(expanded ? "收起" : "展开")模型明细"))
     }
@@ -4259,19 +4626,34 @@ private final class TokenBucketRow: NSButton {
 
 private final class TokenSectionView: NSView {
     init(model: UsagePanelModel.TokenSection, expanded: Bool, expandedBuckets: Set<Int>,
-         target: AnyObject, action: Selector, bucketAction: Selector) {
+         target: AnyObject, action: Selector, bucketAction: Selector, noteAction: Selector? = nil) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 4)
+        // 口径说明图标（圆圈内感叹号）：note + noteAction 同时给定时挂在卡头 chevron 左侧，
+        // 点击由控制器弹浮窗（跨 10s 重建重锚定），悬停另有原生 tooltip 兜底。
+        var noteAccessory: NSView?
+        if model.note != nil, let noteAction = noteAction {
+            let noteButton = NSButton(image: NSImage(systemSymbolName: "exclamationmark.circle",
+                accessibilityDescription: "口径说明") ?? NSImage(), target: target, action: noteAction)
+            noteButton.isBordered = false
+            noteButton.contentTintColor = .secondaryLabelColor
+            noteButton.setAccessibilityLabel("口径说明")
+            noteButton.toolTip = "点击查看口径说明"
+            noteAccessory = noteButton
+        }
         let header = PanelSectionHeading.make(title: model.title, symbol: model.accent.symbol,
-            color: model.accent.color, expanded: expanded, target: target, action: action)
+            color: model.accent.color, expanded: expanded, target: target, action: action,
+            inlineAccessory: noteAccessory)
         PanelUI.addFullWidth(header, to: root)
         if expanded {
-            let tableHeader = TokenDetailRow(values: ["周期", "总量", "输入", "输出"], header: true, accent: model.accent)
+            let columns = model.columnTitles ?? ["周期", "总量", "输入", "输出"]
+            let tableHeader = TokenDetailRow(values: columns, header: true, accent: model.accent)
             PanelUI.addFullWidth(tableHeader, to: root)
             for (index, bucket) in model.buckets.enumerated() {
                 let row = TokenBucketRow(bucket: bucket, accent: model.accent,
-                    expanded: expandedBuckets.contains(index), tag: index, target: target, action: bucketAction)
+                    expanded: expandedBuckets.contains(index), columnTitles: columns,
+                    tag: index, target: target, action: bucketAction)
                 PanelUI.addFullWidth(row, to: root)
                 if expandedBuckets.contains(index) {
                     if bucket.models.isEmpty {
@@ -4283,6 +4665,65 @@ private final class TokenSectionView: NSView {
                             accent: model.accent, modelDetail: true)
                         PanelUI.addFullWidth(detail, to: root)
                         if modelIndex == bucket.models.count - 1 { root.setCustomSpacing(8, after: detail) }
+                    }
+                }
+            }
+        }
+        for notice in PanelUI.notices(model.notices) { PanelUI.addFullWidth(notice, to: root) }
+        addSubview(root)
+        PanelUI.pin(root, to: self)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+/// 周期筛选卡（「模型响应」「缓存命中」）：卡头内嵌今天/近 7 天/近 30 天筛选 chips（GlmUsage 同款筛选逻辑，
+/// 控件复用工具明细的 ToolPeriodButton，选中项按本卡 accent 柔彩底），卡体只渲染选中周期，
+/// 不做周期堆叠折叠；「整体」汇总行置顶（缓存卡口径要求），模型行沿用既有 modelDetail 样式。
+private final class PeriodSectionView: NSView {
+    init(model: UsagePanelModel.TokenSection, selectedIndex: Int, expanded: Bool,
+         target: AnyObject, action: Selector, chipAction: Selector, noteAction: Selector? = nil) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let root = PanelUI.stack(spacing: 4)
+        var chips: NSStackView?
+        if model.buckets.count > 1 {
+            chips = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
+            for (index, bucket) in model.buckets.enumerated() {
+                chips?.addArrangedSubview(ToolPeriodButton(title: bucket.summaryLabel, index: index,
+                    selected: index == selectedIndex, target: target, action: chipAction,
+                    accent: model.accent, context: model.title))
+            }
+        }
+        var noteAccessory: NSView?
+        if model.note != nil, let noteAction = noteAction {
+            let noteButton = NSButton(image: NSImage(systemSymbolName: "exclamationmark.circle",
+                accessibilityDescription: "口径说明") ?? NSImage(), target: target, action: noteAction)
+            noteButton.isBordered = false
+            noteButton.contentTintColor = .secondaryLabelColor
+            noteButton.setAccessibilityLabel("口径说明")
+            noteButton.toolTip = "点击查看口径说明"
+            noteAccessory = noteButton
+        }
+        let header = PanelSectionHeading.make(title: model.title, symbol: model.accent.symbol,
+            color: model.accent.color, expanded: expanded, target: target, action: action,
+            accessory: chips, inlineAccessory: noteAccessory)
+        PanelUI.addFullWidth(header, to: root)
+        if expanded {
+            let bucket = model.buckets.indices.contains(selectedIndex) ? model.buckets[selectedIndex] : nil
+            if let bucket = bucket {
+                let columns = model.columnTitles ?? ["周期", "总量", "输入", "输出"]
+                if bucket.models.isEmpty {
+                    PanelUI.addFullWidth(PanelUI.label(bucket.hasData ? "本周期暂无用量" : "本周期数据尚未读取",
+                        size: 10, color: .secondaryLabelColor), to: root)
+                } else {
+                    PanelUI.addFullWidth(TokenDetailRow(values: columns, header: true, accent: model.accent), to: root)
+                    // 「整体」汇总行置顶：缓存卡的口径要求，模型响应卡同构展示全模型加权值。
+                    PanelUI.addFullWidth(TokenDetailRow(values: ["整体", bucket.total, bucket.input, bucket.output],
+                        header: false, accent: model.accent), to: root)
+                    for tokenModel in bucket.models {
+                        PanelUI.addFullWidth(TokenDetailRow(values: [tokenModel.name, tokenModel.total,
+                            tokenModel.input, tokenModel.output], header: false,
+                            accent: model.accent, modelDetail: true), to: root)
                     }
                 }
             }
@@ -4501,17 +4942,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 title: "重置卡已发放", estimateLabel: nil, estimateFrom: nil, estimateThrough: nil,
                 presentationStatus: nil, occurredAt: now - 86_400, link: "https://aihot.news/codex-reset")
         ]
+        // 模型响应/缓存命中卡的预览数据（token_usage_record 管线快照）：
+        // sol 无缓存证据 → 命中率显 —，覆盖「—」占位与数值两种渲染
         usage.tokensToday = TokenScanner.Stats(input: 1_200_000, output: 300_000, total: 1_500_000, files: 3, models: [
             "gpt-5.5-codex": ModelTokenUsage(input: 700_000, output: 180_000, total: 880_000),
             "gpt-5.5": ModelTokenUsage(input: 500_000, output: 120_000, total: 620_000)
+        ], runs: [
+            "gpt-5.5-codex": ModelRunStats(requests: 12, sumDuration: 64, sumOutput: 1_640,
+                sumInput: 700_000, sumCached: 672_000, sumCacheWrite: 0, histogram: [4, 3, 2, 3, 0, 0, 0, 0]),
+            "gpt-5.5": ModelRunStats(requests: 5, sumDuration: 30, sumOutput: 900,
+                sumInput: 500_000, sumCached: 0, sumCacheWrite: 0, histogram: [2, 1, 2, 0, 0, 0, 0, 0])
         ])
         usage.tokens7d = TokenScanner.Stats(input: 8_000_000, output: 2_000_000, total: 10_000_000, files: 20, models: [
             "gpt-5.5-codex": ModelTokenUsage(input: 5_000_000, output: 1_200_000, total: 6_200_000),
             "gpt-5.5": ModelTokenUsage(input: 3_000_000, output: 800_000, total: 3_800_000)
+        ], runs: [
+            "gpt-5.5-codex": ModelRunStats(requests: 1_200, sumDuration: 48_000, sumOutput: 1_200_000,
+                sumInput: 5_000_000, sumCached: 4_850_000, sumCacheWrite: 0, histogram: [500, 300, 200, 200, 0, 0, 0, 0]),
+            "gpt-5.5": ModelRunStats(requests: 300, sumDuration: 9_000, sumOutput: 270_000,
+                sumInput: 3_000_000, sumCached: 2_700_000, sumCacheWrite: 0, histogram: [150, 80, 40, 30, 0, 0, 0, 0])
         ])
         usage.tokens30d = TokenScanner.Stats(input: 24_000_000, output: 6_000_000, total: 30_000_000, files: 60, models: [
             "gpt-5.5-codex": ModelTokenUsage(input: 14_000_000, output: 3_600_000, total: 17_600_000),
             "gpt-5.5": ModelTokenUsage(input: 10_000_000, output: 2_400_000, total: 12_400_000)
+        ], runs: [
+            "gpt-5.5-codex": ModelRunStats(requests: 4_400, sumDuration: 176_000, sumOutput: 4_400_000,
+                sumInput: 14_000_000, sumCached: 13_580_000, sumCacheWrite: 24_000, histogram: [1_800, 1_100, 700, 800, 0, 0, 0, 0]),
+            "gpt-5.5": ModelRunStats(requests: 1_100, sumDuration: 33_000, sumOutput: 990_000,
+                sumInput: 10_000_000, sumCached: 9_000_000, sumCacheWrite: 0, histogram: [550, 300, 130, 120, 0, 0, 0, 0])
         ])
         usage.extToday = ExternalTokenScanner.Stats(input: 3_350_000, output: 20_000, models: [
             "gpt-5.6-sol": ModelTokenUsage(input: 2_000_000, output: 12_000, total: 2_012_000),
@@ -4716,7 +5174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.postEvent(refresh, atStart: false)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     guard self.panelController.isOpen else { return fail("refresh action closed the panel") }
-                    print("CodexUsage visual event test: PASS (card layout, status button toggle, model rows, tool periods, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
+                    print("CodexUsage visual event test: PASS (card layout, status button toggle, model rows, tool periods, response/cache period chips, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
                     exit(0)
                 }
             }
@@ -5238,6 +5696,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let totals = LocalUsageMerge.combine(local, external) else { return bucket(label, label, total: nil, input: nil, output: nil) }
             return bucket(label, label, total: totals.total, input: totals.input, output: totals.output, models: totals.models)
         }
+        // 模型响应 / 缓存命中两卡：同一次 token_usage_record 扫描的 runs 快照（usage.tokens* 携带）
+        func emptyRunBucket(_ label: String) -> UsagePanelModel.TokenBucket {
+            UsagePanelModel.TokenBucket(summaryLabel: label, detailLabel: label,
+                total: "--", input: "--", output: "--", models: [], hasData: false)
+        }
+        func emptyReadBucket(_ label: String) -> UsagePanelModel.TokenBucket {
+            UsagePanelModel.TokenBucket(summaryLabel: label, detailLabel: label,
+                total: "--", input: "--", output: "--", models: [], hasData: true)
+        }
+        // 响应卡：total=全模型加权 tok/s、input=中位耗时、output=请求数；模型行按 SUM(output) 降序
+        func responseBucket(_ label: String, _ runs: [String: ModelRunStats]?) -> UsagePanelModel.TokenBucket {
+            guard let runs = runs else { return emptyRunBucket(label) }
+            let rows = runs.sorted { lhs, rhs in
+                lhs.value.sumOutput != rhs.value.sumOutput ? lhs.value.sumOutput > rhs.value.sumOutput : lhs.key < rhs.key
+            }.map {
+                UsagePanelModel.TokenModel(name: $0.key, total: Fmt.runTps($0.value),
+                    input: Fmt.runMedian($0.value), output: Fmt.runRequests($0.value))
+            }
+            let combined = ModelRunStats.combine(runs)
+            guard combined.requests > 0 else { return emptyReadBucket(label) }
+            return UsagePanelModel.TokenBucket(summaryLabel: label, detailLabel: label,
+                total: Fmt.runTps(combined), input: Fmt.runMedian(combined), output: Fmt.runRequests(combined),
+                models: rows, hasData: true)
+        }
+        // 缓存卡：total=整体命中率（周期汇总行本身）、input=输入量、output=请求数；模型行按 SUM(input) 降序
+        func cacheBucket(_ label: String, _ runs: [String: ModelRunStats]?) -> UsagePanelModel.TokenBucket {
+            guard let runs = runs else { return emptyRunBucket(label) }
+            let rows = runs.sorted { lhs, rhs in
+                lhs.value.sumInput != rhs.value.sumInput ? lhs.value.sumInput > rhs.value.sumInput : lhs.key < rhs.key
+            }.map {
+                UsagePanelModel.TokenModel(name: $0.key, total: Fmt.runHitRate($0.value),
+                    input: Fmt.tokensAbbr($0.value.sumInput), output: Fmt.runRequests($0.value))
+            }
+            let combined = ModelRunStats.combine(runs)
+            guard combined.requests > 0 else { return emptyReadBucket(label) }
+            return UsagePanelModel.TokenBucket(summaryLabel: label, detailLabel: label,
+                total: Fmt.runHitRate(combined), input: Fmt.tokensAbbr(combined.sumInput),
+                output: Fmt.runRequests(combined), models: rows, hasData: true)
+        }
         let codexBuckets = [merged("今天", usage.tokensToday, usage.extToday),
             merged("近 7 天", usage.tokens7d, usage.ext7d), merged("近 30 天", usage.tokens30d, usage.ext30d)]
         var codexNotices: [UsagePanelModel.Notice] = []
@@ -5260,6 +5757,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let codexSection = UsagePanelModel.TokenSection(title: "用量情况", accent: .codex,
             buckets: codexBuckets, notices: codexNotices)
+        // 两卡数据与用量情况同源同窗（token_usage_record 管线），不叠加独立刷新提示
+        let responseSection = UsagePanelModel.TokenSection(
+            title: "模型响应", accent: .response,
+            buckets: [responseBucket("今天", usage.tokensToday?.runs),
+                      responseBucket("近 7 天", usage.tokens7d?.runs),
+                      responseBucket("近 30 天", usage.tokens30d?.runs)],
+            notices: [], columnTitles: ["模型", "tok/s", "耗时", "请求"],
+            note: UsagePanelModel.responseMetricNote)
+        let cacheSection = UsagePanelModel.TokenSection(
+            title: "缓存命中", accent: .cache,
+            buckets: [cacheBucket("今天", usage.tokensToday?.runs),
+                      cacheBucket("近 7 天", usage.tokens7d?.runs),
+                      cacheBucket("近 30 天", usage.tokens30d?.runs)],
+            notices: [], columnTitles: ["模型", "命中", "输入", "请求"])
 
         var globalNotices: [UsagePanelModel.Notice] = []
         if let error = usage.quotaError {
@@ -5283,6 +5794,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             resetCards: resetSection,
             tibo: tiboSection,
             codexTokens: codexSection,
+            responseSection: responseSection,
+            cacheSection: cacheSection,
             official: usage.official, officialError: usage.officialError,
             quotaHistory: quotaHistorySnapshot,
             quotaHistoryAvailable: (visualPreview && !CommandLine.arguments.contains("--visual-preview-quota-history-unstable")) || QuotaCycleCoordinator.accountKey(accountIdentity) != nil,
@@ -6431,6 +6944,262 @@ enum CodexOfflineRegression {
             try expect(tr.thirty.total == 1235 + 2223 && tr.thirty.files == 2,
                        "tail-read or full-file fallback returned wrong totals (got \(tr.thirty.total))")
 
+            // ── 模型响应 / 缓存命中（token_usage_record 双统计管线）· Task 1 十项断言 ──
+            // 全部临时 root + 临时 statePath；不触真实 ~/.codex/sessions 与生产 state。
+            // 数据事实（2026-11-15）：record 行不含 "total_token_usage" 子串；record 与
+            // token_count 1:1 共存（叠加必双计）；usage 是逐请求终值；cached ⊆ input；
+            // cache_write 字段存在不得假设恒为 0；envelope timestamp 为 ISO8601 毫秒。
+            func runContext(_ model: String, _ at: Date) -> String {
+                "{\"timestamp\":\"\(Fmt.isoFrac.string(from: at))\",\"type\":\"turn_context\",\"payload\":{\"model\":\"\(model)\"}}\n"
+            }
+            func runTaskStart(_ at: Date) -> String {
+                "{\"timestamp\":\"\(Fmt.isoFrac.string(from: at))\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n"
+            }
+            func runToolOut(_ at: Date, _ payloadType: String) -> String {
+                "{\"timestamp\":\"\(Fmt.isoFrac.string(from: at))\",\"type\":\"response_item\",\"payload\":{\"type\":\"\(payloadType)\",\"output\":\"ok\"}}\n"
+            }
+            func runRecord(_ at: Date, _ input: Double, _ cached: Double, _ write: Double, _ output: Double) -> String {
+                "{\"timestamp\":\"\(Fmt.isoFrac.string(from: at))\",\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t\",\"usage\":"
+                    + "{\"input_tokens\":\(Int(input)),\"cached_input_tokens\":\(Int(cached)),\"cache_write_input_tokens\":\(Int(write)),"
+                    + "\"output_tokens\":\(Int(output)),\"reasoning_output_tokens\":0,\"total_tokens\":\(Int(input + output))}}}\n"
+            }
+            func runCount(_ at: Date, _ cum: Double,
+                          last: (input: Double, cached: Double, write: Double, output: Double)? = nil) -> String {
+                var info = "{\"total_token_usage\":{\"input_tokens\":\(Int(cum)),\"output_tokens\":1,\"total_tokens\":\(Int(cum + 1))}"
+                if let last = last {
+                    info += ",\"last_token_usage\":{\"input_tokens\":\(Int(last.input)),\"cached_input_tokens\":\(Int(last.cached)),"
+                        + "\"cache_write_input_tokens\":\(Int(last.write)),\"output_tokens\":\(Int(last.output))}"
+                }
+                return "{\"timestamp\":\"\(Fmt.isoFrac.string(from: at))\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":\(info)}}}\n"
+            }
+
+            // 断言 1/2/4/5/7（timing root）：已知起止时刻 → 加权 tok/s、中位耗时、命中率精确手算；
+            // turn 内多请求边界切分与跨 turn 不串；模型切换与未知模型；record 与 token_count 共存只出 record 一份
+            let rt0 = now
+            let timingRoot = root.path + "/runs-timing"
+            try FileManager.default.createDirectory(atPath: timingRoot, withIntermediateDirectories: true)
+            let timingFile = timingRoot + "/rollout-\(sesStamp(now))-runs.jsonl"
+            // terra：durs 6 + 6 + 0.5 + 1 + 2 = 15.5s（长工具 10s 被边界排除；task_started 重置跨 turn；
+            // record 间回退起点 31→33）；out 520；in 4400；cached 3200；
+            // hist [2,1,0,2,0,0,0,0]（0.5/1→(0,1]，2→(1,2]，6/6→(4,8]）
+            try (
+                runContext("gpt-6.1-terra", rt0)
+                    + runTaskStart(rt0)
+                    + runRecord(rt0.addingTimeInterval(6), 1000, 800, 0, 120)
+                    + runToolOut(rt0.addingTimeInterval(16), "custom_tool_call_output")
+                    + runRecord(rt0.addingTimeInterval(22), 1000, 800, 0, 120)
+                    + runToolOut(rt0.addingTimeInterval(22.5), "function_call_output")
+                    + runRecord(rt0.addingTimeInterval(23), 400, 0, 0, 40)
+                    + runTaskStart(rt0.addingTimeInterval(30))
+                    + runRecord(rt0.addingTimeInterval(31), 1000, 800, 0, 120)
+                    + runRecord(rt0.addingTimeInterval(33), 1000, 800, 0, 120)
+                    + runContext("gpt-6.1-sol", rt0.addingTimeInterval(40))
+                    + runTaskStart(rt0.addingTimeInterval(40))
+                    + runRecord(rt0.addingTimeInterval(42), 500, 0, 100, 60)
+                    // 共存的 token_count（含 last_token_usage）：差分管线照常，runs 不得吸入
+                    + runCount(rt0.addingTimeInterval(7), 5000, last: (300, 0, 0, 3))
+                    + runCount(rt0.addingTimeInterval(24), 9000, last: (300, 0, 0, 3))
+            ).write(toFile: timingFile, atomically: true, encoding: .utf8)
+            // 无 turn_context 的记录归「未知模型」
+            try (runTaskStart(rt0) + runRecord(rt0.addingTimeInterval(4), 300, 100, 0, 30))
+                .write(toFile: timingRoot + "/rollout-\(sesStamp(now))-runs-unknown.jsonl", atomically: true, encoding: .utf8)
+            let timingState = root.path + "/runs-timing-state.json"
+            let tT = TokenScanner.scan(root: timingRoot, statePath: timingState, now: now)
+            let terra = tT.thirty.runs["gpt-6.1-terra"]
+            try expect(terra?.requests == 5 && terra?.sumDuration == 15.5 && terra?.sumOutput == 520
+                       && terra?.sumInput == 4400 && terra?.sumCached == 3200,
+                       "record pipeline boundary split or sums wrong (got \(String(describing: terra)))")
+            try expect(terra?.weightedTps == 520 / 15.5,
+                       "weighted tok/s mismatch (got \(String(describing: terra?.weightedTps)))")
+            try expect(terra?.histogram == [2, 1, 0, 2, 0, 0, 0, 0],
+                       "histogram buckets wrong (got \(String(describing: terra?.histogram)))")
+            // n=5 目标 2.5：累积跨 (0,1] 后在 (1,2] 桶内插值 → 1 + (2.5−2)/1 = 1.5s
+            try expect(terra?.medianSeconds == 1.5,
+                       "median interpolation wrong (got \(String(describing: terra?.medianSeconds)))")
+            try expect(terra?.cacheHitRate == 3200.0 / 4400.0,
+                       "cache hit rate mismatch (got \(String(describing: terra?.cacheHitRate)))")
+            let sol = tT.thirty.runs["gpt-6.1-sol"]
+            // cache_write > 0 也是缓存证据：命中率 0%（非 —）；turn_context 切换后归新模型
+            try expect(sol?.requests == 1 && sol?.weightedTps == 30 && sol?.cacheHitRate == 0,
+                       "sol model-switch attribution or write-evidence wrong (got \(String(describing: sol)))")
+            try expect(tT.thirty.runs["未知模型"]?.requests == 1 && tT.thirty.runs["未知模型"]?.sumDuration == 4,
+                       "records without turn_context were not grouped as unknown (got \(tT.thirty.runs))")
+            // 双计红线 + 零回归：token_count 差分管线数字不动（cum 5000→9000 → total 9001），runs 不吸入两源
+            try expect(tT.thirty.total == 9001 && tT.thirty.files == 1,
+                       "token_count delta pipeline changed (got \(tT.thirty.total))")
+            try expect(tT.thirty.runs.values.reduce(0) { $0 + $1.sumInput } == 4400 + 500 + 300,
+                       "token_count or fallback leaked into record stats (got \(tT.thirty.runs))")
+
+            // 断言 3（guards root）：dur ≤ 0、dur > 900s、input_tokens ≤ 0 整条剔除（timing 与缓存都不进）
+            let guardRoot = root.path + "/runs-guards"
+            try FileManager.default.createDirectory(atPath: guardRoot, withIntermediateDirectories: true)
+            let rt1 = now
+            try (
+                runContext("gpt-5.6-terra", rt1)
+                    + runRecord(rt1.addingTimeInterval(-10), 999, 0, 0, 9)      // 无 turn 起点 → dur 0
+                    + runTaskStart(rt1)
+                    + runRecord(rt1, 500, 0, 0, 5)                              // dur 0
+                    + runRecord(rt1.addingTimeInterval(1000), 500, 0, 0, 5)     // dur > 900s（挂起污染）
+                    + runRecord(rt1.addingTimeInterval(1005), 0, 0, 0, 5)       // input ≤ 0
+                    + runRecord(rt1.addingTimeInterval(1010), 100, 50, 0, 10)   // 唯一有效：dur 5
+            ).write(toFile: guardRoot + "/rollout-\(sesStamp(now))-guards.jsonl", atomically: true, encoding: .utf8)
+            let tG = TokenScanner.scan(root: guardRoot, statePath: root.path + "/runs-guard-state.json", now: now)
+            let guarded = tG.thirty.runs["gpt-5.6-terra"]
+            try expect(guarded?.requests == 1 && guarded?.sumDuration == 5 && guarded?.sumInput == 100
+                       && guarded?.sumCached == 50 && guarded?.sumOutput == 10,
+                       "invalid records were not excluded entirely (got \(String(describing: guarded)))")
+            try expect(guarded?.cacheHitRate == 0.5,
+                       "cache denominator polluted by invalid records (got \(String(describing: guarded?.cacheHitRate)))")
+
+            // 断言 6（nocache root）：窗口无任何 cached/cache_write 证据 → 命中率 nil（UI —）；
+            // 全部模型无证据 → 汇总行同 nil；有证据的窗口汇总非 nil
+            let noCacheRoot = root.path + "/runs-nocache"
+            try FileManager.default.createDirectory(atPath: noCacheRoot, withIntermediateDirectories: true)
+            let rt2 = now
+            try (
+                runContext("gpt-nocache", rt2)
+                    + runTaskStart(rt2)
+                    + runRecord(rt2.addingTimeInterval(3), 700, 0, 0, 50)
+                    + runRecord(rt2.addingTimeInterval(8), 300, 0, 0, 20)
+            ).write(toFile: noCacheRoot + "/rollout-\(sesStamp(now))-nocache.jsonl", atomically: true, encoding: .utf8)
+            let tN = TokenScanner.scan(root: noCacheRoot, statePath: root.path + "/runs-nocache-state.json", now: now)
+            let noCache = tN.thirty.runs["gpt-nocache"]
+            try expect(noCache?.requests == 2 && noCache?.cacheHitRate == nil,
+                       "models without cache evidence must report nil hit rate (got \(String(describing: noCache?.cacheHitRate)))")
+            try expect(ModelRunStats.combine(tN.thirty.runs).cacheHitRate == nil,
+                       "aggregate row must be nil when no model has cache evidence")
+            try expect(ModelRunStats.combine(tT.thirty.runs).cacheHitRate != nil,
+                       "aggregate cache evidence lost")
+
+            // 断言 7（fallback root）：整文件零 record 才回退 last_token_usage 一份（usageSource=2 持久化）；
+            // 旧格式只有累计 total 的贡献为 0；回退记录无耗时证据（tok/s 与中位 —）
+            let fallbackRoot = root.path + "/runs-fallback"
+            try FileManager.default.createDirectory(atPath: fallbackRoot, withIntermediateDirectories: true)
+            let rt3 = now
+            let fallbackFile = fallbackRoot + "/rollout-\(sesStamp(now))-fallback.jsonl"
+            try (
+                runContext("gpt-5.5", rt3)
+                    + runCount(rt3, 1000, last: (2000, 1500, 0, 30))
+                    + runCount(rt3.addingTimeInterval(5), 3000, last: (2000, 1500, 0, 30))
+            ).write(toFile: fallbackFile, atomically: true, encoding: .utf8)
+            try (runContext("gpt-old", rt3) + runCount(rt3, 500))
+                .write(toFile: fallbackRoot + "/rollout-\(sesStamp(now))-legacy.jsonl", atomically: true, encoding: .utf8)
+            let fallbackState = root.path + "/runs-fallback-state.json"
+            let tS = TokenScanner.scan(root: fallbackRoot, statePath: fallbackState, now: now)
+            let fallback = tS.thirty.runs["gpt-5.5"]
+            try expect(fallback?.requests == 1 && fallback?.sumInput == 2000 && fallback?.sumCached == 1500
+                       && fallback?.sumOutput == 30,
+                       "last_token_usage file-level fallback wrong (got \(String(describing: fallback)))")
+            try expect(fallback?.sumDuration == 0 && fallback?.weightedTps == nil && fallback?.medianSeconds == nil,
+                       "fallback record must carry no timing evidence (got \(String(describing: fallback)))")
+            try expect(fallback?.cacheHitRate == 0.75,
+                       "fallback cache rate wrong (got \(String(describing: fallback?.cacheHitRate)))")
+            try expect(tS.thirty.runs["gpt-old"] == nil,
+                       "cumulative-only legacy format must contribute zero to runs")
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: fallbackState)),
+               let saved = try? JSONDecoder().decode(TokenScanner.State.self, from: data),
+               // 枚举器 url.path 是符号链接解析后的形式（/var → /private/var），
+               // 与 fixture 字符串前缀不同——按条目值查找而非路径键
+               let entry = saved.files.values.first(where: { $0.usageSource == 2 }) {
+                try expect(entry.usageSource == 2, "fallback usageSource not persisted (got \(entry.usageSource))")
+                try expect(entry.recordDaysByModel.values.contains { models in
+                    models.values.contains { $0.count == 14 && $0[0] == 1 && $0[3] == 2000 && $0[4] == 1500 }
+                }, "fallback persisted bucket contents wrong")
+            } else {
+                try expect(false, "fallback state entry missing")
+            }
+
+            // 断言 8（needle root）：needle 预筛 + 严格 type/payload.type 校验——
+            // 消息行即使携带用量形状数字或 needle 子串也不产生统计
+            let needleRoot = root.path + "/runs-needle"
+            try FileManager.default.createDirectory(atPath: needleRoot, withIntermediateDirectories: true)
+            let rt5 = now
+            try (
+                runContext("gpt-needle", rt5)
+                    + runTaskStart(rt5)
+                    + "{\"timestamp\":\"\(Fmt.isoFrac.string(from: rt5))\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"input_tokens 88888 cached_input_tokens 88888 output_tokens 88888\"}]}}\n"
+                    + "{\"timestamp\":\"\(Fmt.isoFrac.string(from: rt5))\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"task_started custom_tool_call_output token_usage_record events\"}]}}\n"
+                    + runRecord(rt5.addingTimeInterval(5), 111, 0, 0, 11)
+            ).write(toFile: needleRoot + "/rollout-\(sesStamp(now))-needle.jsonl", atomically: true, encoding: .utf8)
+            let tH = TokenScanner.scan(root: needleRoot, statePath: root.path + "/runs-needle-state.json", now: now)
+            let needleStats = tH.thirty.runs["gpt-needle"]
+            try expect(needleStats?.requests == 1 && needleStats?.sumInput == 111,
+                       "message lines leaked into record stats (got \(String(describing: needleStats)))")
+
+            // 断言 9（v3/arity）：v3 状态作废整体重扫不崩溃；recordDaysByModel arity 坏条目被拒绝并重建。
+            // 状态键取自 clean scan 保存的真实键（枚举器 url.path 口径），确保命中跳过路径
+            let v3State = root.path + "/runs-v3-state.json"
+            let anyKey = URL(fileURLWithPath: timingFile).resolvingSymlinksInPath().path
+            try ("{\"version\":3,\"files\":{\"\(anyKey)\":{\"size\":999999,\"mtime\":0,\"offset\":0,"
+                + "\"previous\":[1,1,1],\"days\":{},\"daysByModel\":{}}}}")
+                .write(toFile: v3State, atomically: true, encoding: .utf8)
+            let tV3 = TokenScanner.scan(root: timingRoot, statePath: v3State, now: now)
+            try expect(tV3.thirty.runs["gpt-6.1-terra"]?.requests == 5 && tV3.thirty.total == 9001,
+                       "v3 state was not discarded and rebuilt cleanly (got \(tV3.thirty.runs) total=\(tV3.thirty.total))")
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: timingState)),
+               let saved = try? JSONDecoder().decode(TokenScanner.State.self, from: data),
+               let (timingKey, clean) = saved.files.first(where: { $0.value.currentModel == "gpt-6.1-sol" }) {
+                let arityState = root.path + "/runs-arity-state.json"
+                // size/mtime 与真实文件一致（命中跳过路径），仅 recordDaysByModel 13 值 arity 非法
+                try ("{\"version\":4,\"files\":{\"\(timingKey)\":{\"size\":\(clean.size),\"mtime\":\(clean.mtime),\"offset\":\(clean.offset),"
+                    + "\"previous\":[0,0,0],\"days\":{},\"daysByModel\":{},\"turnStartTs\":null,\"boundaryTs\":null,\"usageSource\":1,"
+                    + "\"recordDaysByModel\":{\"2000-01-01\":{\"gpt-x\":[1,2,3,4,5,6,7,8,9,10,11,12,13]}}}}}")
+                    .write(toFile: arityState, atomically: true, encoding: .utf8)
+                let tArity = TokenScanner.scan(root: timingRoot, statePath: arityState, now: now)
+                try expect(tArity.thirty.runs["gpt-6.1-terra"]?.requests == 5
+                           && tArity.thirty.runs["gpt-6.1-terra"]?.sumDuration == 15.5,
+                           "bad recordDaysByModel arity was not rejected and rebuilt (got \(tArity.thirty.runs))")
+            } else {
+                try expect(false, "clean timing state missing for arity test")
+            }
+
+            // 断言 10（window root）：毫秒时间戳按事件本地日归日；周期外行不进统计；
+            // 系统 zstd 压缩的 record 帧归档与明文结果一致
+            let windowRoot = root.path + "/runs-window"
+            try FileManager.default.createDirectory(atPath: windowRoot, withIntermediateDirectories: true)
+            let midnight = Calendar.current.startOfDay(for: now)
+            let lateYesterday = midnight.addingTimeInterval(-0.5)   // 昨日 23:59:59.5
+            try (
+                runContext("gpt-5.5-codex", midnight.addingTimeInterval(-40 * 86400))
+                    + runTaskStart(midnight.addingTimeInterval(-40 * 86400))
+                    + runRecord(midnight.addingTimeInterval(-40 * 86400 + 2), 800, 0, 0, 80)   // 40 天前 → 周期外
+                    + runTaskStart(lateYesterday.addingTimeInterval(-3))
+                    + runRecord(lateYesterday, 800, 400, 0, 80)                                 // 昨日
+                    + runRecord(lateYesterday.addingTimeInterval(2), 800, 400, 0, 80)           // 今日 00:00:01.5
+            ).write(toFile: windowRoot + "/rollout-\(sesStamp(now))-window.jsonl", atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.modificationDate: now],
+                                                  ofItemAtPath: windowRoot + "/rollout-\(sesStamp(now))-window.jsonl")
+            let tW = TokenScanner.scan(root: windowRoot, statePath: root.path + "/runs-window-state.json", now: now)
+            try expect(tW.today.runs["gpt-5.5-codex"]?.requests == 1
+                       && tW.seven.runs["gpt-5.5-codex"]?.requests == 2
+                       && tW.thirty.runs["gpt-5.5-codex"]?.requests == 2,
+                       "window or local-day bucketing of record timestamps wrong "
+                       + "(today=\(tW.today.runs) 7d=\(tW.seven.runs) 30d=\(tW.thirty.runs))")
+            let zstPlainRoot = root.path + "/runs-zst-plain"
+            let zstArchRoot = root.path + "/runs-zst-arch"
+            let zstDay = now.addingTimeInterval(-3 * 86400)
+            for dir in [zstPlainRoot, zstArchRoot] {
+                try FileManager.default.createDirectory(atPath: dir + "/" + sesDayDir(zstDay), withIntermediateDirectories: true)
+            }
+            let zstPlainPath = zstPlainRoot + "/rollout-\(sesStamp(zstDay))-plain.jsonl"
+            try (
+                runContext("gpt-6.1-sol", zstDay)
+                    + runTaskStart(zstDay)
+                    + runToolOut(zstDay.addingTimeInterval(1), "custom_tool_call_output")
+                    + runRecord(zstDay.addingTimeInterval(9), 600, 480, 0, 90)
+            ).write(toFile: zstPlainPath, atomically: true, encoding: .utf8)
+            if zstdCompress(src: zstPlainPath,
+                            dst: zstArchRoot + "/rollout-\(sesStamp(zstDay))-arch.jsonl.zst") {
+                let tP = TokenScanner.scan(root: zstPlainRoot, statePath: root.path + "/runs-zst-plain-state.json", now: now)
+                let tZ = TokenScanner.scan(root: zstArchRoot, statePath: root.path + "/runs-zst-arch-state.json", now: now)
+                try expect(tP.thirty.runs == tZ.thirty.runs && tZ.thirty.runs["gpt-6.1-sol"]?.sumDuration == 8
+                           && tZ.thirty.runs["gpt-6.1-sol"]?.sumCached == 480,
+                           "zst record archive mismatch (plain=\(tP.thirty.runs) zst=\(tZ.thirty.runs))")
+            } else {
+                print("CodexUsage --self-test: note: no system zstd CLI, record .zst fixture skipped "
+                      + "(embedded token_count frame still covers the decode path)")
+            }
+
             // 外部用量增量扫描端到端（临时 roots + 临时状态文件，不碰真实 ~/.proma / ~/.claude）：
             // 窗口分桶、嵌套枚举、首见旧文件跳过、追加增量、删除剔除、截断重扫
             let extRootA = root.path + "/proma-a"
@@ -6734,6 +7503,8 @@ enum CodexOfflineRegression {
             try expect(PanelCardLayout.default.order == PanelCardID.allCases && PanelCardLayout.default.hidden.isEmpty,
                        "layout default order")
             try expect(PanelCardLayout.default.visibleOrder == PanelCardID.allCases, "layout default visibility")
+            try expect(UsagePanelModel.responseMetricNote.contains("统计口径") && UsagePanelModel.responseMetricNote.contains("端到端口径"),
+                       "response metric note text")
             var customLayout = PanelCardLayout.default
             customLayout.setVisible(false, for: .tools)
             try expect(!customLayout.isVisible(.tools) && !customLayout.visibleOrder.contains(.tools),
@@ -6934,6 +7705,23 @@ func onceMode() {
         print("external 30d:   \(t(e.thirty))")
     } else {
         print("external: no result (timeout)")
+    }
+
+    // 模型响应/缓存命中摘要（token_usage_record 管线，近 30 天）：只打印、不计入退出码，
+    // 用途是部署后与面板数字真机对拍（行风格对齐上方 Tibo 摘要）
+    if let s = scan, s.error == nil {
+        let runs = s.thirty.runs
+        if runs.isEmpty {
+            print("model runs 30d: none")
+        } else {
+            print("model runs 30d: \(runs.count) models")
+            for (name, stats) in runs.sorted(by: { lhs, rhs in
+                lhs.value.sumOutput != rhs.value.sumOutput ? lhs.value.sumOutput > rhs.value.sumOutput : lhs.key < rhs.key
+            }) {
+                print("  \(name) · tok/s \(Fmt.runTps(stats)) · 中位 \(Fmt.runMedian(stats))"
+                    + " · \(Fmt.runRequests(stats)) 请求 · 命中 \(Fmt.runHitRate(stats))")
+            }
+        }
     }
 
     let ok = quota != nil && quota?.error == nil

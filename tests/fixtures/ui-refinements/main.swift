@@ -82,7 +82,8 @@ case "layoutModel":
     top.move(.quota, direction: .up)
     check(top.order == PanelCardID.allCases, "move at top is a no-op")
     var bottom = PanelCardLayout.default
-    bottom.move(.tools, direction: .down)
+    // 默认末位现为「缓存命中」（新增模型响应/缓存命中两卡排在末两位）
+    bottom.move(.cache, direction: .down)
     check(bottom.order == PanelCardID.allCases, "move at bottom is a no-op")
     let suiteName = "ui-refinements-\(UUID().uuidString)"
     let store = UserDefaults(suiteName: suiteName)!

@@ -3,7 +3,7 @@ import AppKit
 // 面板卡片布局模型与原位设置页：稳定卡片 ID + 顺序 + 显隐集合，JSON 存 UserDefaults。
 // 仅显隐与纵向顺序；页头、footer、更新提示与凭据恢复区不参与配置。隐藏 ≠ 收起：隐藏的卡片仍照常获取数据。
 enum PanelCardID: String, CaseIterable, Codable {
-    case quota, resetCards, tibo, tokens, daily, quotaHistory, tools
+    case quota, resetCards, tibo, tokens, daily, quotaHistory, tools, response, cache
 
     var title: String {
         switch self {
@@ -14,6 +14,8 @@ enum PanelCardID: String, CaseIterable, Codable {
         case .daily: return "用量简析"
         case .quotaHistory: return "额度周期回顾"
         case .tools: return "工具明细"
+        case .response: return "模型响应"
+        case .cache: return "缓存命中"
         }
     }
 }

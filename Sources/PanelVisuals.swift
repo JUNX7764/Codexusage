@@ -2,9 +2,12 @@ import AppKit
 
 // 面板显示层的小型绘图原语与图标常量：不依赖主文件业务模型，可独立编译进 fixture。
 enum PanelVisuals {
-    // 板块标题图标：用量简析保持原有身份，额度周期回顾用独立时钟符号区分。
+    // 板块标题图标：用量简析保持原有身份，额度周期回顾用独立时钟符号区分，
+    // 模型响应/缓存命中卡各自独立符号（均为 macOS 13 可用的 SF Symbols）。
     static let dailySymbol = "chart.bar.fill"
     static let historySymbol = "clock.arrow.circlepath"
+    static let responseSymbol = "speedometer"
+    static let cacheSymbol = "arrow.triangle.2.circlepath"
 
     static let dailyCornerRadius: CGFloat = 1.5
 
