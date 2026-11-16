@@ -2653,6 +2653,11 @@ final class PanelActionButton: NSButton {
     }
     override func mouseEntered(with event: NSEvent) { hovered = true }
     override func mouseExited(with event: NSEvent) { hovered = false }
+
+    func setHoveredForPreview(_ value: Bool) {
+        hovered = value
+        updateLayer()
+    }
 }
 
 private enum PanelSurface {
@@ -4052,6 +4057,24 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     func expandToolsForPreview() { externalExpanded = true }
     func collapseDailyForPreview() { dailyExpanded = false }
+    private var quitButtonForPreview: PanelActionButton? {
+        descendants(footerContainer).compactMap({ $0 as? PanelActionButton }).first(where: {
+            $0.menuItem?.action == #selector(AppDelegate.onQuit)
+        })
+    }
+    func showQuitHoverForPreview() -> Bool {
+        guard let quit = quitButtonForPreview else { return false }
+        quit.setHoveredForPreview(true)
+        return true
+    }
+    func verifyQuitHoverForPreview() -> Bool {
+        guard let quit = quitButtonForPreview, quit.alignment == .center else { return false }
+        quit.setHoveredForPreview(true)
+        let highlighted = quit.layer?.backgroundColor?.alpha ?? 0
+        quit.setHoveredForPreview(false)
+        let cleared = quit.layer?.backgroundColor?.alpha ?? 0
+        return highlighted > 0 && cleared == 0 && !quit.trackingAreas.isEmpty
+    }
     /// 截图辅助：展示原位卡片设置页（不参与事件断言）。
     func showCardSettingsForPreview() { showCardSettings() }
     func expandAllTokenBucketsForPreview() {
@@ -4774,6 +4797,8 @@ private final class PanelFooterView: NSView {
         actions.addArrangedSubview(buttonFactory(model.loginItem, .checkbox, nil))
         actions.addArrangedSubview(PanelUI.spacer())
         let quit = buttonFactory(model.quitItem, .plain, nil)
+        // 固定宽度的独立按钮需在 hover 底色的视觉中心，不沿用整行文本按钮的左对齐。
+        quit.alignment = .center
         quit.widthAnchor.constraint(equalToConstant: 40).isActive = true
         actions.addArrangedSubview(quit)
         root.addArrangedSubview(actions)
@@ -5083,6 +5108,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if arguments.contains("--visual-preview-scroll-end") {
                         _ = self.panelController.scrollToEndForPreview()
                     }
+                    if arguments.contains("--visual-preview-quit-hover") {
+                        guard self.panelController.showQuitHoverForPreview() else {
+                            fputs("CodexUsage visual preview: quit button missing\n", stderr); exit(1)
+                        }
+                    }
                     if arguments.contains("--visual-preview-show-card-settings") {
                         self.panelController.showCardSettingsForPreview()
                     }
@@ -5123,6 +5153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard panelController.isOpen else { return fail("preview panel did not open") }
         guard panelController.verifyCardLayoutForPreview() else { return fail("card layout or spacing failed") }
+        guard panelController.verifyQuitHoverForPreview() else { return fail("quit hover alignment or state reset failed") }
         guard let statusButton = statusItem.button else { return fail("status button missing") }
         statusButton.performClick(nil)
         guard !panelController.isOpen else { return fail("status button did not close panel") }
@@ -5174,7 +5205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.postEvent(refresh, atStart: false)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     guard self.panelController.isOpen else { return fail("refresh action closed the panel") }
-                    print("CodexUsage visual event test: PASS (card layout, status button toggle, model rows, tool periods, response/cache period chips, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
+                    print("CodexUsage visual event test: PASS (card layout, quit hover alignment/reset, status button toggle, model rows, tool periods, response/cache period chips, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
                     exit(0)
                 }
             }
