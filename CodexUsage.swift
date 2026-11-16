@@ -4069,11 +4069,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
     func verifyQuitHoverForPreview() -> Bool {
         guard let quit = quitButtonForPreview, quit.alignment == .center else { return false }
+        quit.updateTrackingAreas()
         quit.setHoveredForPreview(true)
         let highlighted = quit.layer?.backgroundColor?.alpha ?? 0
         quit.setHoveredForPreview(false)
         let cleared = quit.layer?.backgroundColor?.alpha ?? 0
-        return highlighted > 0 && cleared == 0 && !quit.trackingAreas.isEmpty
+        let valid = highlighted > 0 && cleared == 0 && !quit.trackingAreas.isEmpty
+        if !valid { print("QUIT_HOVER highlighted=\(highlighted) cleared=\(cleared) tracking=\(quit.trackingAreas.count)") }
+        return valid
     }
     /// 截图辅助：展示原位卡片设置页（不参与事件断言）。
     func showCardSettingsForPreview() { showCardSettings() }
