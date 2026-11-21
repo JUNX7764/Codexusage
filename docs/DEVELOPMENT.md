@@ -1,7 +1,7 @@
 # CodexUsage 开发说明
 
 > **当前工程事实源**。构建、测试、发布或权限行为发生变化时，应在同一个提交中更新本文。
-> 最后核对：2026-11-10。
+> 最后核对：2026-11-21。
 
 ## 文档入口与效力
 
@@ -67,6 +67,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-hover-fixture
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-events --visual-preview-output=/tmp/codex-hover.png --visual-preview-hover-index=29
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-popover-test=/tmp/codex-popover
+./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-hover-test
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview-empty --visual-preview-empty-failure --visual-preview-tools
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-models
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-quota-history
@@ -82,6 +83,8 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./CodexUsage.app/Contents/MacOS/CodexUsage --visual-preview --visual-preview-events
 ```
 
+悬停时序回归 `--visual-preview-hover-test` 需要真实 GUI 会话（预览图标会真实出现在菜单栏），逐个运行且运行期间不要移动鼠标：测试先用 `detachTrackingForTesting()` 断开真实 tracking，再以固定几何/指针注入合成驱动状态机；等待步骤经 Timer 调度进入（不能从主队列 dispatch 块内嵌套 `RunLoop.run(until:)`，否则 show/hide 的 asyncAfter 会被饿死，GlmUsage 移植时的实测教训）。失败时输出 `CodexUsage hover test: FAIL <步骤>` 并以非零码退出。
+
 ## 文件说明
 
 | 文件 | 说明 |
@@ -92,6 +95,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 | `Sources/QuotaCycleHistory.swift` / `QuotaCycleStore.swift` / `QuotaCycleCoordinator.swift` / `QuotaCycleHistoryView.swift` | 额度轮次状态机、隔离存储、异步协调与原生图表 |
 | `Sources/PanelVisuals.swift` / `DeltaChip.swift` / `AnimatedTokenValue.swift` | 柱形与额度槽几何、环比胶囊、每日数值过渡的纯状态 |
 | `Sources/PanelCustomization.swift` | 卡片布局模型（显隐/顺序，JSON 持久化）与原位卡片设置页 |
+| `Sources/PanelHover.swift` | 悬停显示状态面板的几何/时序纯逻辑、偏好与开合控制器（移植自 GlmUsage） |
 | `Sources/UsageAttribution.swift` / `UsageComparison.swift` | 来源归属及比较计算 |
 | `vendor/zstddeclib.c` | 上游 zstd v1.5.7 单文件解码源，许可见 `vendor/zstd-LICENSE` |
 | `vendor/zstd_bridge.c` / `.h` | zstd 解码的 C 桥接层 |
@@ -117,6 +121,8 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 额度周期历史只消费现有 7d 请求中本次有效的数据，以稳定账户身份派生哈希分区；缺少稳定身份时不落盘。首次周期开始时间是推算，提前重置来源未确认，跨观测缺口不补造轮次；窗口变化须下一样本确认，缺口确认关闭的全程零用量窗口不入史、以锚定样本重启。重置卡 `already_redeemed` 仅确认原请求，单独出现时即使携带原请求时间也不独立生成边界；已有同操作的 `reset` 证据不会被覆盖。面板内每屏显示 6 轮，初始浏览最近 12 轮，可继续加载更早轮次；预览不创建真实历史仓库。
 
 面板卡片设置只作用于九张业务卡片的显隐与纵向顺序，改动即时写入本机偏好；「隐藏」不同于折叠，隐藏的卡片仍照常获取数据，页头、页脚、更新提示与凭据恢复区不参与排序。预览与离线回归使用默认布局基线，不读取也不写入生产偏好（截图可用 `--visual-preview-hide-cards=` 注入）。
+
+悬停显示状态面板默认开启：驻留 0.2s 自动打开、离开图标+面板组 0.30s 延迟收起、图标-面板间 8pt 桥区计入保持区、边界判定含 maxX/maxY；悬停打开的面板首次点击（含面板内点击）转固定常开（pin），普通常开点击关闭。开关在面板「···」菜单，切换即时生效；生产写偏好 `panel.hoverOpen.enabled`，预览不读生产偏好也不落盘（基线默认开，开关只翻运行时状态）。悬停打开与点击打开共用 `AppDelegate.openPanel(byHover:)` 的「打开即最新」全路径；面板关闭时 `popoverDidClose` 幂等复位呈现标记并丢弃未决 hover 转换。
 
 更新脚本接收已确认的 Release 标签和正在运行的应用路径，校验包身份、构建版本和实际安装版本后仅处理目标进程。离线脚本测试使用临时应用、伪造进程和网络命令，**不能替代真实安装环境中的更新、回滚和面板点击验收**。
 

@@ -3356,6 +3356,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     var previewWidth: CGFloat?
     var isOpen: Bool { popover.isShown }
     var previewWindowNumber: Int { contentController.view.window?.windowNumber ?? 0 }
+    /// 面板内容视图与窗口矩形：悬停控制器（AppDelegate 侧）的面板 tracking 与几何判定取值口。
+    /// 内容视图跨开合与 10s 就地重建复用，tracking 装一次即可（inVisibleRect 自动跟随）。
+    var panelContentView: NSView { contentController.view }
+    var panelWindowFrame: NSRect? { contentController.view.window?.frame }
 
     private let popover = NSPopover()
     /// 「模型响应」口径说明浮窗：控制器级持有并跨 10s 重建重锚定（视图内持有会被面板重建打断）。
@@ -3378,6 +3382,12 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private weak var anchorButton: NSStatusBarButton?
+    // 悬停显示状态面板（Sources/PanelHover.swift）：呈现来源标记与面板侧接线。
+    // 控制器本体在 AppDelegate（状态栏图标与开合动作都归那一侧）；面板关闭时由
+    // popoverDidClose 复位标记并丢弃未决 hover 转换（手动通知调用亦须幂等）。
+    weak var hoverController: PanelHoverController?
+    /// 面板当前是否由悬停驻留打开且尚未固定（pin）：首次点击与面板内点击都会转 false
+    var presentedByHover = false
     private static let maximumWidth: CGFloat = 330
     private var panelWidth = UsagePanelController.maximumWidth
 
@@ -3407,6 +3417,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         popover.behavior = .transient
         popover.animates = false
         popover.delegate = self
+        // 悬停时序回归进程：改用 applicationDefined，避免测试期间的真实鼠标点击
+        // （用户正在用机）把 transient Popover 关掉造成时序断言误报；生产与普通预览不变
+        if CommandLine.arguments.contains("--visual-preview-hover-test") {
+            popover.behavior = .applicationDefined
+        }
         if CommandLine.arguments.contains("--visual-preview-dark") {
             popover.appearance = NSAppearance(named: .darkAqua)
         }
@@ -3732,6 +3747,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         cards.target = self
         cards.isEnabled = !showingCardSettings
         menu.addItem(cards)
+        let hover = NSMenuItem(title: "悬停显示状态面板", action: #selector(toggleHoverPanel), keyEquivalent: "")
+        hover.target = self
+        hover.state = panelHoverEnabled ? .on : .off
+        menu.addItem(hover)
         let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
         background.submenu = makeBackgroundStyleMenu()
         menu.addItem(background)
@@ -3745,6 +3764,39 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if hadMonitors { removeMonitors() }
         menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.maxX, y: -6), in: sender)
         if hadMonitors && isOpen { installMonitors() }
+    }
+
+    // MARK: 悬停显示状态面板开关（「···」菜单）
+
+    /// 开关的呈现状态：生产读偏好（与控制器运行时在启动/切换时保持同步）；
+    /// 预览不读生产偏好也不落盘，固定基线「默认开启」，开关只翻运行时状态。
+    private var panelHoverEnabled: Bool { isPreviewMode ? true : PanelHoverPreference.load() }
+
+    @objc private func toggleHoverPanel() {
+        // 运行时状态以控制器为准翻转；生产同步落盘偏好，preview 不写生产 UserDefaults
+        let next = !(hoverController?.isEnabled ?? panelHoverEnabled)
+        if !isPreviewMode { PanelHoverPreference.save(next) }
+        hoverController?.setEnabled(next)
+    }
+
+    /// 「···」菜单悬停开关的离线回归：item 存在且接线正确、state 与呈现状态一致、
+    /// 翻转即时改运行时状态且 preview 不落盘（偏好键原值前后不变，允许既有生产值存在）。
+    func verifyHoverSettingsToggleForPreview() -> Bool {
+        let menu = makePanelSettingsMenu()
+        guard let item = menu.items.first(where: { $0.title == "悬停显示状态面板" }),
+              item.action == #selector(toggleHoverPanel), item.target === self else { return false }
+        guard item.state == (panelHoverEnabled ? .on : .off) else { return false }
+        guard let controller = hoverController else { return false }
+        let persistedBefore = UserDefaults.standard.bool(forKey: PanelHoverPreference.defaultsKey)
+        let wasEnabled = controller.isEnabled
+        toggleHoverPanel()
+        guard controller.isEnabled == !wasEnabled else { return false }
+        toggleHoverPanel()
+        guard controller.isEnabled == wasEnabled else { return false }
+        // preview 不落盘：布尔值前后不变（若存在既有生产值，同样必须保持原样）
+        guard isPreviewMode,
+              UserDefaults.standard.bool(forKey: PanelHoverPreference.defaultsKey) == persistedBefore else { return false }
+        return true
     }
 
     @objc private func showCardSettings() {
@@ -4055,10 +4107,12 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         func editor() -> PanelCardSettingsView? { descendants(contentController.view).compactMap { $0 as? PanelCardSettingsView }.first }
         func fail(_ message: String) -> Bool { print("CODEX_CARD_SETTINGS \(message)"); return false }
 
-        // 统一「···」菜单：卡片设置入口 + 背景样式子菜单；未进入设置页时入口可用
+        // 统一「···」菜单：卡片设置入口 + 悬停开关 + 背景样式子菜单；未进入设置页时入口可用
         let menu = makePanelSettingsMenu()
-        guard menu.items.map(\.title) == ["卡片显示与排序…", "背景样式"], menu.items[0].isEnabled,
-              let backgroundMenu = menu.items[1].submenu,
+        guard menu.items.map(\.title) == ["卡片显示与排序…", "悬停显示状态面板", "背景样式"], menu.items[0].isEnabled,
+              let hoverItem = menu.items.first(where: { $0.title == "悬停显示状态面板" }),
+              hoverItem.action == #selector(toggleHoverPanel), hoverItem.target === self,
+              let backgroundMenu = menu.items[2].submenu,
               backgroundMenu.items.map(\.title).contains("纯色"),
               backgroundMenu.items.contains(where: { $0.title.hasPrefix("液态玻璃") }) else { return fail("menu structure") }
 
@@ -4725,7 +4779,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if isOpen { close() } else { show(anchoredTo: button) }
     }
 
-    private func show(anchoredTo button: NSStatusBarButton) {
+    /// 打开面板：AppDelegate 的 openPanel(byHover:)（点击与 hover 共用路径）与预览回归直接调用。
+    func show(anchoredTo button: NSStatusBarButton) {
         applyBackgroundStyle()
         guard let buttonWindow = button.window else { return }
         anchorButton = button
@@ -4733,7 +4788,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         layoutPanel(anchoredTo: button, buttonWindow: buttonWindow)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         contentController.view.window?.makeFirstResponder(nil)
-        if popover.isShown { installMonitors() }
+        if popover.isShown {
+            installMonitors()
+            hoverController?.installPanelTrackingIfNeeded()
+        }
         let clip = scrollView.contentView
         clip.scroll(to: clip.constrainBoundsRect(NSRect(origin: savedScrollOrigin, size: clip.bounds.size)).origin)
         scrollView.reflectScrolledClipView(clip)
@@ -4777,7 +4835,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                 if event.keyCode == 53 { self.close(); return nil }
                 return event
             }
-            if event.window === self.contentController.view.window || event.window === self.anchorButton?.window { return event }
+            if event.window === self.contentController.view.window || event.window === self.anchorButton?.window {
+                // 面板内点击即固定为常开（hover 呈现语义）；图标点击由 AppDelegate.togglePanel 分派
+                if event.window === self.contentController.view.window && self.presentedByHover {
+                    self.presentedByHover = false
+                }
+                return event
+            }
             self.close()
             return event
         }
@@ -4833,6 +4897,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         cardSettingsWidthConstraint?.isActive = false
         cardSettingsWidthConstraint = nil
         removeMonitors()
+        // hover 呈现标记与未决 hover 转换随关闭复位（self-test 有手动通知调用，必须幂等）
+        presentedByHover = false
+        hoverController?.panelDidClose()
         anchorButton = nil
     }
 
@@ -5112,6 +5179,9 @@ private final class PanelFooterView: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let panelController = UsagePanelController()
+    // 悬停显示状态面板控制器（Sources/PanelHover.swift）；面板侧接线经
+    // panelController.hoverController 弱引用回接，popover 关闭时由 popoverDidClose 复位
+    private var panelHoverController: PanelHoverController?
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
@@ -5159,6 +5229,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.isVisible = true
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
+        // 悬停显示状态面板：驻留 0.2s 开、离组 0.30s 收、首次点击 pin。
+        // preview 进程仅在 --visual-preview-hover-test 启用，其余 GUI 回归不受真实鼠标驻留干扰
+        let hover = PanelHoverController(iconView: statusItem.button)
+        hover.isPanelShown = { [weak self] in self?.panelController.isOpen ?? false }
+        hover.presentedByHover = { [weak self] in self?.panelController.presentedByHover ?? false }
+        hover.statusItemFrame = { [weak self] in self?.statusItemButtonScreenFrame() }
+        hover.panelFrame = { [weak self] in self?.panelController.panelWindowFrame }
+        hover.panelView = { [weak self] in self?.panelController.panelContentView }
+        hover.performShow = { [weak self] in self?.openPanel(byHover: true) }
+        hover.performHide = { [weak self] in self?.panelController.close() }
+        panelController.hoverController = hover
+        panelHoverController = hover
+        if visualPreview
+            ? CommandLine.arguments.contains("--visual-preview-hover-test")
+            : PanelHoverPreference.load() {
+            hover.setEnabled(true)
+        }
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
         panelController.onConfirmUpdate = { [weak self] tag, notes in self?.startConfirmedUpdate(tag: tag, notes: notes) }
         panelController.onUseReset = { [weak self] in self?.beginUseReset() }
@@ -5397,6 +5484,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 print("CodexUsage card settings test: PASS"); exit(0)
             }
+            if arguments.contains("--visual-preview-hover-test") {
+                // 必须用 Timer 而非 dispatch 调度：本块处于 didFinishLaunching 的主队列
+                // drain 链中，测试内的 RunLoop.run(until:) 嵌套运行不会服务被外层
+                // dispatch 块占住（latch）的主队列，asyncAfter 的 show/hide 定时会饿死；
+                // Timer 是 run loop callout，嵌套 run 期间主队列空闲、定时可正常触发
+                let hoverTimer = Timer(timeInterval: 0.8, repeats: false) { [weak self] _ in
+                    self?.runHoverPresentationTest()
+                }
+                RunLoop.main.add(hoverTimer, forMode: .default)
+            }
             let outputPrefix = "--visual-preview-output="
             if let argument = arguments.first(where: { $0.hasPrefix(outputPrefix) }) {
                 let path = String(argument.dropFirst(outputPrefix.count))
@@ -5630,13 +5727,141 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func togglePanel() {
+        if panelController.isOpen {
+            // hover 打开且未固定：首次点击转常开（pin，防误关），移开鼠标不再自动收，不关闭
+            if panelController.presentedByHover {
+                panelController.presentedByHover = false
+                panelHoverController?.cancelPending()
+                return
+            }
+            panelController.close()
+            return
+        }
+        openPanel(byHover: false)
+    }
+
+    /// 打开面板。hover 打开与点击打开共用「打开即最新」全路径（rebuildMenu + 刷新 + 更新检查），
+    /// 仅来源标记不同；refresh/checkForUpdate 自带 preview 与节流门控，不增加请求频率。
+    private func openPanel(byHover: Bool) {
         guard let button = statusItem.button else { return }
-        if !panelController.isOpen { rebuildMenu() }
-        panelController.toggle(anchoredTo: button)
+        panelController.presentedByHover = byHover
+        rebuildMenu()
+        panelController.show(anchoredTo: button)
         if panelController.isOpen {
             refresh()
             checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
         }
+    }
+
+    /// 状态栏图标的屏幕矩形（悬停几何基准，与点外关闭的 global monitor 同款换算）。
+    private func statusItemButtonScreenFrame() -> NSRect? {
+        guard let button = statusItem.button, let window = button.window else { return nil }
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        return frame.width > 0 && frame.height > 0 ? frame : nil
+    }
+
+    /// 悬停开合时序回归（--visual-preview-hover-test）：几何与指针位置全部注入固定值，
+    /// 不依赖真实鼠标/屏幕。真实 tracking 事件（鼠标划过图标/面板）仍可能扰动，
+    /// 测试须逐个运行、勿在菜单栏上移动鼠标。时序覆盖：驻留开 → 跨桥区保持 →
+    /// 离组 0.3s 收 → hover 开后点击 pin → pin 后点击关 → 面板内点击 pin → 开关即时生效与关停。
+    private func runHoverPresentationTest() {
+        func fail(_ message: String) -> Never { fputs("CodexUsage hover test: FAIL \(message)\n", stderr); exit(1) }
+        guard let hover = panelHoverController, hover.isEnabled else {
+            fail("hover controller missing or disabled")
+        }
+        // 断开真实 tracking：预览图标会真的出现在菜单栏，真实光标的 enter/exit 会取消合成时序
+        hover.detachTrackingForTesting()
+        let iconRect = NSRect(x: 1200, y: 1055, width: 40, height: 24)
+        let panelRect = NSRect(x: 1180, y: 640, width: 340, height: 400)
+        hover.statusItemFrame = { iconRect }
+        hover.panelFrame = { panelRect }
+        func wait(_ seconds: Double) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
+        func expectShown(_ shown: Bool, _ step: String) {
+            guard panelController.isOpen == shown else {
+                fail("\(step): expected shown=\(shown), actual=\(panelController.isOpen), hoverMarked=\(panelController.presentedByHover), controllerEnabled=\(hover.isEnabled)")
+            }
+            print("CODEX_HOVER_TEST \(step): ok")
+        }
+        // 固定指针位置的便捷写法
+        func pointAt(_ x: CGFloat, _ y: CGFloat) { hover.pointerLocation = { NSPoint(x: x, y: y) } }
+
+        // 起始态：启动时自动打开的面板先关掉，从关闭态起跑。
+        // 直接 close 而非 togglePanel：若真实光标恰停在图标上，自动打开的面板会带
+        // presentedByHover 标记，togglePanel 的 pin 语义会拒绝关闭（起始布置非断言步骤）
+        if panelController.isOpen { panelController.close() }
+        wait(0.3)
+        expectShown(false, "initial-close")
+
+        // 1. 图标驻留 0.2s 才打开；0.1s 不开
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.1)
+        guard !panelController.isOpen else { fail("dwell 0.1s must not open") }
+        wait(0.5)
+        expectShown(true, "dwell-opens")
+        guard panelController.presentedByHover else { fail("hover-open must mark presentedByHover") }
+
+        // 2. 图标→面板跨桥区：先排 hide 后被面板 enter 取消，保持打开
+        pointAt(panelRect.midX, panelRect.midY)
+        hover.iconExited()
+        wait(0.05)
+        hover.panelEntered()
+        wait(0.6)
+        expectShown(true, "icon-to-panel-keeps-open")
+
+        // 3. 离开面板（远离）→ 0.3s 收起
+        pointAt(200, 300)
+        hover.panelExited()
+        wait(0.15)
+        guard panelController.isOpen else { fail("0.15s after leave must still be open") }
+        wait(0.45)
+        expectShown(false, "leave-closes")
+        guard !panelController.presentedByHover else { fail("close must reset presentedByHover") }
+
+        // 4. 重新悬停打开 → 首次点击=pin（不关闭）；pin 后离开图标不收
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.6)
+        expectShown(true, "reopens-by-dwell")
+        togglePanel()
+        guard panelController.isOpen, !panelController.presentedByHover else { fail("first click on hover-open panel must pin") }
+        print("CODEX_HOVER_TEST click-pins: ok")
+        hover.iconExited()
+        wait(0.6)
+        expectShown(true, "pinned-survives-icon-exit")
+
+        // 5. pin 后再点 → 关闭
+        togglePanel()
+        expectShown(false, "second-click-closes")
+
+        // 6. 面板内点击=pin（local monitor 置位）→ 离开面板不收
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.6)
+        guard panelController.isOpen, panelController.presentedByHover else { fail("reopens-by-dwell again") }
+        panelController.presentedByHover = false   // 与 installMonitors 面板内点击处置一致
+        hover.panelExited()
+        wait(0.6)
+        expectShown(true, "panel-click-pinned-survives-exit")
+        togglePanel()
+        expectShown(false, "close-after-panel-pin")
+
+        // 7. `···` 菜单开关：运行时即时生效（preview 不落盘，断言只验证翻转本身）
+        guard panelController.verifyHoverSettingsToggleForPreview() else { fail("settings toggle") }
+        print("CODEX_HOVER_TEST settings-toggle: ok")
+
+        // 8. 关闭开关时仍处 hover 呈现的面板应收起；
+        //    直接调控制器以隔离 preview 下「偏好值≠arg 启用态」的分叉
+        hover.iconEntered()
+        wait(0.6)
+        guard panelController.isOpen, panelController.presentedByHover else { fail("reopen for disable test") }
+        hover.setEnabled(false)
+        wait(0.2)
+        expectShown(false, "disable-while-hover-open-closes")
+        hover.setEnabled(true)
+
+        print("CodexUsage hover test: PASS")
+        exit(0)
     }
 
 
@@ -7985,7 +8210,62 @@ enum CodexOfflineRegression {
             try expect(NSImage(systemSymbolName: PanelVisuals.historySymbol, accessibilityDescription: nil) != nil,
                        "history symbol exists on this runtime")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/per-model attribution/model switching/.zst archives/real-frame decode/tail-read, external usage model/parse/per-model scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist, panel card layout/normalize/persist-fallback, token value transition, panel visuals geometry/symbols)")
+            // 悬停面板纯逻辑（Sources/PanelHover.swift）：inclusive 边界、桥区（只放宽
+            // keep-open 不放宽打开）、转换 token 簿记、点击决策矩阵、偏好默认值
+            let hoverIcon = NSRect(x: 100, y: 760, width: 40, height: 24)
+            let hoverPanel = NSRect(x: 100, y: 400, width: 320, height: 340)
+            let hoverGeo = PanelHoverGeometry(statusItemFrame: hoverIcon, panelFrames: [hoverPanel])
+            try expect(!hoverIcon.contains(NSPoint(x: hoverIcon.maxX, y: hoverIcon.maxY)),
+                       "对照：NSRect.contains 为半开（右/上边缘不在内）")
+            try expect(PanelHoverGeometry.containsInclusive(hoverIcon, NSPoint(x: hoverIcon.maxX, y: hoverIcon.maxY)),
+                       "inclusive 判定必须含右/上边缘像素（菜单栏图标常在边缘悬停/点击）")
+            try expect(hoverGeo.containsStatusItem(NSPoint(x: hoverIcon.minX, y: hoverIcon.minY)),
+                       "图标判定含左/下边缘")
+            try expect(!hoverGeo.containsStatusItem(NSPoint(x: hoverIcon.maxX + 1, y: hoverIcon.midY)),
+                       "图标判定不外扩")
+            try expect(hoverGeo.containsPanel(NSPoint(x: hoverPanel.maxX, y: hoverPanel.maxY)),
+                       "面板判定含右/上边缘")
+            try expect(hoverGeo.isWithinHoverArea(NSPoint(x: hoverIcon.midX, y: hoverPanel.maxY + 4)),
+                       "图标-面板桥区计入保持区")
+            try expect(!hoverGeo.isWithinHoverArea(NSPoint(x: hoverIcon.midX, y: hoverPanel.maxY + 10)),
+                       "桥区外不保持（面板桥 8pt 与图标桥 8pt 之间的死区）")
+            try expect(!hoverGeo.isWithinHoverArea(NSPoint(x: 0, y: 0)), "远离区域不保持")
+            let hoverGeoNoPanel = PanelHoverGeometry(statusItemFrame: hoverIcon, panelFrames: [])
+            try expect(hoverGeoNoPanel.isWithinHoverArea(NSPoint(x: hoverIcon.minX - 5, y: hoverIcon.midY)),
+                       "无面板时图标周围桥区仍保持")
+            try expect(!hoverGeoNoPanel.isWithinHoverArea(NSPoint(x: hoverIcon.minX - 20, y: hoverIcon.midY)),
+                       "无面板时远离图标不保持")
+            try expect(PanelHoverGeometry(statusItemFrame: nil, panelFrames: []).isWithinHoverArea(NSPoint(x: 0, y: 0)) == false,
+                       "无图标无面板时处处不保持")
+            try expect(!hoverGeo.containsStatusItem(NSPoint(x: hoverPanel.midX, y: hoverPanel.midY))
+                       && hoverGeo.isWithinHoverArea(NSPoint(x: hoverPanel.midX, y: hoverPanel.midY)),
+                       "桥区判定不把面板内点误判为图标")
+
+            var hoverIntent = PanelHoverIntent()
+            let hoverToken1 = hoverIntent.begin(.show)
+            try expect(hoverIntent.consume(hoverToken1), "首次触发应生效")
+            try expect(!hoverIntent.consume(hoverToken1), "同 token 二次触发须被丢弃")
+            let hoverToken2 = hoverIntent.begin(.hide)
+            hoverIntent.cancel()
+            try expect(!hoverIntent.consume(hoverToken2), "取消后的触发须被丢弃")
+            let hoverToken3 = hoverIntent.begin(.show)
+            _ = hoverIntent.begin(.hide)
+            try expect(!hoverIntent.consume(hoverToken3), "被新转换顶替的旧 token 须失效")
+
+            try expect(panelHoverClickOutcome(isShown: false, presentedByHover: false) == .present, "未打开点击=打开")
+            try expect(panelHoverClickOutcome(isShown: true, presentedByHover: false) == .close, "普通常开点击=关闭")
+            try expect(panelHoverClickOutcome(isShown: true, presentedByHover: true) == .pin, "hover 打开首次点击=固定常开")
+
+            let hoverSuite = "CodexUsage-self-test-hover-\(UUID().uuidString)"
+            let hoverStore = UserDefaults(suiteName: hoverSuite)!
+            defer { hoverStore.removePersistentDomain(forName: hoverSuite) }
+            try expect(PanelHoverPreference.load(from: hoverStore), "悬停偏好缺省必须为开")
+            hoverStore.set(false, forKey: PanelHoverPreference.defaultsKey)
+            try expect(!PanelHoverPreference.load(from: hoverStore), "悬停偏好写入后须如实读取")
+            PanelHoverPreference.save(true, to: hoverStore)
+            try expect(PanelHoverPreference.load(from: hoverStore), "悬停偏好 save 须写回")
+
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/per-model attribution/model switching/.zst archives/real-frame decode/tail-read, external usage model/parse/per-model scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist, panel card layout/normalize/persist-fallback, token value transition, panel visuals geometry/symbols, panel hover geometry/intent/click-outcome/preference)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
