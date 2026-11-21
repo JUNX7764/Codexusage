@@ -3384,7 +3384,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private weak var anchorButton: NSStatusBarButton?
     // 悬停显示状态面板（Sources/PanelHover.swift）：呈现来源标记与面板侧接线。
     // 控制器本体在 AppDelegate（状态栏图标与开合动作都归那一侧）；面板关闭时由
-    // popoverDidClose 复位标记并丢弃未决 hover 转换（手动通知调用亦须幂等）。
+    // popoverDidClose 复位标记并丢弃未决 hover 转换（preview 确认测试有手动通知调用，亦须幂等）。
     weak var hoverController: PanelHoverController?
     /// 面板当前是否由悬停驻留打开且尚未固定（pin）：首次点击与面板内点击都会转 false
     var presentedByHover = false
@@ -3768,13 +3768,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     // MARK: 悬停显示状态面板开关（「···」菜单）
 
-    /// 开关的呈现状态：生产读偏好（与控制器运行时在启动/切换时保持同步）；
-    /// 预览不读生产偏好也不落盘，固定基线「默认开启」，开关只翻运行时状态。
-    private var panelHoverEnabled: Bool { isPreviewMode ? true : PanelHoverPreference.load() }
+    /// 开关的呈现状态：以控制器运行时为准（生产启动时从偏好初始化，preview 基线默认开），
+    /// 避免菜单 state 与运行时脱节；控制器缺失时回退默认开启。落盘仍只在生产路径。
+    private var panelHoverEnabled: Bool { hoverController?.isEnabled ?? true }
 
     @objc private func toggleHoverPanel() {
         // 运行时状态以控制器为准翻转；生产同步落盘偏好，preview 不写生产 UserDefaults
-        let next = !(hoverController?.isEnabled ?? panelHoverEnabled)
+        let next = !(hoverController?.isEnabled ?? true)
         if !isPreviewMode { PanelHoverPreference.save(next) }
         hoverController?.setEnabled(next)
     }
@@ -4836,7 +4836,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                 return event
             }
             if event.window === self.contentController.view.window || event.window === self.anchorButton?.window {
-                // 面板内点击即固定为常开（hover 呈现语义）；图标点击由 AppDelegate.togglePanel 分派
+                // 面板内点击即固定为常开（hover 呈现语义）；图标点击由 AppDelegate.togglePanel 分派。
+                // 刻意不移植 GlmUsage 的 window ?? NSApp.window(withWindowNumber:) 回退：nil-window
+                // 事件按窗外关闭处理是 runVisualPanelEventTest 合成外点（windowNumber: 0）所需语义，
+                // 真实鼠标事件不出现 nil window——勿为「对齐姊妹仓库」而改。
                 if event.window === self.contentController.view.window && self.presentedByHover {
                     self.presentedByHover = false
                 }
@@ -4897,7 +4900,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         cardSettingsWidthConstraint?.isActive = false
         cardSettingsWidthConstraint = nil
         removeMonitors()
-        // hover 呈现标记与未决 hover 转换随关闭复位（self-test 有手动通知调用，必须幂等）
+        // hover 呈现标记与未决 hover 转换随关闭复位（preview 确认测试有手动通知调用，必须幂等）
         presentedByHover = false
         hoverController?.panelDidClose()
         anchorButton = nil
@@ -5744,6 +5747,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 仅来源标记不同；refresh/checkForUpdate 自带 preview 与节流门控，不增加请求频率。
     private func openPanel(byHover: Bool) {
         guard let button = statusItem.button else { return }
+        // 丢弃未决驻留 show：点开→立刻点关且指针未离开图标时，陈旧 show 定时器会
+        // 在 ~0.05s 后带 hover 标记重开面板（对齐参照实现的已知边角，关闭路径须主动取消）
+        panelHoverController?.cancelPending()
         panelController.presentedByHover = byHover
         rebuildMenu()
         panelController.show(anchoredTo: button)
