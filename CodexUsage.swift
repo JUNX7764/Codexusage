@@ -70,26 +70,6 @@ enum AtomicJSONFile {
     }
 }
 
-final class RefreshGate {
-    private let lock = NSLock()
-    private var active = false
-    private var queuedManual = false
-
-    func begin(manual: Bool) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard !active else { if manual { queuedManual = true }; return false }
-        active = true
-        return true
-    }
-
-    func finish() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if queuedManual { queuedManual = false; return true }
-        active = false
-        return false
-    }
-}
-
 enum CodexFreshness {
     static func updated(_ previous: Date?, succeeded: Bool, at: Date) -> Date? {
         succeeded ? at : previous
@@ -117,12 +97,6 @@ enum CodexFreshness {
             return (old, oldLastOK, failure)
         }
         return (old, oldLastOK, oldError)
-    }
-}
-
-enum CodexRefreshSchedule {
-    static func slowItemsDue(cycle: Int, every: Int = 5, manual: Bool) -> Bool {
-        manual || (every > 0 && cycle % every == 0)
     }
 }
 
@@ -368,6 +342,9 @@ struct UsageData {
     var tokensToday: TokenScanner.Stats?
     var tokens7d: TokenScanner.Stats?
     var tokens30d: TokenScanner.Stats?
+    var localSampleDay: String?
+    var localStatus: UsageSourceStatus = .pending
+    var externalSampleDay: String?
     var externalTools: [String: [ExternalTokenScanner.Stats]] = [:]
     var sourceStatus: [String: UsageSourceStatus] = [:]
     var official: OfficialUsageSnapshot?
@@ -872,6 +849,7 @@ struct ModelRunStats: Equatable {
     var requests = 0.0
     var sumDuration = 0.0
     var sumOutput = 0.0
+    var timedOutput = 0.0
     var sumInput = 0.0
     var sumCached = 0.0
     var sumCacheWrite = 0.0
@@ -883,13 +861,14 @@ struct ModelRunStats: Equatable {
     /// 加权 tok/s = SUM(output_tokens) / SUM(dur)（分母秒），按模型分组汇总口径；
     /// 无耗时证据（如整文件回退记录）→ nil（UI 显 —）
     var weightedTps: Double? {
-        sumDuration > 0 ? sumOutput / sumDuration : nil
+        sumDuration > 0 ? timedOutput / sumDuration : nil
     }
 
     /// 中位耗时：8 桶直方图累积插值——累积计数跨过 n/2 的桶内按计数占比线性插值
     var medianSeconds: Double? {
-        guard requests > 0 else { return nil }
-        let target = requests / 2
+        let timedRequests = histogram.reduce(0, +)
+        guard timedRequests > 0 else { return nil }
+        let target = timedRequests / 2
         var cumulative = 0.0
         var lower = 0.0
         for (index, count) in histogram.enumerated() {
@@ -919,6 +898,7 @@ struct ModelRunStats: Equatable {
             result.requests += stats.requests
             result.sumDuration += stats.sumDuration
             result.sumOutput += stats.sumOutput
+            result.timedOutput += stats.timedOutput
             result.sumInput += stats.sumInput
             result.sumCached += stats.sumCached
             result.sumCacheWrite += stats.sumCacheWrite
@@ -930,6 +910,9 @@ struct ModelRunStats: Equatable {
 
 enum TokenScanner {
     struct FileEntry: Codable {
+        var device: UInt64?
+        var inode: UInt64?
+        var boundary: Data?
         var size: Int64 = 0
         var mtime: Double = 0
         var offset: UInt64 = 0
@@ -949,12 +932,15 @@ enum TokenScanner {
     }
     // Model dimensions require one rebuild; aggregate totals keep the original accounting rules.
     // v4：新增 recordDaysByModel 等 14 值布局字段；旧 v3 状态作废整体重扫（代价秒级）。
-    struct State: Codable { var version: Int = 4; var files: [String: FileEntry] = [:] }
+    struct State: Codable { var version: Int = 5; var files: [String: FileEntry] = [:]; var sampleDate: String? }
     struct Result {
         var today = Stats()
         var seven = Stats()
         var thirty = Stats()
         var error: String?
+        var sourceStatus: UsageSourceStatus = .available
+        var isPartial = false
+        var sampleDate: String?
     }
     struct Stats {
         var input = 0.0
@@ -967,7 +953,7 @@ enum TokenScanner {
 
     static let sessionsRoot = NSHomeDirectory() + "/.codex/sessions"
     static let defaultStatePath = NSHomeDirectory()
-        + "/Library/Application Support/CodexUsage/scan-state.json"
+        + "/Library/Application Support/CodexUsage/scan-state-v5.json"
     private static let lock = NSLock()
     private static var cache: State?
     private static let dayFmt: DateFormatter = {
@@ -990,7 +976,20 @@ enum TokenScanner {
         var seen = Set<String>()
         var enumed = false
         var enumFailed = false
-        if let enumm = FileManager.default.enumerator(
+        var readFailed = false
+        var dirty = false
+        for path in Array(st.files.keys) {
+            guard var entry = st.files[path] else { continue }
+            let before = entry.days.count + entry.daysByModel.count + entry.recordDaysByModel.count
+            entry.days = entry.days.filter { $0.key >= cutoff30 }
+            entry.daysByModel = entry.daysByModel.filter { $0.key >= cutoff30 }
+            entry.recordDaysByModel = entry.recordDaysByModel.filter { $0.key >= cutoff30 }
+            if before != entry.days.count + entry.daysByModel.count + entry.recordDaysByModel.count { dirty = true; st.files[path] = entry }
+        }
+        var isDirectory: ObjCBool = false
+        let rootExists = FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory)
+        if !rootExists || !isDirectory.boolValue { enumFailed = true }
+        if rootExists && isDirectory.boolValue, let enumm = FileManager.default.enumerator(
             at: URL(fileURLWithPath: root),
             includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
             options: [.skipsHiddenFiles],
@@ -1007,7 +1006,7 @@ enum TokenScanner {
                 if compressed && FileManager.default.fileExists(atPath: String(path.dropLast(4))) { continue }
                 seen.insert(path)
                 guard let vals = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
-                      let size = vals.fileSize else { continue }
+                      let size = vals.fileSize else { readFailed = true; continue }
                 let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
                 let cached = st.files[path]
                 let valid = cached.map { entry in
@@ -1016,18 +1015,32 @@ enum TokenScanner {
                             models.values.allSatisfy { $0.count == 3 }
                         }
                         && entry.recordDaysByModel.values.allSatisfy { models in
-                            models.values.allSatisfy { $0.count == 14 }
+                            models.values.allSatisfy { $0.count == 15 }
                         }
                         && (compressed || entry.offset <= UInt64(max(0, entry.size)))
                 } ?? true
-                if !valid { st.files.removeValue(forKey: path) }
+                if !valid { st.files.removeValue(forKey: path); dirty = true }
                 let old = valid ? cached : nil
                 // An old filename may still be active: only skip when its mtime is also outside the window.
                 if old == nil && fallbackDay < cutoff30 && mtime > 0 &&
                     dayFmt.string(from: Date(timeIntervalSince1970: mtime)) < cutoff30 { continue }
-                if let e = old, e.size == Int64(size), e.mtime == mtime { continue }
+                guard let identityHandle = FileHandle(forReadingAtPath: path) else { readFailed = true; continue }
+                var fileStat = stat()
+                guard fstat(identityHandle.fileDescriptor, &fileStat) == 0 else { try? identityHandle.close(); readFailed = true; continue }
+                let device = UInt64(fileStat.st_dev), inode = UInt64(fileStat.st_ino)
+                var boundaryMatches = false
+                if let e = old, e.device == device, e.inode == inode, let boundary = e.boundary,
+                   (compressed ? UInt64(max(0, e.size)) : e.offset) <= UInt64(max(0, fileStat.st_size)),
+                   (compressed ? UInt64(max(0, e.size)) : e.offset) >= UInt64(boundary.count) {
+                    let boundaryEnd = compressed ? UInt64(max(0, e.size)) : e.offset
+                    var bytes = [UInt8](repeating: 0, count: boundary.count)
+                    let n = bytes.withUnsafeMutableBytes { pread(identityHandle.fileDescriptor, $0.baseAddress, boundary.count, off_t(boundaryEnd - UInt64(boundary.count))) }
+                    boundaryMatches = n == boundary.count && Data(bytes) == boundary
+                }
+                try? identityHandle.close()
+                if let e = old, e.size == Int64(size), e.mtime == mtime, boundaryMatches { continue }
                 var entry = old ?? FileEntry()
-                let append = !compressed && old != nil && Int64(size) > entry.size
+                let append = !compressed && old != nil && boundaryMatches && Int64(size) > entry.size
                 if !append { entry = FileEntry() }
                 // 逐行预筛（needle 只做粗筛，分支内严格校验 type + payload.type）：
                 // v4 新增 token_usage_record / call_output（同时覆盖 custom/function 两种
@@ -1082,10 +1095,11 @@ enum TokenScanner {
                     if type == "token_usage_record" {
                         // usageSource==2：整文件已由 last_token_usage 回退取得所有权（先到先得），
                         // 不混入 record 防双计；record 源文件（0/1）正常写入
-                        guard entry.usageSource != 2,
-                              let usage = payload["usage"] as? [String: Any],
+                        guard let usage = payload["usage"] as? [String: Any],
                               let date = Fmt.parseDateValue(obj["timestamp"]) else { return }
                         sawRecord = true
+                        if entry.usageSource == 2 { entry.recordDaysByModel = [:] }
+                        entry.usageSource = 1
                         let ts = date.timeIntervalSince1970
                         // 端到端耗时 = record 时刻 − max(最近边界, turn 起点)；无任何边界 → dur 0 被守卫剔除
                         var startCandidate = entry.boundaryTs
@@ -1102,10 +1116,11 @@ enum TokenScanner {
                             let dayKey = dayFmt.string(from: date)   // 事件本地日；时间戳已解析成功
                             let model = entry.currentModel ?? "未知模型"
                             var models = entry.recordDaysByModel[dayKey] ?? [:]
-                            var bucket = models[model] ?? [Double](repeating: 0, count: 14)
+                            var bucket = models[model] ?? [Double](repeating: 0, count: 15)
                             bucket[0] += 1
                             bucket[1] += dur
                             bucket[2] += output
+                            bucket[14] += output
                             bucket[3] += input
                             bucket[4] += cached
                             bucket[5] += write
@@ -1164,30 +1179,45 @@ enum TokenScanner {
                 }
                 var readOK = true
                 if compressed {
-                    if let bytes = zstdDecompress(path: path) {
-                        consume(bytes)
-                        if !pending.isEmpty { parseLine(pending); consumed += UInt64(pending.count) }
-                    } else { readOK = false }
+                    readOK = streamZstd(path: path) { chunk in consume(chunk) }
+                    if readOK && !pending.isEmpty { parseLine(pending); consumed += UInt64(pending.count) }
                 } else if let handle = FileHandle(forReadingAtPath: path) {
                     do {
                         try handle.seek(toOffset: entry.offset)
-                        while let chunk = try handle.read(upToCount: 256 * 1024), !chunk.isEmpty { consume(chunk) }
+                        var eof = false
+                        while !eof {
+                            try autoreleasepool {
+                                guard let chunk = try handle.read(upToCount: 256 * 1024), !chunk.isEmpty else { eof = true; return }
+                                consume(chunk)
+                            }
+                        }
                         try handle.close()
                     } catch { try? handle.close(); readOK = false }
                 } else { readOK = false }
-                guard readOK else { continue }
+                guard readOK else { readFailed = true; continue }
                 // Pending bytes are intentionally reread when the writer finishes that line.
                 entry.offset += consumed
                 entry.size = Int64(size); entry.mtime = mtime
+                entry.device = device; entry.inode = inode
+                if let boundaryHandle = FileHandle(forReadingAtPath: path) {
+                    let boundaryEnd = compressed ? UInt64(max(0, entry.size)) : entry.offset
+                    let count = Int(min(boundaryEnd, 64))
+                    var bytes = [UInt8](repeating: 0, count: count)
+                    let n = bytes.withUnsafeMutableBytes { pread(boundaryHandle.fileDescriptor, $0.baseAddress, count, off_t(boundaryEnd - UInt64(count))) }
+                    try? boundaryHandle.close()
+                    guard n == count else { readFailed = true; continue }
+                    entry.boundary = Data(bytes)
+                } else { readFailed = true; continue }
                 // v4 统计源声明（先到先得）：文件内出现过 record → record 源；
                 // 整文件零 record 且存在 last_token_usage 候选才整文件级回退一份
                 //（旧格式只有累计 total 的贡献为 0；回退记录无耗时证据 → tok/s 与中位 —）
-                if entry.usageSource == 0 {
+                if entry.usageSource != 1 {
                     if sawRecord {
                         entry.usageSource = 1
                     } else if let fb = fallback {
+                        entry.recordDaysByModel = [:]
                         var models = entry.recordDaysByModel[fb.day] ?? [:]
-                        var bucket = models[fb.model] ?? [Double](repeating: 0, count: 14)
+                        var bucket = models[fb.model] ?? [Double](repeating: 0, count: 15)
                         bucket[0] += 1
                         bucket[2] += fb.output
                         bucket[3] += fb.input
@@ -1203,17 +1233,21 @@ enum TokenScanner {
                 entry.daysByModel = entry.daysByModel.filter { $0.key >= cutoff30 }
                 entry.recordDaysByModel = entry.recordDaysByModel.filter { $0.key >= cutoff30 }
                 st.files[path] = entry
+                dirty = true
             }
         }
         // 枚举部分失败（子目录暂不可读）时不清理未见面：保留旧条目避免误删仍在窗口内的贡献，
         // 目录恢复可读后下一轮自然收敛（ExternalTokenScanner 同口径）
         if enumed && !enumFailed {
-            for path in Array(st.files.keys) where !seen.contains(path) { st.files.removeValue(forKey: path) }
+            for path in Array(st.files.keys) where !seen.contains(path) { st.files.removeValue(forKey: path); dirty = true }
         }
-        if statePath == defaultStatePath { cache = st }
-        saveState(st, to: statePath)
-        guard enumed else { return Result(error: "无法枚举 \(root)") }
+        if enumed && !enumFailed && !readFailed && st.sampleDate != todayKey { st.sampleDate = todayKey; dirty = true }
+        if dirty { _ = saveState(st, to: statePath) }
         var r = Result()
+        r.sourceStatus = (!enumed || enumFailed || readFailed) ? (!rootExists && st.sampleDate == nil && st.files.isEmpty ? .absent : .failed) : .available
+        r.isPartial = (enumFailed || readFailed) && (st.sampleDate != nil || !st.files.isEmpty)
+        r.sampleDate = st.sampleDate
+        if !enumed || enumFailed || readFailed { r.error = "无法完整读取 \(root)" }
         for e in st.files.values {
             var today = [0.0, 0.0, 0.0], seven = today, thirty = today
             for (day, values) in e.days where day <= todayKey && values.count == 3 {
@@ -1263,11 +1297,12 @@ enum TokenScanner {
 
     /// record 管线窗口聚合：14 值布局 → ModelRunStats（requests>0 才计入）
     private static func addRun(_ runs: inout [String: ModelRunStats], name: String, values: [Double]) {
-        guard values.count == 14, values[0] > 0 else { return }
+        guard values.count == 15, values[0] > 0 else { return }
         var stats = runs[name] ?? ModelRunStats()
         stats.requests += values[0]
         stats.sumDuration += values[1]
         stats.sumOutput += values[2]
+        stats.timedOutput += values[14]
         stats.sumInput += values[3]
         stats.sumCached += values[4]
         stats.sumCacheWrite += values[5]
@@ -1275,61 +1310,84 @@ enum TokenScanner {
         runs[name] = stats
     }
 
-    /// 解压 .jsonl.zst 全量到内存后逐行处理；任何失败返回 nil，
-    /// 按「本文件本轮无法读取」处理（不写状态条目，
-    /// 修复或删除该归档后下轮扫描自动收敛）。
-    ///
-    /// 解码走 vendor/zstddeclib.c（上游 zstd v1.5.7 单文件解码源，BSD-3-Clause）
-    /// 进程内完成——系统 Compression 框架不含 zstd 算法，依赖外部 zstd 命令则把
-    /// 环境负担转嫁给用户；内置解码对任何用户环境都成立。输出缓冲优先用帧头声明
-    /// 的内容大小精确分配；
-    /// 声明未知时按压缩体 8 倍起步，空间不足时扩容；损坏数据立即退出，
-    /// 单文件解码上限 256 MiB，防止异常归档造成过大的内存占用。
-    static func zstdDecompress(path: String) -> Data? {
-        guard let raw = FileManager.default.contents(atPath: path), !raw.isEmpty else { return nil }
-        return raw.withUnsafeBytes { src in
-            guard let srcPtr = src.bindMemory(to: UInt8.self).baseAddress else { return nil }
-            let limit = 256 << 20
-            let declared = cu_zstd_content_size(srcPtr, raw.count)
-            if declared > UInt64(limit) { return nil }
-            var capacity = declared > 0 ? Int(declared) : min(max(raw.count, 1 << 17), limit / 8) * 8
-            while capacity <= limit {
-                var out = Data(count: capacity)
-                let written = out.withUnsafeMutableBytes { dst in
-                    cu_zstd_decompress(srcPtr, raw.count,
-                                       dst.bindMemory(to: UInt8.self).baseAddress!, capacity)
+    /// Decode incrementally; callers stage all changes until the complete frame is verified.
+    static func streamZstd(path: String, consume: (Data) -> Void) -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: path), let stream = cu_zstd_stream_create() else { return false }
+        defer { try? handle.close(); cu_zstd_stream_free(stream) }
+        var output = [UInt8](repeating: 0, count: 256 * 1024)
+        var total = 0
+        var remaining = 1
+        var sawInput = false
+        do {
+            while let input = try handle.read(upToCount: 256 * 1024), !input.isEmpty {
+                sawInput = true
+                var position = 0
+                while position < input.count {
+                    var written = 0
+                    let previous = position
+                    let rc = input.withUnsafeBytes { src in
+                        output.withUnsafeMutableBytes { dst in
+                            cu_zstd_stream_step(stream, src.baseAddress, input.count, &position,
+                                                dst.baseAddress, 256 * 1024, &written)
+                        }
+                    }
+                    guard rc != UInt.max, position > previous || written > 0 else { return false }
+                    total += written
+                    guard total <= 256 * 1024 * 1024 else { return false }
+                    if written > 0 { consume(Data(output[0..<written])) }
+                    remaining = Int(rc)
                 }
-                if written == Int(bitPattern: UInt.max) {
-                    if capacity == limit { return nil }
-                    capacity = min(capacity * 4, limit)
-                    continue
-                }
-                guard written > 0, written <= capacity else { return nil }
-                out.count = written
-                return out
             }
-            return nil
-        }
+            return sawInput && remaining == 0
+        } catch { return false }
     }
 
     private static func loadState(at path: String) -> State {
         if path == defaultStatePath, let s = cache { return s }
         // v3 及更旧状态直接作废（整体重扫），不尝试迁移：record 管线字段必须全量重建
         if let data = FileManager.default.contents(atPath: path),
-           let s = try? JSONDecoder().decode(State.self, from: data), s.version == 4 {
+           let s = try? JSONDecoder().decode(State.self, from: data), s.version == 5 {
             return s
+        }
+        // Preserve the v4 snapshot for rollback. Rebuild each readable file because its
+        // old bucket cannot recover timed output; retain unavailable file totals.
+        if path == defaultStatePath {
+            let legacyPath = NSHomeDirectory() + "/Library/Application Support/CodexUsage/scan-state.json"
+            if let data = FileManager.default.contents(atPath: legacyPath),
+               var legacy = try? JSONDecoder().decode(State.self, from: data), legacy.version == 4 {
+                legacy.version = 5
+                for key in Array(legacy.files.keys) {
+                    guard var entry = legacy.files[key] else { continue }
+                    for day in Array(entry.recordDaysByModel.keys) {
+                        guard var models = entry.recordDaysByModel[day] else { continue }
+                        for model in Array(models.keys) {
+                            guard var values = models[model], values.count == 14 else { continue }
+                            values[1] = 0
+                            for i in 6..<14 { values[i] = 0 }
+                            values.append(0)
+                            models[model] = values
+                        }
+                        entry.recordDaysByModel[day] = models
+                    }
+                    legacy.files[key] = entry
+                }
+                return legacy
+            }
         }
         return State()
     }
 
-    private static func saveState(_ s: State, to path: String) {
-        guard let data = try? JSONEncoder().encode(s) else { return }
+    private static func saveState(_ s: State, to path: String) -> Bool {
+        guard let data = try? JSONEncoder().encode(s) else { return false }
         // 复用凭据链的原子写：UUID 临时名 + rename + 仅所有者权限
         // （状态文件含会话绝对路径与逐文件聚合，不应给其他用户留读面）
         do {
             try AtomicJSONFile.replace(data, at: path)
+            if path == defaultStatePath { cache = s }
+            return true
         } catch {
             NSLog("[CodexUsage] TokenScanner saveState failed at %@: %@", path, error.localizedDescription)
+            return false
         }
     }
 }
@@ -1366,26 +1424,34 @@ enum ExternalTokenScanner {
         /// 已安装来源全部不可读（目录存在但枚举失败 / state.db 存在但查询失败）时置错；
         /// 未安装任何来源（目录/库均不存在）不算失败——没装对应工具时该来源自然为 0
         var error: String?
+        var isPartial = false
         var tools: [String: [Stats]] = [:]
         var sourceStatus: [String: UsageSourceStatus] = [:]
     }
 
     /// 按文件增量扫描状态：offset 为已消费字节数，days 为按日聚合 [input, output]
-    struct FileState: Codable {
+    struct FileState: Codable, Equatable {
         var offset: UInt64 = 0
         var mtime: Double?
+        var device: UInt64?
+        var inode: UInt64?
+        var boundary: UInt64?
         var days: [String: [Double]] = [:]
         var daysByModel: [String: [String: [Double]]] = [:]
     }
     /// hermes 快照：rows 存上次各累计行的值，days 存按 last_seen 归日的差分历史
-    struct HermesState: Codable {
+    struct HermesState: Codable, Equatable {
         var rows: [String: [Double]] = [:]
         var days: [String: [Double]] = [:]
         var daysByModel: [String: [String: [Double]]] = [:]
     }
-    struct State: Codable {
+    struct State: Codable, Equatable {
         var files: [String: FileState] = [:]
         var hermes: HermesState?
+        // root/Hermes 最近一次成功观测时间：来源消失后在 31 天保留窗内报 failed（沿用缓存值），
+        // 超窗视为已移除（absent），卸载来源不再永久失败
+        var knownRoots: [String: Date]?
+        var knownHermes: Date?
     }
 
     static let fileRoots = [
@@ -1400,7 +1466,7 @@ enum ExternalTokenScanner {
     // 文件名带版本号：口径/来源变更后弃用旧缓存强制重建（v2 目录去重、v3 含 cache、
     // v4 proma 源切 agent-sessions 对齐 Token Monitor、v5 增加模型维度）
     static let defaultStatePath = NSHomeDirectory()
-        + "/Library/Application Support/CodexUsage/external-scan-state-v5.json"
+        + "/Library/Application Support/CodexUsage/external-scan-state-v6.json"
 
     // 与 TokenScanner.scan 同款互斥：状态读改写不是原子的，防止未来调用方并发进入
     private static let lock = NSLock()
@@ -1432,9 +1498,25 @@ enum ExternalTokenScanner {
                      hermesDB: String? = hermesDBPath,
                      statePath: String = defaultStatePath,
                      now: Date = Date(),
-                     hermesFailAfterRows: Int? = nil) -> Result {
+                     hermesFailAfterRows: Int? = nil,
+                     legacyStatePath: String? = nil) -> Result {
         lock.lock(); defer { lock.unlock() }
-        var st = loadState(at: statePath)
+        let legacyPath = legacyStatePath ?? (statePath == defaultStatePath ? statePath.replacingOccurrences(of: "-v6.json", with: "-v5.json") : nil)
+        let exists = FileManager.default.fileExists(atPath: statePath)
+        let legacyIsNewer: Bool = {
+            guard let legacyPath = legacyPath,
+                  let oldDate = (try? FileManager.default.attributesOfItem(atPath: legacyPath)[.modificationDate]) as? Date else { return false }
+            guard let newDate = (try? FileManager.default.attributesOfItem(atPath: statePath)[.modificationDate]) as? Date else { return true }
+            return oldDate > newDate
+        }()
+        var st = loadState(at: legacyIsNewer ? legacyPath! : statePath)
+        let original = st
+        if legacyIsNewer {
+            // 文件来源可重扫；Hermes 累计基线及按日差分不可重建，完整保留。
+            for key in st.files.keys {
+                st.files[key]?.device = nil; st.files[key]?.inode = nil; st.files[key]?.boundary = nil
+            }
+        }
         // Collapse old aliases before aggregation; keep the most advanced snapshot.
         var canonicalFiles: [String: FileState] = [:]
         for (path, entry) in st.files {
@@ -1444,30 +1526,57 @@ enum ExternalTokenScanner {
         st.files = canonicalFiles
         let cutoff = Calendar.current.date(byAdding: .day, value: -31, to: now) ?? now.addingTimeInterval(-retainSeconds)
         let cutoffKey = dayFmt.string(from: cutoff)
+        for key in st.files.keys {
+            guard var file = st.files[key] else { continue }
+            file.days = file.days.filter { $0.key >= cutoffKey }
+            file.daysByModel = file.daysByModel.filter { $0.key >= cutoffKey }
+            st.files[key] = file
+        }
+        if var hermes = st.hermes {
+            hermes.days = hermes.days.filter { $0.key >= cutoffKey }
+            hermes.daysByModel = hermes.daysByModel.filter { $0.key >= cutoffKey }
+            st.hermes = hermes
+        }
         let files = scanFiles(roots: roots, cutoff: cutoff, cutoffKey: cutoffKey, into: &st)
         var hermesOK: Bool?   // nil = 未安装（state.db 不存在），不算失败
         if let db = hermesDB, FileManager.default.fileExists(atPath: db) {
             hermesOK = scanHermes(path: db, cutoffKey: cutoffKey, into: &st, failAfterRows: hermesFailAfterRows)
         }
-        saveState(st, at: statePath)
         var r = buckets(st, now: now)
         // File cache already stores contributions by path; derive tool totals without
         // rescanning or splitting pre-existing aggregate totals by guesswork.
         let sourceNames = ["Proma", "Proma", "Claude Code"]
-        let canonicalRoots = roots.map(realPath)
+        let canonicalRoots = roots.map(stableRootPath)
         var parts: [String: State] = [:]
         for (path, state) in st.files {
             guard let owner = UsageAttribution.owner(path: realPath(path), roots: canonicalRoots) else { continue }
             let name = owner < sourceNames.count ? sourceNames[owner] : "Other"
-            var part = parts[name] ?? State(); part.files[path] = state; parts[name] = part
+            parts[name, default: State()].files[path] = state
         }
         for (name, part) in parts {
             let values = buckets(part, now: now)
             r.tools[name] = [values.today, values.seven, values.thirty]
         }
+        var anyRootReadable = false
         for (index, root) in roots.enumerated() {
             let name = index < sourceNames.count ? sourceNames[index] : "Other"
-            let status = files.status[root] ?? .absent
+            var status = files.status[root] ?? .absent
+            let stable = stableRootPath(root)
+            if status == .absent {
+                // 曾见过的 root 消失 → 保留窗内报 failed（缓存值继续沿用）；超窗视为已移除。
+                // 近期日数据的缓存文件同样作为「曾见过」佐证（knownRoots 缺失时的兜底）
+                let seenAt = st.knownRoots?[stable] ?? st.knownRoots?[root]
+                let hasRecentFiles = st.files.contains(where: { $0.key.hasPrefix(stable + "/") && !$0.value.days.isEmpty })
+                if seenAt.map({ $0 >= cutoff }) == true || hasRecentFiles { status = .failed }
+            }
+            if status == .available {
+                anyRootReadable = true
+                st.knownRoots = st.knownRoots ?? [:]
+                st.knownRoots?[stable] = now
+                // 原始形式同写：root 指向可卸载目标（NAS/iCloud 符号链接）时，目标消失后
+                // realpath 链断裂，stable 只能还原到链接自身路径，须用原始键命中
+                st.knownRoots?[root] = now
+            }
             let oldStatus = r.sourceStatus[name]
             if status == .failed || oldStatus == .failed { r.sourceStatus[name] = .failed }
             else if status == .available || oldStatus == .available { r.sourceStatus[name] = .available }
@@ -1479,13 +1588,24 @@ enum ExternalTokenScanner {
             let values = buckets(part, now: now)
             r.tools["Hermes"] = [values.today, values.seven, values.thirty]
         }
-        r.sourceStatus["Hermes"] = hermesOK == true ? .available : (hermesOK == false ? .failed : .absent)
-        // 失败面：有已安装来源但无一可读 → 置错（调用方保留旧值、不推进成功时间）；
-        // 部分来源失败仍按成功处理（增量状态保留旧贡献，下轮自愈）
-        let anySource = files.installed > 0 || hermesOK != nil
-        let anySuccess = files.enumerated > 0 || hermesOK == true
-        if anySource && !anySuccess {
-            r.error = "外部会话目录 / hermes state.db 均不可读"
+        if hermesOK == true { st.knownHermes = now }
+        // db 当前失败 → failed；db 消失 → 保留窗内报 failed，超窗视为已移除（同 root 规则）。
+        // st.hermes != nil 不参与判定：首次扫入空结构后永真，起不到「曾见过」的限定作用
+        r.sourceStatus["Hermes"] = hermesOK == true ? .available : (hermesOK == false ? .failed
+            : (hermesDB != nil && (st.knownHermes ?? .distantPast) >= cutoff ? .failed : .absent))
+        let failed = r.sourceStatus.values.contains(.failed)
+        if failed {
+            // 同一来源可挂多个 root（Proma 两条目录）：名字级状态任一失败即 degraded；
+            // 但只要有可读 root（数据已在 r.buckets）或 Hermes 可读就不算「均不可读」，
+            // 名字级 contains(.available) 会被同名后写 root 覆盖，不能作为部分可读依据
+            r.isPartial = anyRootReadable || hermesOK == true
+            r.error = r.isPartial ? "部分外部来源不可读" : "外部会话目录 / hermes state.db 均不可读"
+        }
+        if st != original || !exists || legacyIsNewer {
+            // Write the rollback snapshot first. If either write fails, the next scan retries.
+            if legacyPath == nil || saveState(st, at: legacyPath!) {
+                _ = saveState(st, at: statePath)
+            }
         }
         return r
     }
@@ -1495,6 +1615,25 @@ enum ExternalTokenScanner {
         var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
         guard realpath(p, &buf) != nil else { return p }
         return String(cString: buf)
+    }
+
+    /// root 级归一化：realpath(3) 对不存在的路径返回 NULL，消失的 root 会从
+    /// /private/var/... 漂回 /var/...，与 knownRoots / files 里已解析的键失配，
+    /// 已观测来源被误判成从未安装。解析最长已存在祖先再拼回剩余分量，
+    /// 使同一路径在存在与消失两个时刻归一到同一形式。
+    private static func stableRootPath(_ p: String) -> String {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        if realpath(p, &buf) != nil { return String(cString: buf) }
+        var dir = (p as NSString).deletingLastPathComponent
+        var missing = [(p as NSString).lastPathComponent]
+        while !dir.isEmpty && dir != "/" {
+            if realpath(dir, &buf) != nil {
+                return String(cString: buf) + "/" + missing.reversed().joined(separator: "/")
+            }
+            missing.append((dir as NSString).lastPathComponent)
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        return p
     }
 
     /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
@@ -1514,8 +1653,11 @@ enum ExternalTokenScanner {
             status[root] = .failed
             // 不是目录（异常）或枚举失败都算该 root 不可读；未枚举成功不入 enumedRoots
             var rootFailed = false
+            // 枚举走解析后的真实路径：enumerator 拒绝把根级符号链接本身当目录打开
+            // （ENOTDIR），指向 NAS/iCloud 的符号链接 root 会被误标 failed；
+            // /var 层级 root 的行为不变（枚举器本就产出 realpath 形式路径）
             guard isDir.boolValue, let enumerator = FileManager.default.enumerator(
-                at: URL(fileURLWithPath: root),
+                at: URL(fileURLWithPath: realPath(root)),
                 includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles], errorHandler: { _, _ in rootFailed = true; return true })
             else { continue }
@@ -1535,21 +1677,34 @@ enum ExternalTokenScanner {
                 let mtimeU = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
                 var fs = st.files[path] ?? FileState()
                 // 文件只增不改：大小与 mtime 均未变才跳过（绝大多数文件走这里）
-                if fs.offset == sizeU, let cached = fs.mtime, cached == mtimeU {
-                    st.files[path] = fs; continue
-                }
+
                 // 首次见到且 31 天未修改：旧内容不可能贡献近 30 天数据，记录大小后跳过
-                if fs.offset == 0, fs.days.isEmpty,
+                if (fs.offset == 0 || fs.device == nil), fs.days.isEmpty,
                    let mtime = vals.contentModificationDate, mtime < cutoff {
                     fs.offset = sizeU; fs.mtime = mtimeU; st.files[path] = fs; continue
                 }
-                // 截断/轮换：该文件的旧聚合已不可信，清零重扫
-                if sizeU < fs.offset { fs = FileState() }
-                // 同字节数整文件重写：offset 已追平但 mtime 与上次记录不同 → 旧聚合不可信，
-                // 清零重扫（mtime 缺失为 0 时无法判断，保持旧行为避免每轮重扫）
-                if fs.offset == sizeU, fs.mtime != nil, mtimeU != 0 { fs = FileState() }
-
                 guard let fh = try? FileHandle(forReadingFrom: url) else { rootFailed = true; continue }
+                var fileStat = stat()
+                guard fstat(fh.fileDescriptor, &fileStat) == 0 else { try? fh.close(); rootFailed = true; continue }
+                let device = UInt64(fileStat.st_dev), inode = UInt64(fileStat.st_ino)
+                func boundaryHash(_ offset: UInt64) -> UInt64? {
+                    let start = offset > 128 ? offset - 128 : 0
+                    do {
+                        try fh.seek(toOffset: start)
+                        guard let data = try fh.read(upToCount: Int(offset - start)), data.count == Int(offset - start) else { return nil }
+                        return data.reduce(UInt64(14695981039346656037)) { ($0 ^ UInt64($1)) &* 1099511628211 }
+                    } catch { return nil }
+                }
+                let currentBoundary = fs.offset > 0 && sizeU >= fs.offset ? boundaryHash(fs.offset) : nil
+                let changed = sizeU < fs.offset || (fs.device != nil && fs.device != device)
+                    || (fs.inode != nil && fs.inode != inode)
+                    || (fs.boundary != nil && fs.boundary != currentBoundary)
+                    || (fs.offset == sizeU && fs.mtime != nil && mtimeU != 0 && fs.mtime != mtimeU)
+                if changed || (fs.offset > 0 && (fs.device == nil || fs.inode == nil || fs.boundary == nil)) { fs = FileState() }
+                if fs.offset == sizeU, fs.mtime == mtimeU, fs.device == device, fs.inode == inode {
+                    try? fh.close(); continue
+                }
+                fs.device = device; fs.inode = inode
                 fh.seek(toFileOffset: fs.offset)
                 // 与 TokenScanner 同款分块读 + 行缓冲：首见的大文件不整份载入内存；
                 // 只消费到最后一个完整换行，正在被写入的残缺行留给下次
@@ -1576,6 +1731,7 @@ enum ExternalTokenScanner {
                     }
                     pending.append(contentsOf: chunk[start...])
                 }
+                fs.boundary = boundaryHash(consumed)
                 try? fh.close()
                 if readError { rootFailed = true; continue }
                 if consumed > fs.offset {
@@ -1800,13 +1956,15 @@ enum ExternalTokenScanner {
         return State()
     }
 
-    private static func saveState(_ s: State, at path: String) {
-        guard let data = try? JSONEncoder().encode(s) else { return }
+    @discardableResult private static func saveState(_ s: State, at path: String) -> Bool {
+        guard let data = try? JSONEncoder().encode(s) else { return false }
         // 复用凭据链的原子写：UUID 临时名 + rename + 仅所有者权限（与 TokenScanner 同口径）
         do {
             try AtomicJSONFile.replace(data, at: path)
+            return true
         } catch {
             NSLog("[CodexUsage] ExternalTokenScanner saveState failed at %@: %@", path, error.localizedDescription)
+            return false
         }
     }
 }
@@ -2372,7 +2530,7 @@ struct UsagePanelModel {
     enum NoticeLevel {
         case info, warning, error
     }
-    struct Notice {
+    struct Notice: Equatable {
         var text: String
         var level: NoticeLevel
     }
@@ -2395,12 +2553,15 @@ struct UsagePanelModel {
         var useTitle: String? = nil
         var useEnabled: Bool = false
     }
-    struct TiboRow {
+    struct TiboRow: Equatable {
         var text: String
         var confirmed: Bool   // 已确认发放，渲染时显示 checkmark.circle.fill
         var item: NSMenuItem?
+        // item 是每轮新建的 NSMenuItem，指针地址参与 reflecting 比较会导致永远不等；
+        // 显示比较只看内容
+        static func == (l: TiboRow, r: TiboRow) -> Bool { l.text == r.text && l.confirmed == r.confirmed }
     }
-    struct TiboSection {
+    struct TiboSection: Equatable {
         var rows: [TiboRow]
         var notices: [Notice]
     }
@@ -3207,6 +3368,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private let scrollView = NSScrollView()
     private let stack = PanelUI.stack(spacing: 8)
     private var model: UsagePanelModel?
+    private var renderedModel: UsagePanelModel?
+    private var renderedCards: [PanelCardID: NSView] = [:]
+    /// 本轮稳定刷新是否真的换过卡片：决定是否需要重算 popover 尺寸/恢复滚动（无变化刷新跳过）
+    private var stableReplacedCard = false
+    private var renderedMinute: Int = -1
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private weak var anchorButton: NSStatusBarButton?
@@ -3314,10 +3480,106 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     func update(model: UsagePanelModel) {
         self.model = model
-        quotaHistoryUI.hover = nil
         quotaHistoryUI.browser.update(model.quotaHistory.state.closed + (model.quotaHistory.state.current.map { [$0] } ?? []))
         // 阅读版本说明期间保留滚动位置；数据更新仍写入模型，关闭说明后刷新显示。
-        if isOpen && updateConfirmation == nil { refreshPanelLayout() }
+        if isOpen && updateConfirmation == nil {
+            // 稳定替换路径与全量重建同保护：禁隐式动画；真的换过卡片才重算 popover 尺寸
+            // 并恢复滚动位置（无变化刷新零额外布局开销）
+            let previousOrigin = scrollView.contentView.bounds.origin
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            stableReplacedCard = false
+            let stable = refreshStableCards(model)
+            if stable, stableReplacedCard, let button = anchorButton, let window = button.window, isOpen {
+                layoutPanel(anchoredTo: button, buttonWindow: window)
+                let clip = scrollView.contentView
+                let desired = NSRect(origin: previousOrigin, size: clip.bounds.size)
+                clip.scroll(to: clip.constrainBoundsRect(desired).origin)
+                scrollView.reflectScrolledClipView(clip)
+            }
+            CATransaction.commit()
+            if !stable { refreshPanelLayout() }
+        }
+    }
+
+    // Preserve chart and control instances when the independent cards have not
+    // changed. Structural changes continue through the full layout path.
+    private func refreshStableCards(_ next: UsagePanelModel) -> Bool {
+        guard let old = renderedModel, !showingCardSettings,
+              !UpdateProgressController.shared.isActive,
+              renderedMinute == Int(Date().timeIntervalSince1970 / 60) else { return false }
+        func same<T>(_ a: T, _ b: T) -> Bool { String(reflecting: a) == String(reflecting: b) }
+        func item(_ value: NSMenuItem?) -> String {
+            guard let value = value else { return "nil" }
+            return "\(value.title)|\(value.isEnabled)|\(value.state.rawValue)"
+        }
+        guard item(old.updateItem) == item(next.updateItem),
+              same(old.notices, next.notices),
+              (old.resetCards == nil) == (next.resetCards == nil),
+              (old.tibo == nil) == (next.tibo == nil),
+              old.quotaHistoryAvailable == next.quotaHistoryAvailable else { return false }
+        func replace(_ id: PanelCardID, changed: Bool, make: () -> NSView?) -> Bool {
+            guard changed, panelLayout.visibleOrder.contains(id) else { return true }
+            guard let oldView = renderedCards[id], let index = stack.arrangedSubviews.firstIndex(of: oldView) else { return false }
+            let focused = contentController.view.window?.firstResponder as? NSView
+            guard let replacement = make() else { return false }
+            stack.removeArrangedSubview(oldView)
+            oldView.removeFromSuperview()
+            stack.insertArrangedSubview(replacement, at: index)
+            replacement.widthAnchor.constraint(equalToConstant: panelWidth - 32).isActive = true
+            renderedCards[id] = replacement
+            stableReplacedCard = true
+            if let focused = focused {
+                if focused.window != nil { focused.window?.makeFirstResponder(focused) }
+                // 焦点在被替换卡内随旧视图销毁：按类 + 无障碍标识 + tag 在新卡里找回等价视图
+                else if let standIn = descendants(replacement).first(where: {
+                    type(of: $0) === type(of: focused)
+                        && $0.accessibilityLabel() == focused.accessibilityLabel() && $0.tag == focused.tag
+                }) { standIn.window?.makeFirstResponder(standIn) }
+            }
+            return true
+        }
+        guard replace(.quota, changed: !same(old.quotas, next.quotas), make: { QuotaCardSectionView(quotas: next.quotas) }),
+              replace(.resetCards, changed: !same(old.resetCards, next.resetCards), make: {
+                  next.resetCards.map { ResetCardSectionView(model: $0, target: self, action: #selector(requestUseReset)) }
+              }),
+              replace(.tibo, changed: old.tibo != next.tibo, make: { next.tibo.map { self.makeTiboSection($0) } }),
+              replace(.tokens, changed: !same(old.codexTokens, next.codexTokens), make: {
+                  self.makeCardSection(TokenSectionView(model: next.codexTokens, expanded: self.codexExpanded,
+                      expandedBuckets: self.expandedCodexBuckets, target: self, action: #selector(toggleCodex),
+                      bucketAction: #selector(toggleCodexBucket(_:))))
+              }),
+              replace(.response, changed: !same(old.responseSection, next.responseSection), make: {
+                  self.makeCardSection(PeriodSectionView(model: next.responseSection, selectedIndex: self.responsePeriod,
+                      expanded: self.responseExpanded, target: self, action: #selector(toggleResponse),
+                      chipAction: #selector(toggleResponsePeriod(_:)), noteAction: #selector(toggleMetricNote(_:))))
+              }),
+              replace(.cache, changed: !same(old.cacheSection, next.cacheSection), make: {
+                  self.makeCardSection(PeriodSectionView(model: next.cacheSection, selectedIndex: self.cachePeriod,
+                      expanded: self.cacheExpanded, target: self, action: #selector(toggleCache),
+                      chipAction: #selector(toggleCachePeriod(_:))))
+              }),
+              replace(.daily, changed: !same(old.official, next.official) || old.officialError != next.officialError || old.officialTodayFill != next.officialTodayFill, make: {
+                  let chart = self.renderedCards[.daily].flatMap { descendants($0).compactMap { $0 as? DailyUsageChart }.first }
+                  if let chart = chart, let parent = chart.superview as? NSStackView {
+                      parent.removeArrangedSubview(chart)
+                      chart.removeFromSuperview()
+                  }
+                  return self.makeCardSection(self.makeDailySection(next, reusing: chart))
+              }),
+              replace(.tools, changed: !same(old.tools, next.tools), make: { self.makeCardSection(self.makeToolSection(next)) }) else { return false }
+        if let history = descendants(stack).compactMap({ $0 as? QuotaCycleHistoryView }).first {
+            let now = isPreviewMode ? Date(timeIntervalSince1970: 1_793_897_600) : Date()
+            history.update(snapshot: next.quotaHistory, now: now)
+        }
+        if old.title != next.title || old.plan != next.plan || old.email != next.email ||
+           old.lastAttempt != next.lastAttempt || old.version != next.version ||
+           item(old.refreshItem) != item(next.refreshItem) || item(old.loginItem) != item(next.loginItem) ||
+           item(old.quitItem) != item(next.quitItem) {
+            installChrome(model: next)
+        }
+        renderedModel = next
+        return true
     }
 
     private func clear(container: NSView) {
@@ -3364,6 +3626,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private func rebuildContent() {
         guard let model = model else { return }
+        renderedModel = model
+        renderedMinute = Int(Date().timeIntervalSince1970 / 60)
         // 口径说明浮窗跨重建：行重建会摘掉锚点按钮，先记录开合并主动收起，重建完成后重锚定。
         let metricNoteWasShown = metricNotePopover.isShown
         if metricNoteWasShown { metricNotePopover.performClose(nil) }
@@ -3377,6 +3641,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             }
         }
         installChrome(model: model)
+        renderedCards.removeAll()
         for row in stack.arrangedSubviews {
             stack.removeArrangedSubview(row)
             row.removeFromSuperview()
@@ -3400,6 +3665,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                 addContentRow(makeEmptyCardsState())
             } else {
                 for id in visible {
+                    let oldCount = stack.arrangedSubviews.count
                     switch id {
                     case .quota:
                         addContentRow(QuotaCardSectionView(quotas: model.quotas))
@@ -3430,6 +3696,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                     case .tools:
                         addContentRow(makeCardSection(makeToolSection(model)))
                     }
+                    if stack.arrangedSubviews.count > oldCount { renderedCards[id] = stack.arrangedSubviews.last }
                 }
             }
         }
@@ -3572,10 +3839,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         return root
     }
-    func resetQuotaHistoryAccount() { quotaHistoryUI.reset() }
+    func resetQuotaHistoryAccount() { quotaHistoryUI.reset(); renderedModel = nil }
     @objc private func toggleQuotaHistory() { quotaHistoryUI.expanded.toggle(); refreshPanelLayout() }
 
-    private func makeDailySection(_ model: UsagePanelModel) -> NSView {
+    private func makeDailySection(_ model: UsagePanelModel, reusing chart: DailyUsageChart? = nil) -> NSView {
         let root = PanelUI.stack(spacing: 6)
         let heading = PanelSectionHeading.make(title: "用量简析", symbol: PanelVisuals.dailySymbol,
             color: PanelAccent.codex.color, expanded: dailyExpanded, target: self,
@@ -3595,7 +3862,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         totalRow.addArrangedSubview(PanelUI.label("累计 Token", size: 10, color: .secondaryLabelColor, wrapping: false))
         totalRow.addArrangedSubview(PanelUI.spacer())
         PanelUI.addFullWidth(totalRow, to: root)
-        PanelUI.addFullWidth(DailyUsageChart(snapshot: model.official, scannedToday: model.officialTodayFill), to: root)
+        let dailyChart = chart ?? DailyUsageChart(snapshot: model.official, scannedToday: model.officialTodayFill)
+        if chart != nil { dailyChart.update(snapshot: model.official, scannedToday: model.officialTodayFill) }
+        PanelUI.addFullWidth(dailyChart, to: root)
         let compared = UsageComparison.evaluate(snapshot: model.official, now: Date(), todayFill: model.officialTodayFill)
         func comparisonColor(_ value: UsageComparison.Value) -> NSColor {
             if case .percent(let amount) = value { return amount < 0 ? RemainingColorTier.green.color() : PanelAccent.codex.color }
@@ -4332,7 +4601,31 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                 modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
                 characters: "\u{F702}", charactersIgnoringModifiers: "\u{F702}", isARepeat: false, keyCode: 123) else { return false }
         window.sendEvent(key)
-        return chart.selectedIndexForPreview == 28
+        guard chart.selectedIndexForPreview == 28, var fixture = model else { return false }
+        let originalHistory = descendants(stack).compactMap { $0 as? QuotaCycleHistoryView }.first
+        let started = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<25 { update(model: fixture) }
+        let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1000
+        print("CodexUsage 25 stable panel refreshes: \(String(format: "%.2f", elapsed)) ms")
+        guard descendants(stack).contains(where: { $0 === chart }),
+              chart.selectedIndexForPreview == 28, window.firstResponder === chart,
+              originalHistory == nil || descendants(stack).contains(where: { $0 === originalHistory }) else { return false }
+        if !fixture.quotas.isEmpty {
+            fixture.quotas[0].remaining = fixture.quotas[0].remaining == 42 ? 43 : 42
+            update(model: fixture)
+            guard descendants(stack).contains(where: { $0 === chart }),
+                  chart.selectedIndexForPreview == 28, window.firstResponder === chart else { return false }
+        }
+        // .daily 稳定替换分支：只变 officialTodayFill（本机补今日）触发 replace，
+        // 验证 chart 实例复用、卡片对象确实换新、选中日与焦点随替换保留
+        let oldDailyCard = renderedCards[.daily]
+        fixture.officialTodayFill = (fixture.officialTodayFill ?? 0) + 7
+        update(model: fixture)
+        let charts = descendants(stack).compactMap { $0 as? DailyUsageChart }
+        guard charts.count == 1, charts[0] === chart, renderedCards[.daily] !== oldDailyCard,
+              let dailyCard = renderedCards[.daily], descendants(dailyCard).contains(where: { $0 === chart }),
+              chart.selectedIndexForPreview == 28, window.firstResponder === chart else { return false }
+        return true
     }
 
     /// 固定假数据截图：显示指定日列的浮层并检查其不越界。
@@ -4820,11 +5113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
-    private var cycle = 0
-    private let refreshGate = RefreshGate()
+    private var refreshSchedule = RefreshSchedule()
     private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
-    // token 扫描每 N 个刷新周期做一次（主循环 10s × 30 = 5 分钟；额度每轮都刷）
-    private let tokenEveryCycles = 30
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
     // （与 GlmUsage 的静默保留旧数据不同，这是刻意改进：过期数据必须可见）
     private let quotaStaleAfter: TimeInterval = 600
@@ -4851,8 +5141,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 菜单栏可因深色壁纸、双屏或全屏而与 App 外观合法地不同，不能用 App 外观覆盖菜单栏。
     // 每 5s 对账，不一致时仅重建不缓存的动态颜色图片，不切换 isVisible、不钉死绘制外观。
     private var appearancePollTimer: Timer?
-    // status.json 去重：内容不变时跳过原子写，避免每 5-10s 无意义的 fsync+rename
-    private var lastStatusData: Data?
+    private let statusWriter = StatusSnapshotWriter { data in
+        let path = NSHomeDirectory() + "/Library/Application Support/CodexUsage/status.json"
+        try AtomicJSONFile.replace(data, at: path)
+    }
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
 
@@ -4890,17 +5182,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateProgressObserver = NotificationCenter.default.addObserver(
             forName: UpdateProgressController.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.updateProgressDidChange() }
-        refresh(tokens: true, manual: true)
+        refresh(manual: true)
         attachBarAppearanceObserver()
         appearancePollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.reconcileBarAppearance()
         }
         appearancePollTimer?.tolerance = 1
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            self.cycle += 1
-            self.refresh(tokens: CodexRefreshSchedule.slowItemsDue(cycle: self.cycle,
-                every: self.tokenEveryCycles, manual: false))
+            self?.refresh()
         }
         timer?.tolerance = 3
         // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 30 分钟；
@@ -4972,6 +5261,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ]
         // 模型响应/缓存命中卡的预览数据（token_usage_record 管线快照）：
         // sol 无缓存证据 → 命中率显 —，覆盖「—」占位与数值两种渲染
+        usage.localSampleDay = LocalScanDay.key(now)
+        usage.externalSampleDay = usage.localSampleDay
+        usage.localStatus = .available
         usage.tokensToday = TokenScanner.Stats(input: 1_200_000, output: 300_000, total: 1_500_000, files: 3, models: [
             "gpt-5.5-codex": ModelTokenUsage(input: 700_000, output: 180_000, total: 880_000),
             "gpt-5.5": ModelTokenUsage(input: 500_000, output: 120_000, total: 620_000)
@@ -5216,13 +5508,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // 拉取数据：额度走网络（回调内含 401 兜底刷新），token 扫描与重置卡明细走每 5 分钟周期
-    private func refresh(tokens: Bool, manual: Bool = false) {
-        guard !visualPreview else { return }
-        guard refreshGate.begin(manual: manual) else { return }
-        performRefresh(tokens: tokens || manual)
+    private func refresh(manual: Bool = false) {
+        guard !visualPreview, let work = refreshSchedule.request(manual: manual, now: Date()) else { return }
+        performRefresh(work)
     }
 
-    private func performRefresh(tokens: Bool) {
+    private func performRefresh(_ work: RefreshSchedule.Work) {
         synchronizeAccount()
         let generation = accountGeneration
         let identity = accountIdentity
@@ -5230,7 +5521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard CodexAuth.identity(auth) == identity else {
             synchronizeAccount()
             updateUI()
-            if refreshGate.finish() { performRefresh(tokens: true) }
+            if let next = refreshSchedule.finish() { performRefresh(next) }
             return
         }
         lastAttemptAt = Date()
@@ -5251,16 +5542,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 group.leave()
             }
         }
-        if tokens {
+        if work == .full {
             group.enter()
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 // Codex CLI 本机会话与外部用量（Proma/Claude Code/hermes）都是纯本地扫描，
                 // 串在同一 utility 块里，互不争抢也只进出一个 group 名额
-                let r = TokenScanner.scan()
-                let e = ExternalTokenScanner.scan()
+                let sampleTime = Date()
+                let day = LocalScanDay.key(sampleTime)
+                let r = TokenScanner.scan(now: sampleTime)
+                let e = ExternalTokenScanner.scan(now: sampleTime)
                 DispatchQueue.main.async {
-                    self?.applyTokens(r)
-                    self?.applyExternal(e)
+                    self?.applyTokens(r, day: day)
+                    self?.applyExternal(e, day: day)
                     group.leave()
                 }
             }
@@ -5306,7 +5599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 各 apply 回调只更新数据，渲染统一在这里做一次：
             // 菜单重建与 status.json 写入每轮刷新各一次，而不是每个数据源一次
             self.updateUI()
-            if self.refreshGate.finish() { self.performRefresh(tokens: true) }
+            if let next = self.refreshSchedule.finish() { self.performRefresh(next) }
         }
     }
 
@@ -5336,9 +5629,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func togglePanel() {
         guard let button = statusItem.button else { return }
+        if !panelController.isOpen { rebuildMenu() }
         panelController.toggle(anchoredTo: button)
         if panelController.isOpen {
-            refresh(tokens: false)
+            refresh()
             checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
         }
     }
@@ -5362,36 +5656,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.email = r.email ?? usage.email
     }
 
-    private func applyTokens(_ r: TokenScanner.Result) {
-        tokensLastOK = CodexFreshness.updated(tokensLastOK, succeeded: r.error == nil, at: Date())
-        if let e = r.error {
-            usage.tokensError = e
-        } else {
-            usage.tokensToday = r.today
-            usage.tokens7d = r.seven
-            usage.tokens30d = r.thirty
-            usage.tokensError = nil
-        }
+    private func applyTokens(_ result: TokenScanner.Result, day: String) {
+        usage.localStatus = result.sourceStatus
+        usage.tokensError = result.error
+        if result.error == nil && result.sourceStatus == .available { tokensLastOK = Date() }
+        guard result.error == nil || result.isPartial || (usage.tokens7d == nil && result.thirty.files > 0) else { return }
+        usage.localSampleDay = day
+        usage.tokensToday = result.today
+        usage.tokens7d = result.seven
+        usage.tokens30d = result.thirty
     }
 
-    // 外部用量：成功则全量替换快照；已安装来源全部不可读时保留旧值、不推进 lastOK
-    // （30 分钟后现有 ⚠ 过期标注自动亮起），并显示错误行
-    private func applyExternal(_ r: ExternalTokenScanner.Result) {
-        usage.sourceStatus = r.sourceStatus
-        if let e = r.error {
-            usage.extError = e
-        } else {
-            extLastOK = CodexFreshness.updated(extLastOK, succeeded: true, at: Date())
-            usage.externalTools = r.tools
-            usage.extToday = r.today
-            usage.ext7d = r.seven
-            usage.ext30d = r.thirty
-            usage.extError = nil
-        }
+    private func applyExternal(_ result: ExternalTokenScanner.Result, day: String) {
+        usage.sourceStatus = result.sourceStatus
+        usage.extError = result.error
+        if result.error == nil { extLastOK = Date() }
+        guard result.error == nil || result.isPartial || (usage.ext7d == nil && result.thirty.total > 0) else { return }
+        usage.externalSampleDay = day
+        usage.externalTools = result.tools
+        usage.extToday = result.today
+        usage.ext7d = result.seven
+        usage.ext30d = result.thirty
     }
 
-    // 重置卡：成功则更新并清错误；瞬时失败保留上次数据、仅记录错误
-    // （有旧数据时菜单仍展示未过期的旧卡；卡数据状态与额度窗口互相独立）
     private func applyResetCards(_ cards: [ResetCard]?, _ err: String?) {
         let r = CodexFreshness.apply(fresh: cards, failure: err,
             old: usage.resetCards, oldLastOK: resetCardsLastOK, oldError: usage.resetCardsError, now: Date())
@@ -5540,9 +5827,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // 自诊断：把渲染内容写到本地，便于排查（绝不写任何凭证值）
     private func writeStatus(line1: String, line2: String) {
-        let dir = NSHomeDirectory() + "/Library/Application Support/CodexUsage"
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
-                                                 attributes: [.posixPermissions: 0o700])
         func iso(_ d: Date?) -> String { Fmt.isoStamp(d) }
         let cardsNow = CodexFreshness.availableCards(usage.resetCards ?? [], now: Date())
         let info: [String: Any] = [
@@ -5563,7 +5847,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "tiboError": usage.tiboError ?? "",
             "quotaLastSuccess": ["fiveHour": iso(fiveHourLastOK), "sevenDay": iso(sevenDayLastOK)],
             "tokensLastSuccess": iso(tokensLastOK),
-            "externalTokensToday": Fmt.tokensAbbr(usage.extToday?.total),
+            "externalTokensToday": Fmt.tokensAbbr(usage.today(on: LocalScanDay.key(Date())).external?.total),
             "externalTokens7d": Fmt.tokensAbbr(usage.ext7d?.total),
             "externalTokens30d": Fmt.tokensAbbr(usage.ext30d?.total),
             "externalTokensLastSuccess": iso(extLastOK),
@@ -5583,17 +5867,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "version": BuildInfo.version,
             "updateAvailable": UpdateChecker.shared.available
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
-            // 内容不变时跳过原子写，避免每 5-10s 无意义的 fsync+rename
-            if data == lastStatusData { return }
-            lastStatusData = data
-            // 与扫描状态文件同口径：仅所有者可读（内容含会话路径与统计聚合）
-            do {
-                try AtomicJSONFile.replace(data, at: dir + "/status.json")
-            } catch {
-                NSLog("[CodexUsage] writeStatus failed: %@", error.localizedDescription)
-            }
-        }
+        statusWriter.submit(info)
     }
 
     // 下拉面板（六卡片自上而下，见 docs/project/11-usage-insights-prd.md §3）：
@@ -5769,7 +6043,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 total: Fmt.runHitRate(combined), input: Fmt.tokensAbbr(combined.sumInput),
                 output: Fmt.runRequests(combined), models: rows, hasData: true)
         }
-        let codexBuckets = [merged("今天", usage.tokensToday, usage.extToday),
+        let today = usage.today(on: LocalScanDay.key(Date()))
+        let todayBucket = today.complete ? merged("今天", today.local, today.external)
+                                         : bucket("今天", "今天", total: nil, input: nil, output: nil)
+        let codexBuckets = [todayBucket,
             merged("近 7 天", usage.tokens7d, usage.ext7d), merged("近 30 天", usage.tokens30d, usage.ext30d)]
         var codexNotices: [UsagePanelModel.Notice] = []
         if usage.tokensToday == nil && usage.tokens7d == nil && usage.tokens30d == nil {
@@ -5783,7 +6060,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             codexNotices.append(notice("Codex用量统计失败：\(error)", .error))
         }
         if let error = usage.extError { codexNotices.append(notice("部分数据 · 外部统计失败：\(error)", .warning)) }
-        else if usage.tokensToday == nil || usage.extToday == nil || usage.sourceStatus.values.contains(.failed)
+        else if !today.complete || usage.sourceStatus.values.contains(.failed)
                     || usage.sourceStatus.contains(where: { name, status in
                         status == .absent && (usage.externalTools[name]?.contains(where: { $0.total > 0 }) ?? false)
                     }) {
@@ -5794,14 +6071,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 两卡数据与用量情况同源同窗（token_usage_record 管线），不叠加独立刷新提示
         let responseSection = UsagePanelModel.TokenSection(
             title: "模型响应", accent: .response,
-            buckets: [responseBucket("今天", usage.tokensToday?.runs),
+            buckets: [responseBucket("今天", today.local?.runs),
                       responseBucket("近 7 天", usage.tokens7d?.runs),
                       responseBucket("近 30 天", usage.tokens30d?.runs)],
             notices: [], columnTitles: ["模型", "tok/s", "耗时", "请求"],
             note: UsagePanelModel.responseMetricNote)
         let cacheSection = UsagePanelModel.TokenSection(
             title: "缓存命中", accent: .cache,
-            buckets: [cacheBucket("今天", usage.tokensToday?.runs),
+            buckets: [cacheBucket("今天", today.local?.runs),
                       cacheBucket("近 7 天", usage.tokens7d?.runs),
                       cacheBucket("近 30 天", usage.tokens30d?.runs)],
             notices: [], columnTitles: ["模型", "命中", "输入", "请求"])
@@ -5833,14 +6110,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             official: usage.official, officialError: usage.officialError,
             quotaHistory: quotaHistorySnapshot,
             quotaHistoryAvailable: (visualPreview && !CommandLine.arguments.contains("--visual-preview-quota-history-unstable")) || QuotaCycleCoordinator.accountKey(accountIdentity) != nil,
-            officialTodayFill: LocalUsageMerge.combine(usage.tokensToday, usage.extToday)?.total,
+            officialTodayFill: today.total,
             tools: (0..<3).map { period in
-                let codex = [usage.tokensToday, usage.tokens7d, usage.tokens30d][period]
+                let codex = [today.local, usage.tokens7d, usage.tokens30d][period]
                 var rows: [(name: String, total: Double?, input: Double?, output: Double?, status: UsageSourceStatus)] = []
                 if let value = codex { rows.append(("Codex", value.total, value.input, value.output, usage.tokensError == nil ? .available : .failed)) }
                 else if usage.tokensError != nil { rows.append(("Codex", nil, nil, nil, .failed)) }
                 for name in ["Proma", "Claude Code", "Hermes"] {
-                    if let values = usage.externalTools[name], values.count == 3 {
+                    if let values = usage.externalTools[name], values.count == 3, period != 0 || today.externalDayMatches {
                         let value = values[period]
                         rows.append((name, value.total, value.input, value.output, usage.sourceStatus[name] ?? .pending))
                     } else if usage.sourceStatus[name] == .failed { rows.append((name, nil, nil, nil, .failed)) }
@@ -5952,17 +6229,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.panelController.setUpdateMessage(message, dismissAfter: result == .unknown ? 15 : 6)
                 }
                 self.updateUI()
-                self.refresh(tokens: true, manual: true)
+                self.refresh(manual: true)
                 if result.acknowledgesRedemption {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                        self?.refresh(tokens: true, manual: true)
+                        self?.refresh(manual: true)
                     }
                 }
             }
         }
     }
 
-    @objc private func onRefresh() { refresh(tokens: true, manual: true) }
+    @objc private func onRefresh() { refresh(manual: true) }
 
     // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤10s 也会兜底重建）
     private func checkForUpdate() {
@@ -6527,17 +6804,57 @@ enum CodexOfflineRegression {
             try expect(CodexFreshness.isStale(lastSuccess: last, hasData: true, now: now, after: 50),
                        "retained old data was not stale")
 
-            let gate = RefreshGate()
-            try expect(gate.begin(manual: false), "initial refresh gate did not open")
-            try expect(!gate.begin(manual: false), "overlapping timer refresh started")
-            try expect(!gate.begin(manual: true) && !gate.begin(manual: true), "manual overlap started immediately")
-            try expect(gate.finish(), "manual requests did not coalesce to one follow-up")
-            try expect(!gate.begin(manual: false), "gate did not remain active for queued follow-up")
-            try expect(!gate.finish() && gate.begin(manual: false), "gate was not released after follow-up")
-            try expect(!CodexRefreshSchedule.slowItemsDue(cycle: 4, manual: false)
-                       && CodexRefreshSchedule.slowItemsDue(cycle: 5, manual: false)
-                       && CodexRefreshSchedule.slowItemsDue(cycle: 1, manual: true),
-                       "slow-item cycle or manual refresh schedule is incorrect")
+            var schedule = RefreshSchedule()
+            try expect(schedule.request(manual: false, now: now) == .full, "initial refresh must read slow sources")
+            try expect(schedule.request(manual: true, now: now) == nil, "active refresh overlapped")
+            try expect(schedule.finish() == .full && schedule.finish() == nil, "manual follow-up failed to coalesce")
+            try expect(schedule.request(manual: false, now: now.addingTimeInterval(299)) == .quota, "fast quota skipped")
+            try expect(schedule.request(manual: false, now: now.addingTimeInterval(300)) == nil
+                       && schedule.finish() == .full, "deadline lost during in-flight quota")
+            _ = schedule.finish()
+
+            var slowNetwork = RefreshSchedule()
+            var completesAt: Int?
+            var fullStarts: [Int] = []
+            for second in 0...1811 {
+                if completesAt == second {
+                    let next = slowNetwork.finish()
+                    completesAt = next == nil ? nil : second + 11
+                    if next == .full { fullStarts.append(second) }
+                }
+                if second <= 1800 && second.isMultiple(of: 10),
+                   let work = slowNetwork.request(manual: false, now: now.addingTimeInterval(Double(second))) {
+                    completesAt = second + 11
+                    if work == .full { fullStarts.append(second) }
+                }
+            }
+            try expect(fullStarts.count == 7 && fullStarts.enumerated().allSatisfy { index, actual in
+                (index * 300 ... index * 300 + 11).contains(actual)
+            }, "five-minute refresh starved on a slow network: \(fullStarts)")
+            var wake = RefreshSchedule()
+            _ = wake.request(manual: false, now: now)
+            _ = wake.finish()
+            let later = now.addingTimeInterval(8 * 3600)
+            try expect(wake.request(manual: false, now: later) == .full && wake.finish() == nil
+                       && wake.request(manual: false, now: later) == .quota, "sleep triggered catch-up bursts")
+
+            var overnightUsage = UsageData()
+            overnightUsage.localStatus = .available
+            overnightUsage.tokensToday = TokenScanner.Stats(input: 90, output: 10, total: 100)
+            overnightUsage.extToday = ExternalTokenScanner.Stats(input: 40, output: 10)
+            overnightUsage.localSampleDay = "2026-11-20"
+            overnightUsage.externalSampleDay = overnightUsage.localSampleDay
+            overnightUsage.sourceStatus = ["Proma": .available, "Hermes": .absent]
+            try expect(overnightUsage.today(on: "2026-11-20").total == 150, "same-day aggregate missing")
+            try expect(overnightUsage.today(on: "2026-11-21").total == nil, "yesterday leaked into today")
+            overnightUsage.externalSampleDay = "2026-11-21"
+            try expect(overnightUsage.today(on: "2026-11-21").total == nil, "partial new day presented as complete")
+            overnightUsage.localStatus = .absent
+            try expect(overnightUsage.today(on: "2026-11-21").total == 50, "absent local source blocked valid external usage")
+            overnightUsage.sourceStatus["Proma"] = .failed
+            try expect(overnightUsage.today(on: "2026-11-21").total == 50, "failed source cleared a same-day trusted external value")
+            overnightUsage.externalSampleDay = "2026-11-20"
+            try expect(overnightUsage.today(on: "2026-11-21").total == nil, "stale external value leaked into today after failure")
 
             let cardPayload: [String: Any] = ["credits": [
                 ["id": "fixture-card", "reset_type": "codex_rate_limits", "status": "available", "expires_at": now.addingTimeInterval(3_600).timeIntervalSince1970,
@@ -7137,7 +7454,7 @@ enum CodexOfflineRegression {
                let entry = saved.files.values.first(where: { $0.usageSource == 2 }) {
                 try expect(entry.usageSource == 2, "fallback usageSource not persisted (got \(entry.usageSource))")
                 try expect(entry.recordDaysByModel.values.contains { models in
-                    models.values.contains { $0.count == 14 && $0[0] == 1 && $0[3] == 2000 && $0[4] == 1500 }
+                    models.values.contains { $0.count == 15 && $0[0] == 1 && $0[3] == 2000 && $0[4] == 1500 }
                 }, "fallback persisted bucket contents wrong")
             } else {
                 try expect(false, "fallback state entry missing")
@@ -7313,7 +7630,7 @@ enum CodexOfflineRegression {
                        "truncated external file did not rebase its aggregation")
 
             // 外部用量失败面：已安装来源全部不可读 → error；未安装（路径不存在）不算失败；
-            // 部分来源可读仍按成功（增量状态保留旧贡献，下轮自愈）
+            // 部分来源失败须明确报告（增量状态保留旧贡献，下轮自愈）
             let notADir = root.path + "/not-a-dir"
             try Data("x".utf8).write(to: URL(fileURLWithPath: notADir))
             let badScan = ExternalTokenScanner.scan(roots: [notADir], hermesDB: nil,
@@ -7329,9 +7646,59 @@ enum CodexOfflineRegression {
             try expect(badHermes.error != nil, "corrupt hermes db was reported as success")
             let partialScan = ExternalTokenScanner.scan(roots: [extRootA, notADir], hermesDB: nil,
                                                         statePath: root.path + "/ext-partial-state.json", now: extBase)
-            try expect(partialScan.error == nil && partialScan.thirty.input == 30,
+            try expect(partialScan.error != nil && partialScan.isPartial && partialScan.thirty.input == 30,
                        "partially readable sources were reported as total failure")
 
+            do {
+            // An observed empty source that later disappears is failed, not a fresh zero.
+            let emptyRoot = root.path + "/external-empty"
+            let emptyState = root.path + "/external-empty-state.json"
+            try FileManager.default.createDirectory(atPath: emptyRoot, withIntermediateDirectories: true)
+            let emptyFirst = ExternalTokenScanner.scan(roots: [emptyRoot], hermesDB: nil, statePath: emptyState, now: extBase)
+            try expect(emptyFirst.error == nil && emptyFirst.sourceStatus["Proma"] == .available, "empty source should be a valid zero")
+            let firstCacheDate = try FileManager.default.attributesOfItem(atPath: emptyState)[.modificationDate] as! Date
+            _ = ExternalTokenScanner.scan(roots: [emptyRoot], hermesDB: nil, statePath: emptyState, now: extBase)
+            let secondCacheDate = try FileManager.default.attributesOfItem(atPath: emptyState)[.modificationDate] as! Date
+            try expect(firstCacheDate == secondCacheDate, "unchanged external cache was rewritten")
+            try FileManager.default.removeItem(atPath: emptyRoot)
+            let missingEmpty = ExternalTokenScanner.scan(roots: [emptyRoot], hermesDB: nil, statePath: emptyState, now: extBase)
+            try expect(missingEmpty.error != nil && missingEmpty.sourceStatus["Proma"] == .failed, "disappeared empty source was treated as absent")
+
+            // 符号链接 root 指向的目标消失（NAS/iCloud 卸载形态）：realpath 链断裂后
+            // stable 只能还原到链接自身路径，knownRoots 原始键必须命中并报 failed
+            let linkRoot = root.path + "/proma-link"
+            let linkTarget = root.path + "/proma-link-target"
+            try FileManager.default.createDirectory(atPath: linkTarget, withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(atPath: linkRoot, withDestinationPath: linkTarget)
+            let linkState = root.path + "/proma-link-state.json"
+            _ = ExternalTokenScanner.scan(roots: [linkRoot], hermesDB: nil, statePath: linkState, now: extBase)
+            try FileManager.default.removeItem(atPath: linkTarget)
+            let danglingLink = ExternalTokenScanner.scan(roots: [linkRoot], hermesDB: nil, statePath: linkState, now: extBase)
+            try expect(danglingLink.error != nil && danglingLink.sourceStatus["Proma"] == .failed, "dangling symlinked source was treated as absent")
+
+            // A failed atomic write can be retried, without touching any real user data.
+            let retryDir = root.path + "/external-retry"
+            let retryPath = retryDir + "/state.json"
+            try Data("block parent".utf8).write(to: URL(fileURLWithPath: retryDir))
+            _ = ExternalTokenScanner.scan(roots: [], hermesDB: nil, statePath: retryPath, now: extBase)
+            try FileManager.default.removeItem(atPath: retryDir)
+            try FileManager.default.createDirectory(atPath: retryDir, withIntermediateDirectories: true)
+            _ = ExternalTokenScanner.scan(roots: [], hermesDB: nil, statePath: retryPath, now: extBase)
+            try expect(FileManager.default.fileExists(atPath: retryPath), "failed external cache write was not retried")
+
+            // Legacy Hermes rows and daily history migrate together and stay readable by old versions.
+            let legacyPath = root.path + "/external-v5.json"
+            let migratedPath = root.path + "/external-v6.json"
+            var legacy = ExternalTokenScanner.State()
+            legacy.hermes = ExternalTokenScanner.HermesState(rows: ["row": [100, 20]], days: [extDayKey: [100, 20]], daysByModel: [extDayKey: ["gpt-test": [100, 20]]])
+            try JSONEncoder().encode(legacy).write(to: URL(fileURLWithPath: legacyPath))
+            let migrated = ExternalTokenScanner.scan(roots: [], hermesDB: nil, statePath: migratedPath, now: extBase, legacyStatePath: legacyPath)
+            let migratedState = try JSONDecoder().decode(ExternalTokenScanner.State.self, from: Data(contentsOf: URL(fileURLWithPath: migratedPath)))
+            let rollbackState = try JSONDecoder().decode(ExternalTokenScanner.State.self, from: Data(contentsOf: URL(fileURLWithPath: legacyPath)))
+            try expect(migrated.thirty.total == 120 && migratedState.hermes == legacy.hermes && rollbackState.hermes == legacy.hermes,
+                       "Hermes migration or rollback snapshot lost baselines or daily history")
+
+            }
             // hermes 差分（临时 sqlite 夹具）：首扫按 last_seen 回填、累计行增长入当日、
             // 计数重置 rebase 不倒扣、行删除移出快照但保留历史差分
             let hdbPath = root.path + "/hermes-fixture.db"
@@ -7767,11 +8134,21 @@ func onceMode() {
 if CommandLine.arguments.contains("--official-usage-check") {
     switch OfficialUsageReader.read(expected: CodexAuth.load()) {
     case .success(let snapshot):
-        let codex = TokenScanner.scan()
-        let external = ExternalTokenScanner.scan()
-        let fill = LocalUsageMerge.combine(codex.error == nil ? codex.today : nil,
-                                           external.error == nil ? external.today : nil)?.total
-        let comparison = UsageComparison.evaluate(snapshot: snapshot, now: Date(), todayFill: fill)
+        let sampled = Date()
+        let sampleDay = LocalScanDay.key(sampled)
+        let codex = TokenScanner.scan(now: sampled)
+        let external = ExternalTokenScanner.scan(now: sampled)
+        var local = UsageData()
+        local.localSampleDay = sampleDay
+        local.externalSampleDay = sampleDay
+        local.localStatus = codex.sourceStatus
+        local.tokensToday = codex.today
+        local.extToday = external.today
+        local.extError = external.error
+        local.sourceStatus = external.sourceStatus
+        let now = Date()
+        let comparison = UsageComparison.evaluate(snapshot: snapshot, now: now,
+            todayFill: local.today(on: LocalScanDay.key(now)).total)
         print("official usage: success; dailyComparisonReady=\(comparison.0.value != .insufficient); weeklyComparisonReady=\(comparison.1.value != .insufficient) (values withheld)")
         exit(0)
     case .failure(let failure): print("official usage: \(failure)"); exit(1)

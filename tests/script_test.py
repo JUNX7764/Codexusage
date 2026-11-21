@@ -151,6 +151,7 @@ esac
         self._mock("open", r'''
 echo "open $*" >> "$MOCK_LOG"
 if [ "$1" = "-R" ]; then exit 0; fi
+if [ "${MOCK_UNHEALTHY_ONCE:-0}" = 1 ] && [ ! -e "$MOCK_UNHEALTHY_MARKER" ]; then : > "$MOCK_UNHEALTHY_MARKER"; exit 0; fi
 : > "$MOCK_STATE"
 ''')
         self._mock("ps", r'''
@@ -520,23 +521,35 @@ exit 0
         self.assertIn("已加载的 LaunchAgent", result.stdout)
         self.assertFalse(any("bootout" in line for line in self.log_lines()))
 
-    def test_loaded_agent_with_missing_plist_self_heals_and_updates(self):
-        # 旧版本关自启只删 plist 不 bootout：job 仍在 launchd 内存里而 plist 缺失，
-        # 更新不应被阻断，而是按当前安装位置重写 plist 后继续
+    def test_loaded_agent_with_missing_plist_preserves_disabled_preference(self):
         installed = self.prepare_update()
         plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
         plist.unlink()
         result = self.run_update()
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.marker(installed), "new")
-        self.assertIn("缺少 plist 文件，已按当前安装位置重写", result.stdout)
-        self.assertTrue(plist.exists(), result.stdout)
-        with plist.open("rb") as handle:
-            healed = plistlib.load(handle)
-        self.assertEqual(healed["Label"], LABEL)
-        self.assertEqual(healed["ProgramArguments"], [str(installed / "Contents" / "MacOS" / EXECUTABLE)])
-        self.assertTrue(healed["RunAtLoad"])
-        self.assertEqual(healed["KeepAlive"], {"SuccessfulExit": False})
+        self.assertFalse(plist.exists())
+        self.assertTrue(any("bootout" in line for line in self.log_lines()))
+        self.assertFalse(any("bootstrap" in line for line in self.log_lines()))
+        self.assertTrue(any(line.startswith("open ") for line in self.log_lines()))
+
+    def test_unloaded_enabled_agent_starts_after_update(self):
+        installed = self.prepare_update()
+        self.state.unlink()  # no process is running before this unloaded-agent case
+        result = self.run_update(MOCK_AGENT_ACTIVE="0")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(any("bootstrap" in line for line in self.log_lines()))
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_disabled_agent_remains_disabled_on_rollback(self):
+        installed = self.prepare_update()
+        plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        plist.unlink()
+        result = self.run_update(MOCK_UNHEALTHY_ONCE="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(plist.exists())
+        self.assertFalse(any("bootstrap" in line for line in self.log_lines()))
 
     def test_zip_download_failure_aborts_before_staging(self):
         installed = self.prepare_update()

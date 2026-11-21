@@ -114,16 +114,36 @@ struct QuotaCycleReducer {
         guard sample.isValid, state.lastRequestStartedAt.map({ sample.requestStartedAt > $0 }) ?? true,
               state.previous.map({ sample.observedAt >= $0.observedAt }) ?? true else { return }
         state.lastRequestStartedAt = sample.requestStartedAt
-        guard var current = state.current, state.previous != nil else {
+        guard var current = state.current, let previous = state.previous else {
             state.current = makeCycle(sample, kind: .inferred)
             state.previous = sample
             return
         }
         let changed = abs(sample.resetAt.timeIntervalSince(current.expectedResetAt)) > policy.resetJitter
+        let elapsed = sample.observedAt.timeIntervalSince(previous.observedAt)
+        let resetDrift = sample.resetAt.timeIntervalSince(previous.resetAt)
+        // A moving seven-day deadline is not a boundary. Compare successive samples,
+        // including short polling intervals that are smaller than resetJitter.
+        let sliding = elapsed > 0 && elapsed <= policy.maximumContinuousGap &&
+            abs(resetDrift - elapsed) <= 3 && previous.planType == sample.planType &&
+            previous.usedPercent == sample.usedPercent && resetDrift > 0
+        if sliding && (state.pendingTransition == nil || state.pendingTransition?.reason == .anomaly || state.pendingTransition?.reason == .gap) {
+            current.expectedResetAt = sample.resetAt
+            current.lastObservedAt = sample.observedAt
+            current.lastObservedUsedPercent = sample.usedPercent
+            if state.pendingTransition?.reason == .anomaly || state.pendingTransition?.reason == .gap {
+                state.pendingTransition = nil
+            }
+            state.current = current
+            state.previous = sample
+            return
+        }
         let samePlan = current.evidence.last?.planType == sample.planType
         if samePlan, let redemption = state.redemptions.last(where: {
             $0.status == .reset && $0.baselineCycleID == current.id &&
-            $0.originalRequestedAt != nil && sample.requestStartedAt >= $0.responseAt
+            $0.originalRequestedAt != nil && sample.requestStartedAt >= $0.responseAt &&
+            sample.requestStartedAt.timeIntervalSince($0.responseAt) <= policy.confirmationMaxDelay &&
+            sample.requestStartedAt < current.expectedResetAt
         }), redemption.originalRequestedAt! >= current.firstObservedAt,
            (changed || current.lastObservedUsedPercent - sample.usedPercent >= policy.meaningfulDrop),
            sample.observedAt.timeIntervalSince(current.lastObservedAt) <= policy.maximumContinuousGap {

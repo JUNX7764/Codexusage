@@ -246,6 +246,32 @@ case "coordinator":
     coordinator.activate(accountIdentity: "token:unstable", generation: 5)
     coordinator.observe(sample(400, 90), identity: "token:unstable", generation: 5); drain(); deliver()
     check(writes == before, "unstable identity cannot write")
+case "slidingWrites":
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    var writes = 0
+    var latest: QuotaCycleSnapshot?
+    let c = QuotaCycleCoordinator(root: root, writer: { data, url in
+        writes += 1
+        try data.write(to: url, options: .atomic)
+    }, schedule: { $0() }, deliver: { latest = $0 })
+    func drain() {
+        let signal = DispatchSemaphore(value: 0)
+        c.drain { signal.signal() }
+        check(signal.wait(timeout: .now() + 10) == .success, "drain sliding writes")
+    }
+    let identity = "account:sliding|workspace"
+    c.activate(accountIdentity: identity, generation: 1)
+    for i in 0...360 {
+        let at = Double(i * 10)
+        c.observe(sample(at, 0, 604800 + at), identity: identity, generation: 1)
+    }
+    drain()
+    check(writes <= 16 && latest?.state.closed.isEmpty == true, "sliding heartbeat write bound: \(writes)")
+    let key = QuotaCycleCoordinator.accountKey(identity)!
+    let store = QuotaCycleStore(root: root) { data, url in try data.write(to: url, options: .atomic) }
+    let restored = try! store.load(accountKey: key)
+    check(restored.current?.id == latest?.state.current?.id && restored.current?.firstObservedAt == t, "restart preserves cycle identity")
 case "browser":
     for count in [0, 1, 5, 6, 7, 12, 13, 25] {
         var records: [QuotaCycleRecord] = []
@@ -322,37 +348,28 @@ case "planRecovery":
     reducer.ingest(sample(160, 6, 605800, plan: "pro"), into: &churn)
     check(churn.closed.first?.end == .unconfirmed, "stable new plan recovers")
 case "slidingResetAt":
-    // 滑动 resetAt：服务端在无用量期间返回 observedAt+7d，每轮漂移 ~130s > jitter。
-    // 修复前每次采样都即时 gap 关闭一轮伪周期；修复后滑动全程不关闭、异常压缩为一条。
-    reducer.ingest(sample(0, 0), into: &state)
-    let id = state.current!.id
-    let frozenAt = state.current!.lastObservedAt
-    for i in 1...32 {
-        let at = Double(i) * 130
-        reducer.ingest(sample(at, 0, 604800 + at), into: &state)
+    for interval in [10.0, 130.0] {
+        var sliding = QuotaCycleState()
+        reducer.ingest(sample(0, 0), into: &sliding)
+        let id = sliding.current!.id
+        for i in 1...361 {
+            let at = Double(i) * interval
+            reducer.ingest(sample(at, 0, 604800 + at), into: &sliding)
+        }
+        check(sliding.closed.isEmpty && sliding.current?.id == id, "sliding deadline retains cycle")
+        check(sliding.current?.firstObservedAt == t && sliding.pendingTransition == nil, "sliding deadline retains first observation")
+        let last = 361.0 * interval
+        reducer.ingest(sample(last + interval, 1, 604800 + last), into: &sliding)
+        check(sliding.current?.id == id && sliding.current?.lastObservedUsedPercent == 1, "fixed deadline and usage update same cycle")
     }
-    check(state.closed.isEmpty, "sliding drift must not close cycles")
-    check(state.anomalies.count == 1, "sliding anomalies collapse to one")
-    check(state.pendingTransition?.reason == .gap, "gap candidate armed during sliding")
-    check(state.current?.id == id && state.current?.lastObservedAt == frozenAt &&
-        state.current?.lastObservedUsedPercent == 0 && state.current?.evidence.count == 1, "current frozen during sliding")
-    // 锚定：服务端固定 reset（与最后一条滑动值相差 130s > jitter）→ 候选以锚定样本重新武装。
-    let anchorAt = 32.0 * 130 + 130
-    let anchorReset = 604800.0 + anchorAt
-    reducer.ingest(sample(anchorAt, 0, anchorReset), into: &state)
-    check(state.closed.isEmpty && state.pendingTransition?.reason == .gap &&
-        state.pendingTransition?.first.observedAt == t.addingTimeInterval(anchorAt), "anchor re-arms candidate")
-    // 确认窗口下限内的稳定采样保留候选；随后 10~180s 内的稳定采样触发一次 gap 关闭。
-    reducer.ingest(sample(anchorAt + 5, 0, anchorReset), into: &state)
-    check(state.closed.isEmpty && state.pendingTransition?.first.observedAt == t.addingTimeInterval(anchorAt), "early stable sample keeps candidate")
-    reducer.ingest(sample(anchorAt + 125, 1, anchorReset), into: &state)
-    // 零用量分支：全程 0% 的初始周期被丢弃（不压入 closed），当前窗口以锚定样本重启。
-    check(state.closed.isEmpty && state.pendingTransition == nil, "zero-usage window is dropped, not closed")
-    check(state.current?.id != id && state.current?.startKind == .afterGap &&
-        state.current?.firstObservedAt == t.addingTimeInterval(anchorAt) &&
-        state.current?.expectedResetAt == t.addingTimeInterval(anchorReset), "window restarts at anchor")
-    check(state.current?.lastObservedUsedPercent == 1 && state.current?.evidence.count == 2, "confirm sample value and evidence appended")
-    check(state.anomalies.count == 1, "no anomaly inflation after restart")
+case "expiredRedemption":
+    reducer.ingest(sample(0, 70, 3600), into: &state)
+    let id = state.current!.id
+    reducer.record(QuotaRedemptionEvidence(operationHash: "op", originalRequestedAt: t.addingTimeInterval(5), responseAt: t.addingTimeInterval(10), status: .reset, baselineCycleID: id), into: &state)
+    reducer.ingest(sample(3500, 70, 3600), into: &state)
+    reducer.ingest(sample(3610, 0, 608400), into: &state)
+    reducer.ingest(sample(3630, 0, 608400), into: &state)
+    check(state.closed.first?.end == .natural, "expired redemption must not claim natural boundary")
 case "slidingNaturalRegression":
     // 复刻 2025-11-20 13:38 真实序列：临近重置的心跳（53%、reset 漂移 115s ≤ jitter）→
     // 滑动 reset 样本触发 natural 候选 → 120s 后 reset 恰漂移 120s 的样本确认，natural 关闭仍正常。

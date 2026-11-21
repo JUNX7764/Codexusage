@@ -139,8 +139,8 @@ private final class ChartHoverLabel: NSView {
 final class DailyUsageChart: NSView {
     /// 图元口径：官方日桶 / 官方范围内缺桶（官方客户端按 0 渲染）/ 本机扫描补今日 / 缺失。
     enum Entry { case reported(Double), inferredZero, scanned(Double), missing }
-    private let days: [(String, Entry)]
-    private let todayKey: String?
+    private var days: [(String, Entry)] = []
+    private var todayKey: String?
     var selectedIndexForPreview: Int? { selection }
     var selectedTextForPreview: String { hover.stringValue }
     var hoverWithinBoundsForPreview: Bool {
@@ -155,7 +155,7 @@ final class DailyUsageChart: NSView {
     override var isFlipped: Bool { true }
 
     /// 近 30 个日历日止于今日（官方最大源日期更晚时以其为界）；官方缺今日桶时以与用量情况同口径的本机合并用量补并描边标注未结束。
-    init(snapshot: OfficialUsageSnapshot?, scannedToday: Double? = nil) {
+    private static func entries(snapshot: OfficialUsageSnapshot?, scannedToday: Double?) -> ([(String, Entry)], String?) {
         var entries: [(String, Entry)] = []
         var today: String?
         if let snapshot = snapshot, !snapshot.days.isEmpty {
@@ -182,8 +182,12 @@ final class DailyUsageChart: NSView {
                 }
             }
         }
-        days = entries
-        todayKey = today
+        return (entries, today)
+    }
+    init(snapshot: OfficialUsageSnapshot?, scannedToday: Double? = nil) {
+        let data = Self.entries(snapshot: snapshot, scannedToday: scannedToday)
+        days = data.0
+        todayKey = data.1
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 61).isActive = true
@@ -194,6 +198,15 @@ final class DailyUsageChart: NSView {
         setAccessibilityLabel("用量简析图，使用左右方向键查看日期")
     }
     required init?(coder: NSCoder) { fatalError() }
+    func update(snapshot: OfficialUsageSnapshot?, scannedToday: Double?) {
+        let selectedDate = selection.flatMap { days.indices.contains($0) ? days[$0].0 : nil }
+        let data = Self.entries(snapshot: snapshot, scannedToday: scannedToday)
+        days = data.0
+        todayKey = data.1
+        selection = selectedDate.flatMap { key in days.firstIndex { $0.0 == key } }
+        needsDisplay = true
+        updateAccessibility()
+    }
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true

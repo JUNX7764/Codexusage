@@ -15,6 +15,7 @@ WORK=""
 BACKUP=""
 INSTALLED=""
 AGENT=0
+LOADED=0
 STOPPED=0
 SUCCESS=0
 NEW_VERSION=""
@@ -248,22 +249,16 @@ if other_copy_running; then
     echo "!! 检测到另一应用副本正在运行，已中止"
     exit 1
 fi
-if JOB_INFO="$(launchctl print "gui/${MYUID}/${LABEL}" 2>/dev/null)"; then
-    LOADED_BINARY="$(printf '%s\n' "$JOB_INFO" | awk '/^[[:space:]]*program = / { sub(/^[[:space:]]*program = /, ""); print; exit }')"
-    [ "$LOADED_BINARY" = "$BINARY" ] || { echo "!! 已加载的 LaunchAgent 指向另一副本或无法确认，已中止"; exit 1; }
-    if [ ! -f "$AGENT_PLIST" ]; then
-        # 旧版本关闭自启时只删 plist 不 bootout，已加载 job 与磁盘状态会脱节，导致更新
-        # 被永久阻断。已加载 program 已确认指向本应用，按开启自启的同款内容重写后继续；
-        # 本脚本稍后本就 bootout → 换包 → bootstrap，重写内容即为最终生效状态。
-        mkdir -p "$(dirname "$AGENT_PLIST")"
-        printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n    <key>Label</key><string>%s</string>\n    <key>ProgramArguments</key>\n    <array><string>%s</string></array>\n    <key>RunAtLoad</key><true/>\n    <key>KeepAlive</key>\n    <dict><key>SuccessfulExit</key><false/></dict>\n</dict>\n</plist>\n' \
-            "$LABEL" "$BINARY" > "$AGENT_PLIST" \
-            || { echo "!! LaunchAgent plist 不存在且重写失败，已中止"; exit 1; }
-        echo "==> 已加载的 LaunchAgent 缺少 plist 文件，已按当前安装位置重写"
-    fi
+# plist 是用户自启偏好；已加载作业仅决定是否需要停止。
+if [ -f "$AGENT_PLIST" ]; then
     AGENT_BINARY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null || true)"
     [ "$AGENT_BINARY" = "$BINARY" ] || { echo "!! LaunchAgent 指向另一副本，已中止"; exit 1; }
     AGENT=1
+fi
+if JOB_INFO="$(launchctl print "gui/${MYUID}/${LABEL}" 2>/dev/null)"; then
+    LOADED_BINARY="$(printf '%s\n' "$JOB_INFO" | awk '/^[[:space:]]*program = / { sub(/^[[:space:]]*program = /, ""); print; exit }')"
+    [ "$LOADED_BINARY" = "$BINARY" ] || { echo "!! 已加载的 LaunchAgent 指向另一副本或无法确认，已中止"; exit 1; }
+    LOADED=1
 fi
 
 echo "==> 3/5 在安装位置旁暂存新版本"
@@ -283,7 +278,7 @@ if ! codesign --verify --deep --strict "$STAGE"; then
 fi
 
 echo "==> 4/5 停止 ${LABEL} 并切换版本"
-if [ "$AGENT" = 1 ]; then
+if [ "$LOADED" = 1 ]; then
     launchctl bootout "gui/${MYUID}/${LABEL}"
 fi
 STOPPED=1

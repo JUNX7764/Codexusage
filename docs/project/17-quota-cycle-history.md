@@ -24,6 +24,8 @@
 
 稳定账户 identity 经 `SHA256("quota-cycle-v1|" + identity)` 派生分区，文件位于 `~/Library/Application Support/CodexUsage/quota-history/<hash>/history-v1.json`；目录 0700、文件 0600。无稳定账户不落盘。文件不保存账户原始身份、凭据、卡片 ID、原请求 key 或原始响应；用卡操作仅存哈希。预览不创建真实仓库。
 
-持久化版本为 1；解码检查数值、时间、ID、顺序和候选归属。损坏或未来版本不覆盖原文件；写失败保留内存状态并显示「历史未保存」，下次保存可重试。无变化观测经去重和五分钟心跳减少写入。模型、仓库和协调器可用 `python3 -m unittest discover -s tests -p 'quota_cycle_history_test.py' -v` 在临时目录验证。
+文件名沿用 `history-v1.json`，当前内容 schema 为 v3；v1/v2 通过校验后迁移，历史标签不重新推断。解码检查数值、时间、ID、顺序和候选归属。损坏或未来版本不覆盖原文件；写失败保留内存状态并显示「历史未保存」，下次保存可重试。无变化观测经去重和五分钟心跳减少写入。模型、仓库和协调器可用 `python3 -m unittest discover -s tests -p 'quota_cycle_history_test.py' -v` 在临时目录验证。
 
 父会话已在真实 AppKit 假数据窗口检查翻页、悬停移出恢复、选中、折叠重开、单步方向键和 Escape；连续键盘跨页另由原生事件回归覆盖。VoiceOver 实际朗读和真实账号长期采样未验证，不能用固定数据代替；详见 [验证记录](../verification/2026-11-12-quota-cycle-history.md)。
+
+连续采样时，同时比较观测时间与截止时间：两者近似等幅前移且用量、套餐不变时保留当前周期；漂移仅在五分钟心跳或其他必要变化时落盘。确认兑换作为独立事实保存，只有同一基线周期、响应后 180 秒内发起且原截止前的采样才能用于用卡归因。

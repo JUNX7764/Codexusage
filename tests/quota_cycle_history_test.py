@@ -52,6 +52,9 @@ class QuotaCycleHistoryTest(unittest.TestCase):
     def test_coordinator(self):
         self.run_case('coordinator')
 
+    def test_sliding_writes(self):
+        self.run_case('slidingWrites')
+
     def test_browser(self):
         self.run_case('browser')
 
@@ -63,6 +66,9 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_sliding_reset_at(self):
         self.run_case('slidingResetAt')
+
+    def test_expired_redemption(self):
+        self.run_case('expiredRedemption')
 
     def test_sliding_natural_regression(self):
         self.run_case('slidingNaturalRegression')

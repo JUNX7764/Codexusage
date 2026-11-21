@@ -72,7 +72,13 @@ final class QuotaCycleCoordinator {
     private func semantic(_ value: QuotaCycleState) -> QuotaCycleState {
         var result = value
         result.previous = nil; result.lastRequestStartedAt = nil
-        if var current = result.current { current.lastObservedAt = current.firstObservedAt; result.current = current }
+        if var current = result.current {
+            current.lastObservedAt = current.firstObservedAt
+            // Deadline drift from a sliding window is maintained in memory and
+            // captured at the heartbeat, rather than forcing a write each poll.
+            if let first = current.evidence.first { current.expectedResetAt = first.resetAt }
+            result.current = current
+        }
         return result
     }
     private func save(_ value: inout Partition, key: String, at: Date, force: Bool = false) {

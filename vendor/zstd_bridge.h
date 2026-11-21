@@ -8,3 +8,10 @@ size_t cu_zstd_decompress(const unsigned char *src, size_t srcLen,
                           unsigned char *dst, size_t dstCap);
 
 #endif
+
+/* Streaming decoder: caller owns context; returns SIZE_MAX on error, otherwise
+ * remaining frame bytes hint (zero means a complete frame). */
+void *cu_zstd_stream_create(void);
+void cu_zstd_stream_free(void *ctx);
+size_t cu_zstd_stream_step(void *ctx, const void *src, size_t srcLen, size_t *srcPos,
+                           void *dst, size_t dstCap, size_t *dstPos);

@@ -9,9 +9,9 @@ final class QuotaCycleUIState {
 }
 
 final class QuotaCycleHistoryView: NSView {
-    private let snapshot: QuotaCycleSnapshot
+    private var snapshot: QuotaCycleSnapshot
     private let available: Bool
-    private let now: Date
+    private var now: Date
     private let state: QuotaCycleUIState
     private let earlier = NSButton(title: "‹", target: nil, action: nil)
     private let newer = NSButton(title: "›", target: nil, action: nil)
@@ -54,6 +54,12 @@ final class QuotaCycleHistoryView: NSView {
         newer.frame = NSRect(x: width - 26, y: 0, width: 24, height: 19)
         chart.frame = NSRect(x: 0, y: 21, width: width, height: 94)
         detail1.frame = NSRect(x: 0, y: 117, width: width, height: 15)
+    }
+    func update(snapshot: QuotaCycleSnapshot, now: Date) {
+        self.snapshot = snapshot
+        self.now = now
+        chart.update(snapshot: snapshot, now: now)
+        refresh()
     }
     var previewText: String { detail1.stringValue }
     var previewTooltip: String { detail1.toolTip ?? "" }
@@ -161,8 +167,8 @@ private final class QuotaCycleAccessibilityItem: NSAccessibilityElement {
 
 final class QuotaCycleChart: NSView {
     private let state: QuotaCycleUIState
-    private let snapshot: QuotaCycleSnapshot
-    private let now: Date
+    private var snapshot: QuotaCycleSnapshot
+    private var now: Date
     var changed: (() -> Void)?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -177,6 +183,11 @@ final class QuotaCycleChart: NSView {
         setAccessibilityLabel("额度周期图，使用左右方向键选择周期")
     }
     required init?(coder: NSCoder) { fatalError() }
+    func update(snapshot: QuotaCycleSnapshot, now: Date) {
+        self.snapshot = snapshot
+        self.now = now
+        needsDisplay = true
+    }
     override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); window?.acceptsMouseMovedEvents = true }
     override func updateTrackingAreas() {
         super.updateTrackingAreas(); trackingAreas.forEach(removeTrackingArea)

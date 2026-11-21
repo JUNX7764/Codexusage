@@ -15,3 +15,15 @@ size_t cu_zstd_decompress(const unsigned char *src, size_t srcLen,
     if (!ZSTD_isError(rc)) return rc;
     return ZSTD_getErrorCode(rc) == ZSTD_error_dstSize_tooSmall ? SIZE_MAX : 0;
 }
+
+void *cu_zstd_stream_create(void) { return ZSTD_createDStream(); }
+void cu_zstd_stream_free(void *ctx) { ZSTD_freeDStream((ZSTD_DStream *)ctx); }
+size_t cu_zstd_stream_step(void *ctx, const void *src, size_t srcLen, size_t *srcPos,
+                           void *dst, size_t dstCap, size_t *dstPos) {
+    ZSTD_inBuffer input = { src, srcLen, *srcPos };
+    ZSTD_outBuffer output = { dst, dstCap, 0 };
+    size_t rc = ZSTD_decompressStream((ZSTD_DStream *)ctx, &output, &input);
+    *srcPos = input.pos;
+    *dstPos = output.pos;
+    return ZSTD_isError(rc) ? SIZE_MAX : rc;
+}
