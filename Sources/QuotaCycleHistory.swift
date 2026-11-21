@@ -45,14 +45,14 @@ struct QuotaCyclePolicy {
     var maximumContinuousGap: TimeInterval = 15 * 60
     var heartbeatInterval: TimeInterval = 5 * 60
 }
-enum QuotaPendingReason: String, Codable { case early, natural, anomaly, planChange }
+enum QuotaPendingReason: String, Codable { case early, natural, anomaly, planChange, gap }
 struct QuotaPendingTransition: Codable, Equatable {
     let baselineCycleID: UUID
     let first: QuotaObservation
     let reason: QuotaPendingReason
 }
 struct QuotaCycleState: Codable, Equatable {
-    var schemaVersion = 1
+    var schemaVersion = 3
     var closed: [QuotaCycleRecord] = []
     var current: QuotaCycleRecord?
     var previous: QuotaObservation?
@@ -81,9 +81,20 @@ struct QuotaCycleReducer {
         state.pendingTransition = nil
     }
     private func appendAnomaly(_ sample: QuotaObservation, into state: inout QuotaCycleState) {
-        if let last = state.anomalies.last, last.usedPercent == sample.usedPercent &&
-            last.planType == sample.planType && abs(last.resetAt.timeIntervalSince(sample.resetAt)) <= policy.resetJitter { return }
-        state.anomalies.append(sample)
+        state.anomalies = Self.compressedAnomalies(state.anomalies + [sample], policy: policy)
+    }
+    // 滑动 resetAt 期间服务端返回 observedAt+7d，相邻采样 resetAt 漂移 ~130s：同用量、同套餐且漂移
+    // 未超过最大连续缺口的连续异常属于同一次滑动-idle，仅保留最新一条；真实的 reset 跳变（Δ 大）
+    // 或用量/套餐变化仍逐条保留。reducer 与 v1→v2 存量迁移共用。
+    static func compressedAnomalies(_ anomalies: [QuotaObservation], policy: QuotaCyclePolicy) -> [QuotaObservation] {
+        var result: [QuotaObservation] = []
+        for sample in anomalies {
+            if let last = result.last, last.usedPercent == sample.usedPercent, last.planType == sample.planType,
+               abs(last.resetAt.timeIntervalSince(sample.resetAt)) <= policy.maximumContinuousGap {
+                result[result.count - 1] = sample
+            } else { result.append(sample) }
+        }
+        return result
     }
     func record(_ event: QuotaRedemptionEvidence, into state: inout QuotaCycleState) {
         guard !event.operationHash.isEmpty, event.responseAt.timeIntervalSince1970.isFinite,
@@ -120,8 +131,52 @@ struct QuotaCycleReducer {
             state.previous = sample
             return
         }
+        // .gap 二段确认：观测缺口候选须下一个稳定采样证实（resetAt 稳定、确认窗口 10~180s）才真正关闭。
+        // 滑动 resetAt 期间每个新采样的 reset 都在漂移，候选被逐轮替换，永不关闭——与 GLM 的
+        // pending 替换语义一致，修复「每 15 分钟关闭一轮伪周期」的缺陷。
+        // 注意：delay 上限（confirmationMaxDelay）与轮询节奏（~120-130s）硬耦合——reset 已稳定但
+        // 轮询持续 >180s 时，候选在「清除→重武装」中循环、gap 永不关闭（无伪周期，仅关闭延迟）；
+        // 若未来调整轮询间隔，需同步评估确认窗口上下限。
+        if let pending = state.pendingTransition, pending.reason == .gap {
+            let stable = abs(sample.resetAt.timeIntervalSince(pending.first.resetAt)) <= policy.resetJitter
+                && sample.planType == pending.first.planType
+            let delay = sample.observedAt.timeIntervalSince(pending.first.observedAt)
+            if stable && delay >= policy.confirmationMinDelay && delay <= policy.confirmationMaxDelay && samePlan {
+                if current.evidence.allSatisfy({ $0.usedPercent == 0 }) {
+                    // 口径：全程 0% 的窗口不产生历史柱——真实重置边界已由前一周期的自然到期保留，
+                    // 锚定即「缺口后首次观测」；与迁移剔除签名同一取舍。丢弃旧 current（不压入 closed），
+                    // 以锚定样本重启当前窗口，避免「真实重置 → idle 滑动 → 首次用量重锚定」每周复现
+                    // observedTransition/gap 0% 碎片柱。
+                    state.current = makeCycle(pending.first, kind: .afterGap)
+                    state.pendingTransition = nil
+                    current = state.current!
+                    current.lastObservedAt = sample.observedAt
+                    current.lastObservedUsedPercent = sample.usedPercent
+                    if sample.usedPercent != pending.first.usedPercent || sample.planType != pending.first.planType {
+                        current.evidence.append(sample)
+                    }
+                    state.current = current
+                    state.previous = sample
+                    return
+                }
+                close(&state, first: pending.first, reason: .gap, kind: .afterGap)
+                current = state.current!
+                current.lastObservedAt = sample.observedAt
+                current.lastObservedUsedPercent = sample.usedPercent
+                if sample.usedPercent != pending.first.usedPercent || sample.planType != pending.first.planType {
+                    current.evidence.append(sample)
+                }
+                state.current = current
+                state.previous = sample
+                return
+            }
+            if stable && delay < policy.confirmationMinDelay { state.previous = sample; return }
+            // 不稳定（reset 继续漂移或套餐变化）或超过确认窗口：清除候选，让下方最新样本重新武装。
+            state.pendingTransition = nil
+        }
+        // 观测缺口只武装候选，不再以冻结的 lastObservedAt 为基准即时关闭。
         if changed && samePlan && sample.observedAt.timeIntervalSince(current.lastObservedAt) > policy.maximumContinuousGap {
-            close(&state, first: sample, reason: .gap, kind: .afterGap)
+            state.pendingTransition = QuotaPendingTransition(baselineCycleID: current.id, first: sample, reason: .gap)
             state.previous = sample
             return
         }

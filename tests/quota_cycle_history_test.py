@@ -60,3 +60,18 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_plan_recovery(self):
         self.run_case('planRecovery')
+
+    def test_sliding_reset_at(self):
+        self.run_case('slidingResetAt')
+
+    def test_sliding_natural_regression(self):
+        self.run_case('slidingNaturalRegression')
+
+    def test_gap_with_usage(self):
+        self.run_case('gapWithUsage')
+
+    def test_migration(self):
+        self.run_case('migration')
+
+    def test_migration_invalid_v1(self):
+        self.run_case('migrationInvalidV1')

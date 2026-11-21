@@ -14,7 +14,7 @@ final class QuotaCycleStore {
     }
     private func finite(_ date: Date?) -> Bool { date.map { $0.timeIntervalSince1970.isFinite } ?? true }
     private func valid(_ state: QuotaCycleState) -> Bool {
-        guard state.schemaVersion == 1, finite(state.lastRequestStartedAt),
+        guard state.schemaVersion == 1 || state.schemaVersion == 2 || state.schemaVersion == 3, finite(state.lastRequestStartedAt),
               state.previous?.isValid ?? true, state.anomalies.allSatisfy(\.isValid) else { return false }
         if let previous = state.previous {
             guard let current = state.current, state.lastRequestStartedAt == previous.requestStartedAt,
@@ -64,9 +64,39 @@ final class QuotaCycleStore {
         guard values.isSymbolicLink != true, values.isRegularFile == true else { throw StoreError.unsafePath }
         let data = try Data(contentsOf: url)
         let decoded = try JSONDecoder().decode(QuotaCycleState.self, from: data)
-        guard decoded.schemaVersion == 1 else { throw StoreError.unsupportedVersion }
-        guard valid(decoded) else { throw StoreError.invalidState }
-        return decoded
+        switch decoded.schemaVersion {
+        case 3:
+            guard valid(decoded) else { throw StoreError.invalidState }
+            return decoded
+        case 1, 2:
+            // v1/v2 存量：沿用旧保护语义先拒绝损坏文件（invalidState，分区只读、字节不改写），再执行迁移；
+            // 剔除口径对 v2（上一轮迁移产物，可能含 observedTransition/gap 零用量 stub）同样适用。
+            guard valid(decoded) else { throw StoreError.invalidState }
+            return migrate(decoded)
+        default:
+            throw StoreError.unsupportedVersion
+        }
+    }
+    // v1/v2→v3 迁移：滑动 resetAt 缺陷曾把每次采样都关成伪周期（afterGap/gap、单证据、0% 用量），
+    // 并把滑动-idle 期的异常样本逐条堆积；早期版本还把零用量 stub（observedTransition/gap）单独入史。
+    // 迁移只做剔除与压缩（只删不改、保序），不重放历史；pendingTransition 作废，其余字段原样保留。
+    // 输入已通过 valid()，而删除、压缩替换、置 nil 均不改写剩余记录，校验不变式必然保持，故迁移
+    // 结果无需二次校验、不设回退分支（损坏存量已在上方守卫抛出 invalidState）。coordinator 下一次
+    // save 自然以 v3 落盘。
+    private func migrate(_ v1: QuotaCycleState) -> QuotaCycleState {
+        var migrated = v1
+        migrated.schemaVersion = 3
+        migrated.closed = v1.closed.filter { !Self.isSlidingPseudoCycle($0) }
+        migrated.anomalies = QuotaCycleReducer.compressedAnomalies(v1.anomalies, policy: QuotaCyclePolicy())
+        migrated.pendingTransition = nil
+        return migrated
+    }
+    // 剔除签名：gap 关闭、证据至多一条且用量为 0（含 afterGap 伪周期与 observedTransition 零用量
+    // stub）。有意的口径取舍：单证据零用量的 gap 关闭窗口一律剔除、不区分开始来源——真实重置边界
+    // 已由前一周期的自然到期保留，全程零用量的窗口不以独立周期入史；合法的「缺口链」窗口（缺口
+    // >15min 后以 0% 返回且此后再无新观测）与此同形态，一并剔除，属于接受的粒度损失。
+    private static func isSlidingPseudoCycle(_ record: QuotaCycleRecord) -> Bool {
+        record.end == .gap && record.evidence.count <= 1 && record.lastObservedUsedPercent == 0
     }
     func save(_ state: QuotaCycleState, accountKey: String) throws {
         let url = try path(accountKey)

@@ -43,6 +43,8 @@ case "transitions":
     state = QuotaCycleState()
     reducer.ingest(sample(0, 70), into: &state)
     reducer.ingest(sample(1900000, 1, 2419200), into: &state)
+    check(state.closed.isEmpty && state.pendingTransition?.reason == .gap, "long gap awaits a stable confirmation")
+    reducer.ingest(sample(1900120, 1, 2419200), into: &state)
     check(state.closed.count == 1 && state.closed.first?.end == .gap && state.current?.startKind == .afterGap, "long gap does not invent cycles")
     state = QuotaCycleState()
     reducer.ingest(sample(0, 99.6), into: &state)
@@ -187,7 +189,7 @@ case "store":
         try JSONSerialization.data(withJSONObject: corrupt).write(to: path)
         do { _ = try store.load(accountKey: key); check(false, "duplicate decoded IDs") } catch {}
         try bytes.write(to: path)
-        json["schemaVersion"] = 2
+        json["schemaVersion"] = 4
         let future = try JSONSerialization.data(withJSONObject: json)
         try future.write(to: path)
         do { _ = try store.load(accountKey: key); check(false, "future schema") } catch {}
@@ -319,5 +321,169 @@ case "planRecovery":
     check(churn.closed.isEmpty, "return to earlier candidate cannot confirm")
     reducer.ingest(sample(160, 6, 605800, plan: "pro"), into: &churn)
     check(churn.closed.first?.end == .unconfirmed, "stable new plan recovers")
+case "slidingResetAt":
+    // 滑动 resetAt：服务端在无用量期间返回 observedAt+7d，每轮漂移 ~130s > jitter。
+    // 修复前每次采样都即时 gap 关闭一轮伪周期；修复后滑动全程不关闭、异常压缩为一条。
+    reducer.ingest(sample(0, 0), into: &state)
+    let id = state.current!.id
+    let frozenAt = state.current!.lastObservedAt
+    for i in 1...32 {
+        let at = Double(i) * 130
+        reducer.ingest(sample(at, 0, 604800 + at), into: &state)
+    }
+    check(state.closed.isEmpty, "sliding drift must not close cycles")
+    check(state.anomalies.count == 1, "sliding anomalies collapse to one")
+    check(state.pendingTransition?.reason == .gap, "gap candidate armed during sliding")
+    check(state.current?.id == id && state.current?.lastObservedAt == frozenAt &&
+        state.current?.lastObservedUsedPercent == 0 && state.current?.evidence.count == 1, "current frozen during sliding")
+    // 锚定：服务端固定 reset（与最后一条滑动值相差 130s > jitter）→ 候选以锚定样本重新武装。
+    let anchorAt = 32.0 * 130 + 130
+    let anchorReset = 604800.0 + anchorAt
+    reducer.ingest(sample(anchorAt, 0, anchorReset), into: &state)
+    check(state.closed.isEmpty && state.pendingTransition?.reason == .gap &&
+        state.pendingTransition?.first.observedAt == t.addingTimeInterval(anchorAt), "anchor re-arms candidate")
+    // 确认窗口下限内的稳定采样保留候选；随后 10~180s 内的稳定采样触发一次 gap 关闭。
+    reducer.ingest(sample(anchorAt + 5, 0, anchorReset), into: &state)
+    check(state.closed.isEmpty && state.pendingTransition?.first.observedAt == t.addingTimeInterval(anchorAt), "early stable sample keeps candidate")
+    reducer.ingest(sample(anchorAt + 125, 1, anchorReset), into: &state)
+    // 零用量分支：全程 0% 的初始周期被丢弃（不压入 closed），当前窗口以锚定样本重启。
+    check(state.closed.isEmpty && state.pendingTransition == nil, "zero-usage window is dropped, not closed")
+    check(state.current?.id != id && state.current?.startKind == .afterGap &&
+        state.current?.firstObservedAt == t.addingTimeInterval(anchorAt) &&
+        state.current?.expectedResetAt == t.addingTimeInterval(anchorReset), "window restarts at anchor")
+    check(state.current?.lastObservedUsedPercent == 1 && state.current?.evidence.count == 2, "confirm sample value and evidence appended")
+    check(state.anomalies.count == 1, "no anomaly inflation after restart")
+case "slidingNaturalRegression":
+    // 复刻 2025-11-20 13:38 真实序列：临近重置的心跳（53%、reset 漂移 115s ≤ jitter）→
+    // 滑动 reset 样本触发 natural 候选 → 120s 后 reset 恰漂移 120s 的样本确认，natural 关闭仍正常。
+    reducer.ingest(sample(0, 53, 604800), into: &state)
+    reducer.ingest(sample(604911, 53, 604915), into: &state)
+    check(state.current?.lastObservedAt == t.addingTimeInterval(604911) && state.current?.evidence.count == 1, "heartbeat advances within jitter")
+    reducer.ingest(sample(604921, 0, 604921 + 604798), into: &state)
+    check(state.closed.isEmpty && state.pendingTransition?.reason == .natural, "sliding sample arms natural candidate")
+    reducer.ingest(sample(605041, 0, 604921 + 604798 + 120), into: &state)
+    check(state.closed.count == 1 && state.closed.first?.end == .natural, "natural close at exact jitter boundary")
+    check(state.closed.first?.lastObservedUsedPercent == 53 &&
+        state.closed.first?.boundaryLower == t.addingTimeInterval(604911) &&
+        state.closed.first?.boundaryUpper == t.addingTimeInterval(604921), "old cycle keeps 53% evidence and boundary")
+    check(state.current?.startKind == .observedTransition &&
+        state.current?.firstObservedAt == t.addingTimeInterval(604921) &&
+        state.current?.lastObservedAt == t.addingTimeInterval(605041) &&
+        state.current?.lastObservedUsedPercent == 0 && state.current?.evidence.count == 1, "new cycle anchored at sliding sample")
+    check(state.anomalies.isEmpty && state.pendingTransition == nil, "no anomaly inflation on natural path")
+case "gapWithUsage":
+    // 非零用量周期经缺口关闭仍正常入史：零用量丢弃规则不误伤有实际用量的窗口。
+    reducer.ingest(sample(0, 40), into: &state)
+    let id = state.current!.id
+    reducer.ingest(sample(1000, 40, 604800 + 1000), into: &state)
+    check(state.closed.isEmpty && state.pendingTransition?.reason == .gap, "gap candidate armed after long silence")
+    reducer.ingest(sample(1130, 41, 604800 + 1000), into: &state)
+    check(state.closed.count == 1 && state.closed.first?.end == .gap && state.closed.first?.startKind == .inferred &&
+        state.closed.first?.lastObservedUsedPercent == 40, "non-zero usage cycle closes as gap")
+    check(state.current?.id != id && state.current?.startKind == .afterGap &&
+        state.current?.firstObservedAt == t.addingTimeInterval(1000) &&
+        state.current?.lastObservedUsedPercent == 41 && state.current?.evidence.count == 2, "new window starts at anchor with usage")
+    check(state.pendingTransition == nil, "candidate consumed by close")
+case "migration":
+    // v1 与 v2 存量迁移（线上已落 v2，需能二次迁移）：2 条真实周期（保留）+ 1 条 observedTransition/gap
+    // 零用量 stub + 25 条 afterGap/gap 伪周期（一并剔除）+ 滑动异常堆积（压缩）；
+    // current/previous/lastRequestStartedAt 原样保留，schemaVersion 升到 3。
+    func record(_ start: Double, _ last: Double, _ reset: Double, _ used: Double, ev: [QuotaObservation],
+                startKind: QuotaCycleStart, end: QuotaCycleEnd?, lower: Double, upper: Double) -> QuotaCycleRecord {
+        QuotaCycleRecord(id: UUID(), startKind: startKind,
+            inferredStartAt: startKind == .inferred ? t.addingTimeInterval(reset - 604800) : nil,
+            firstObservedAt: t.addingTimeInterval(start), expectedResetAt: t.addingTimeInterval(reset),
+            lastObservedAt: t.addingTimeInterval(last), lastObservedUsedPercent: used,
+            boundaryLower: t.addingTimeInterval(lower), boundaryUpper: t.addingTimeInterval(upper),
+            end: end, incomplete: startKind == .inferred || startKind == .afterGap, evidence: ev)
+    }
+    func makeFixture(_ version: Int) -> QuotaCycleState {
+        var v = QuotaCycleState()
+        v.schemaVersion = version
+        v.closed.append(record(0, 604700, 604800, 99, ev: [sample(0, 99, 604800)], startKind: .inferred, end: .natural, lower: 604700, upper: 604810))
+        v.closed.append(record(604810, 1209500, 1209600, 53, ev: [sample(604810, 41, 1209600), sample(1209500, 53, 1209600)], startKind: .observedTransition, end: .natural, lower: 1209500, upper: 1209700))
+        v.closed.append(record(1209700, 1209820, 1209700 + 604800, 0, ev: [sample(1209700, 0, 1209700 + 604800)], startKind: .observedTransition, end: .gap, lower: 1209820, upper: 1210750))
+        for i in 0..<25 {
+            let at = 1210750.0 + Double(i) * 1020
+            let next = i < 24 ? at + 1020 : 1236250
+            v.closed.append(record(at, at, at + 604800, 0, ev: [sample(at, 0, at + 604800)], startKind: .afterGap, end: .gap, lower: at, upper: next))
+        }
+        let anchorReset = 1236250.0 + 604800
+        let anchor = sample(1236250, 0, anchorReset), later = sample(1240000, 1, anchorReset)
+        v.current = QuotaCycleRecord(id: UUID(), startKind: .afterGap, inferredStartAt: nil,
+            firstObservedAt: anchor.observedAt, expectedResetAt: anchor.resetAt, lastObservedAt: later.observedAt,
+            lastObservedUsedPercent: 1, boundaryLower: nil, boundaryUpper: nil, end: nil, incomplete: true,
+            evidence: [anchor, later])
+        v.previous = later
+        v.lastRequestStartedAt = later.requestStartedAt
+        // pending 须满足 valid() 不变量（迁移前置守卫会校验）：requestStartedAt 不晚于 previous、observedAt 不早于 current.lastObservedAt。
+        let pendingFirst = QuotaObservation(requestStartedAt: later.requestStartedAt, observedAt: t.addingTimeInterval(1240010),
+            usedPercent: 0, resetAt: t.addingTimeInterval(anchorReset + 130), planType: "plus")
+        v.pendingTransition = QuotaPendingTransition(baselineCycleID: v.current!.id, first: pendingFirst, reason: .anomaly)
+        for i in 0..<40 {
+            let at = 1210000.0 + Double(i) * 130
+            v.anomalies.append(sample(at, 0, at + 604800))
+        }
+        v.anomalies.append(sample(1216210, 7, 1216210 + 604800 + 100000))
+        return v
+    }
+    for version in [1, 2] {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = String(repeating: "e", count: 64)
+        let source = makeFixture(version)
+        let dir = root.appendingPathComponent(key, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try JSONEncoder().encode(source).write(to: dir.appendingPathComponent("history-v1.json"), options: .atomic)
+            let store = QuotaCycleStore(root: root) { data, url in try data.write(to: url, options: .atomic) }
+            let migrated = try store.load(accountKey: key)
+            check(migrated.schemaVersion == 3, "schema upgraded from \(version)")
+            check(migrated.closed.count == 2, "zero-usage stub and pseudo cycles dropped (from \(version))")
+            check(migrated.closed.map(\.startKind) == [.inferred, .observedTransition] &&
+                migrated.closed[0].end == .natural && migrated.closed[0].lastObservedUsedPercent == 99 &&
+                migrated.closed[1].end == .natural && migrated.closed[1].lastObservedUsedPercent == 53, "real cycles kept in order (from \(version))")
+            check(migrated.anomalies.count == 2 && migrated.anomalies[0].usedPercent == 0 && migrated.anomalies[1].usedPercent == 7, "sliding anomalies compressed, real anomaly kept (from \(version))")
+            check(migrated.current?.id == source.current?.id && migrated.current?.lastObservedUsedPercent == 1 &&
+                migrated.current?.expectedResetAt == source.current?.expectedResetAt &&
+                migrated.current?.evidence == source.current?.evidence && migrated.current?.startKind == .afterGap, "current preserved untouched (from \(version))")
+            check(migrated.pendingTransition == nil, "pending cleared (from \(version))")
+            check(migrated.previous == source.previous && migrated.lastRequestStartedAt == source.lastRequestStartedAt &&
+                migrated.redemptions.isEmpty, "rest preserved (from \(version))")
+            try store.save(migrated, accountKey: key)
+            let reloaded = try store.load(accountKey: key)
+            check(reloaded == migrated, "migrated v3 state roundtrips (from \(version))")
+        } catch { check(false, "migration error (from \(version)): \(error)") }
+    }
+case "migrationInvalidV1":
+    // 损坏 v1：迁移前置守卫沿用旧保护语义拒绝加载（invalidState），文件字节保持原样、永不被改写。
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let key = String(repeating: "f", count: 64)
+    var v1 = QuotaCycleState()
+    v1.schemaVersion = 1
+    let r = QuotaCycleReducer(policy: QuotaCyclePolicy())
+    r.ingest(sample(0, 70), into: &v1)
+    var bad = v1.current!
+    bad.lastObservedUsedPercent = 101
+    v1.current = bad
+    let dir = root.appendingPathComponent(key, isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("history-v1.json")
+        let bytes = try JSONEncoder().encode(v1)
+        try bytes.write(to: path, options: .atomic)
+        let store = QuotaCycleStore(root: root) { data, url in try data.write(to: url, options: .atomic) }
+        do {
+            _ = try store.load(accountKey: key)
+            check(false, "invalid v1 must be rejected")
+        } catch QuotaCycleStore.StoreError.invalidState {
+            // 预期路径：损坏 v1 不迁移、不加载。
+        } catch {
+            check(false, "unexpected error: \(error)")
+        }
+        let after = try Data(contentsOf: path)
+        check(after == bytes, "invalid v1 file bytes preserved")
+    } catch { check(false, "migrationInvalidV1 error: \(error)") }
 default: exit(2)
 }
