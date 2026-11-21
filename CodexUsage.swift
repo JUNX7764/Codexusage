@@ -1610,25 +1610,27 @@ enum ExternalTokenScanner {
         return r
     }
 
-    /// 全解析符号链接的绝对路径（realpath(3)）；路径不存在时原样返回
-    private static func realPath(_ p: String) -> String {
+    /// realpath(3) 解析结果；路径不存在时返回 nil
+    private static func resolvedPath(_ p: String) -> String? {
         var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-        guard realpath(p, &buf) != nil else { return p }
+        guard realpath(p, &buf) != nil else { return nil }
         return String(cString: buf)
     }
+
+    /// 全解析符号链接的绝对路径；路径不存在时原样返回
+    private static func realPath(_ p: String) -> String { resolvedPath(p) ?? p }
 
     /// root 级归一化：realpath(3) 对不存在的路径返回 NULL，消失的 root 会从
     /// /private/var/... 漂回 /var/...，与 knownRoots / files 里已解析的键失配，
     /// 已观测来源被误判成从未安装。解析最长已存在祖先再拼回剩余分量，
     /// 使同一路径在存在与消失两个时刻归一到同一形式。
     private static func stableRootPath(_ p: String) -> String {
-        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-        if realpath(p, &buf) != nil { return String(cString: buf) }
+        if let resolved = resolvedPath(p) { return resolved }
         var dir = (p as NSString).deletingLastPathComponent
         var missing = [(p as NSString).lastPathComponent]
         while !dir.isEmpty && dir != "/" {
-            if realpath(dir, &buf) != nil {
-                return String(cString: buf) + "/" + missing.reversed().joined(separator: "/")
+            if let resolved = resolvedPath(dir) {
+                return resolved + "/" + missing.reversed().joined(separator: "/")
             }
             missing.append((dir as NSString).lastPathComponent)
             dir = (dir as NSString).deletingLastPathComponent
