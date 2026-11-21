@@ -11,7 +11,7 @@ struct RefreshSchedule {
     private var pendingFull = false
 
     mutating func request(manual: Bool, now: Date) -> Work? {
-        if lastTick.map({ now < $0 }) == true { nextDue = nil }
+        if let last = lastTick, now < last { nextDue = nil }
         lastTick = now
         let due = nextDue.map { now >= $0 } ?? true
         if due {
