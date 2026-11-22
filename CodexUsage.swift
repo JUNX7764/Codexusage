@@ -5353,7 +5353,9 @@ private final class PanelFooterView: NSView {
         attachment.bounds = CGRect(x: 0, y: (font.capHeight - iconSize.height) / 2,
                                    width: iconSize.width, height: iconSize.height)
         let title = NSMutableAttributedString(attachment: attachment)
-        title.append(NSAttributedString(string: " ", attributes: [.font: font, .kern: 2]))
+        // 间距只用一个空格字符：版面 ~3.2pt + icon/字形侧承留 ≈ 6pt 视觉（macOS 原生
+        // icon+文字工具栏间距档）；不加 kern——实测会把视觉间距推到 ~8pt
+        title.append(NSAttributedString(string: " ", attributes: [.font: font]))
         title.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: accent]))
         return title
     }
@@ -5789,13 +5791,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 guard !self.panelController.isOpen else { return fail("outside click did not close panel") }
                 self.panelController.toggle(anchoredTo: button)
-                // footer 刷新 pill 的键等价为 ⌘R（修饰键经 makeActionButton 从 menu item 透传）
+                // footer 刷新 pill 的键等价接线（修饰键经 makeActionButton 从 menu item 透传）：
+                // 直调 responder 链入口断言 PanelRootView→按钮 ⌘R 转发；经窗口投递的键等价遍历
+                // 依赖 key window 状态，预览进程不激活 app 时不稳定（Escape 能过是走 popover
+                // 自身的 transient dismiss 监听，不构成对照），不作为断言依据
                 guard let refresh = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command],
                     timestamp: 0, windowNumber: self.panelController.previewWindowNumber, context: nil, characters: "r",
                     charactersIgnoringModifiers: "r", isARepeat: false, keyCode: 15) else {
                     return fail("could not create refresh key event")
                 }
-                NSApp.postEvent(refresh, atStart: false)
+                guard self.panelController.panelContentView.performKeyEquivalent(with: refresh) else {
+                    return fail("⌘R not handled by panel root view")
+                }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                     guard self.panelController.isOpen else { return fail("refresh action closed the panel") }
                     // ⌘R 正向断言：preview 演示态必须真实进入「刷新中…」（键等价不是静默吞键）
