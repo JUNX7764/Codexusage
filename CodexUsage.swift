@@ -2614,7 +2614,6 @@ struct UsagePanelModel {
     var officialTodayFill: Double?   // 官方日桶缺今日时以与用量情况同口径的本机合并今日用量补足（Codex+外部）
     var tools: [[(name: String, total: Double?, input: Double?, output: Double?, status: UsageSourceStatus)]]
     var notices: [Notice]
-    var lastAttempt: String
     var version: String
     var refreshItem: NSMenuItem
     var loginItem: NSMenuItem
@@ -3623,7 +3622,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             history.update(snapshot: next.quotaHistory, now: now)
         }
         if old.title != next.title || old.plan != next.plan || old.email != next.email ||
-           old.lastAttempt != next.lastAttempt || old.version != next.version ||
+           old.version != next.version ||
            item(old.refreshItem) != item(next.refreshItem) ||
            old.quotaLastOKText != next.quotaLastOKText ||
            old.sevenDayErrorLine != next.sevenDayErrorLine ||
@@ -4472,6 +4471,12 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }) else { return false }
         return true
     }
+    /// events 测试用：读取刷新 pill 当前合成标题（含附件符前缀，用 contains 判定状态）。
+    func footerRefreshTitleForPreview() -> String? {
+        contentController.view.layoutSubtreeIfNeeded()
+        return descendants(footerContainer).compactMap { $0 as? PanelActionButton }
+            .first(where: { $0.identifier?.rawValue == "CodexRole.footer.refresh" })?.attributedTitle.string
+    }
     /// 截图辅助：展示原位卡片设置页（不参与事件断言）。
     func showCardSettingsForPreview() { showCardSettings() }
     func expandAllTokenBucketsForPreview() {
@@ -5303,6 +5308,8 @@ private final class PanelFooterView: NSView {
         let refreshText = model.refreshInFlight ? "刷新中…" : "数据刷新"
         refresh.isEnabled = !model.refreshInFlight
         refresh.attributedTitle = Self.refreshAttributedTitle(refreshText, appearance: refresh.effectiveAppearance)
+        // 合成标题以附件符开头，VoiceOver 读不出语义；显式给纯文本标签
+        refresh.setAccessibilityLabel(refreshText)
         // 附件图标按当前 appearance 预着色，外观切换时重生成（动态色对附件渲染不稳定）
         refresh.appearanceChangeHandler = { [weak refresh] in
             guard let refresh = refresh else { return }
@@ -5789,10 +5796,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return fail("could not create refresh key event")
                 }
                 NSApp.postEvent(refresh, atStart: false)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                     guard self.panelController.isOpen else { return fail("refresh action closed the panel") }
-                    print("CodexUsage visual event test: PASS (card layout, footer chrome, status button toggle, model rows, tool periods, response/cache period chips, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
-                    exit(0)
+                    // ⌘R 正向断言：preview 演示态必须真实进入「刷新中…」（键等价不是静默吞键）
+                    guard let inFlight = self.panelController.footerRefreshTitleForPreview(),
+                          inFlight.contains("刷新中…") else { return fail("⌘R did not enter in-flight state") }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                        guard self.panelController.isOpen else { return fail("refresh action closed the panel") }
+                        let recovered = self.panelController.footerRefreshTitleForPreview() ?? ""
+                        guard recovered.contains("数据刷新") else { return fail("in-flight state did not recover") }
+                        print("CodexUsage visual event test: PASS (card layout, footer chrome, status button toggle, model rows, tool periods, response/cache period chips, chart movement handler/keyboard, Escape, outside click, refresh key equivalent in-flight and recovery)")
+                        exit(0)
+                    }
                 }
             }
         }
@@ -6602,7 +6617,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             },
             notices: globalNotices,
-            lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))",
             version: displayVersion,
             refreshItem: refreshItem,
             loginItem: loginItem,
