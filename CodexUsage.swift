@@ -2779,7 +2779,7 @@ final class PanelSolidBackgroundView: NSView {
 
 final class PanelActionButton: NSButton {
     enum Style {
-        case plain, prominent, checkbox, subtleAccent
+        case plain, prominent, subtleAccent
     }
 
     var menuItem: NSMenuItem?
@@ -2799,8 +2799,6 @@ final class PanelActionButton: NSButton {
                     : NSColor.clear).cgColor
             case .subtleAccent:
                 layer?.backgroundColor = PanelAccent.codex.color.withAlphaComponent(hovered ? 0.28 : 0.18).cgColor
-            case .checkbox:
-                layer?.backgroundColor = NSColor.clear.cgColor
             }
         }
     }
@@ -3591,7 +3589,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         if old.title != next.title || old.plan != next.plan || old.email != next.email ||
            old.lastAttempt != next.lastAttempt || old.version != next.version ||
-           item(old.refreshItem) != item(next.refreshItem) || item(old.loginItem) != item(next.loginItem) ||
+           item(old.refreshItem) != item(next.refreshItem) ||
            item(old.quitItem) != item(next.quitItem) {
             installChrome(model: next)
         }
@@ -3751,8 +3749,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         hover.target = self
         hover.state = panelHoverEnabled ? .on : .off
         menu.addItem(hover)
-        // 「开机自启」与底部 checkbox 同源：model.loginItem 携带 title/action/state
-        // （preview 基线 .on，不触真实 LaunchAgent），点击由 AppDelegate.onToggleLogin 处理
+        // 「开机自启」唯一入口（底部 checkbox 已移除）：model.loginItem 携带
+        // title/action/state（preview 基线 .on，不触真实 LaunchAgent），点击由 AppDelegate.onToggleLogin 处理
         let login = NSMenuItem(title: "开机自启", action: nil, keyEquivalent: "")
         login.action = model?.loginItem.action
         login.target = model?.loginItem.target
@@ -4349,25 +4347,18 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular),
             .foregroundColor: textColor
         ])
-        if style == .checkbox {
-            button.setButtonType(.switch)
-            button.isBordered = false
-            button.state = item.state
-            button.contentTintColor = PanelAccent.codex.color
-        } else {
-            button.setButtonType(.momentaryChange)
-            button.isBordered = false
-            (button.cell as? NSButtonCell)?.highlightsBy = []
-            button.cell?.wraps = true
-            button.cell?.lineBreakMode = .byWordWrapping
-            button.heightAnchor.constraint(greaterThanOrEqualToConstant: style == .plain ? 26 : 30).isActive = true
-        }
+        button.setButtonType(.momentaryChange)
+        button.isBordered = false
+        (button.cell as? NSButtonCell)?.highlightsBy = []
+        button.cell?.wraps = true
+        button.cell?.lineBreakMode = .byWordWrapping
+        button.heightAnchor.constraint(greaterThanOrEqualToConstant: style == .plain ? 26 : 30).isActive = true
         return button
     }
 
     @objc private func performAction(_ sender: PanelActionButton) {
         guard let item = sender.menuItem, let action = item.action else { return }
-        // 只有「退出」先收起面板；刷新/开机自启等保持面板打开，动作结果就地可见
+        // 只有「退出」先收起面板；刷新等保持面板打开，动作结果就地可见
         if action == #selector(AppDelegate.onQuit) { close() }
         DispatchQueue.main.async {
             _ = NSApp.sendAction(action, to: item.target, from: item)
@@ -5171,7 +5162,6 @@ private final class PanelFooterView: NSView {
         let refresh = buttonFactory(model.refreshItem, .prominent, nil)
         refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true
         actions.addArrangedSubview(refresh)
-        actions.addArrangedSubview(buttonFactory(model.loginItem, .checkbox, nil))
         actions.addArrangedSubview(PanelUI.spacer())
         let quit = buttonFactory(model.quitItem, .plain, nil)
         // 固定宽度的独立按钮需在 hover 底色的视觉中心，不沿用整行文本按钮的左对齐。

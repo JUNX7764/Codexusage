@@ -124,7 +124,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 悬停显示状态面板默认开启：驻留 0.2s 自动打开、离开图标+面板组 0.30s 延迟收起、图标-面板间 8pt 桥区计入保持区、边界判定含 maxX/maxY；悬停打开的面板首次点击（含面板内点击）转固定常开（pin），普通常开点击关闭。开关在面板「···」菜单，切换即时生效；生产写偏好 `panel.hoverOpen.enabled`，预览不读生产偏好也不落盘（基线默认开，开关只翻运行时状态）。悬停打开与点击打开共用 `AppDelegate.openPanel(byHover:)` 的「打开即最新」全路径；面板关闭时 `popoverDidClose` 幂等复位呈现标记并丢弃未决 hover 转换。
 
-开机自启默认开启：无显式关闭记录（偏好键 `launchAtLogin.enabled`）且 LaunchAgent plist 缺失时，真实启动路径自动安装（Translocation 下静默跳过、写失败仅记日志）；显式关闭写偏好阻止下次自动装回。开关在面板底部与「···」菜单，两处同源 `model.loginItem`（preview 基线 .on，不触真实文件）；`update.sh` 继续以 plist 存在与否为自启偏好信号，模板由 `AppDelegate.launchAgentPlistContent(label:executablePath:)` 统一生成（self-test 断言其契约）。
+开机自启默认开启：无显式关闭记录（偏好键 `launchAtLogin.enabled`）且 LaunchAgent plist 缺失时，真实启动路径自动安装（Translocation 下静默跳过、写失败仅记日志）；显式关闭写偏好阻止下次自动装回。开关在面板「···」菜单（唯一入口，状态源 `model.loginItem`，preview 基线 .on，不触真实文件；底部 checkbox 已移除）；`update.sh` 继续以 plist 存在与否为自启偏好信号，模板由 `AppDelegate.launchAgentPlistContent(label:executablePath:)` 统一生成（self-test 断言其契约）。
 
 更新脚本接收已确认的 Release 标签和正在运行的应用路径，校验包身份、构建版本和实际安装版本后仅处理目标进程。离线脚本测试使用临时应用、伪造进程和网络命令，**不能替代真实安装环境中的更新、回滚和面板点击验收**。
 
