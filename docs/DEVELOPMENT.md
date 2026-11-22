@@ -122,9 +122,11 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 面板卡片设置只作用于九张业务卡片的显隐与纵向顺序，改动即时写入本机偏好；「隐藏」不同于折叠，隐藏的卡片仍照常获取数据，页头、页脚、更新提示与凭据恢复区不参与排序。预览与离线回归使用默认布局基线，不读取也不写入生产偏好（截图可用 `--visual-preview-hide-cards=` 注入）。
 
-悬停显示状态面板默认开启：驻留 0.2s 自动打开、离开图标+面板组 0.30s 延迟收起、图标-面板间 8pt 桥区计入保持区、边界判定含 maxX/maxY；悬停打开的面板首次点击（含面板内点击）转固定常开（pin），普通常开点击关闭。开关在面板「···」菜单，切换即时生效；生产写偏好 `panel.hoverOpen.enabled`，预览不读生产偏好也不落盘（基线默认开，开关只翻运行时状态）。悬停打开与点击打开共用 `AppDelegate.openPanel(byHover:)` 的「打开即最新」全路径；面板关闭时 `popoverDidClose` 幂等复位呈现标记并丢弃未决 hover 转换。
+悬停显示状态面板默认开启：驻留 0.2s 自动打开、离开图标+面板组 0.30s 延迟收起、图标-面板间 8pt 桥区计入保持区、边界判定含 maxX/maxY；悬停打开的面板首次点击（含面板内点击）转固定常开（pin），普通常开点击关闭。开关在面板 ⚙ 设置菜单（「悬停自动展开」），切换即时生效；生产写偏好 `panel.hoverOpen.enabled`，预览不读生产偏好也不落盘（基线默认开，开关只翻运行时状态）。悬停打开与点击打开共用 `AppDelegate.openPanel(byHover:)` 的「打开即最新」全路径；面板关闭时 `popoverDidClose` 幂等复位呈现标记并丢弃未决 hover 转换。
 
-开机自启默认开启：无显式关闭记录（偏好键 `launchAtLogin.enabled`）且 LaunchAgent plist 缺失时，真实启动路径自动安装（Translocation 下静默跳过、写失败仅记日志）；显式关闭写偏好阻止下次自动装回。开关在面板「···」菜单（唯一入口，状态源 `model.loginItem`，preview 基线 .on，不触真实文件；底部 checkbox 已移除）；`update.sh` 继续以 plist 存在与否为自启偏好信号，模板由 `AppDelegate.launchAgentPlistContent(label:executablePath:)` 统一生成（self-test 断言其契约）。
+开机自启默认开启：无显式关闭记录（偏好键 `launchAtLogin.enabled`）且 LaunchAgent plist 缺失时，真实启动路径自动安装（Translocation 下静默跳过、写失败仅记日志）；显式关闭写偏好阻止下次自动装回。开关在面板 ⚙ 设置菜单（唯一入口，状态源 `model.loginItem`，preview 基线 .on，不触真实文件；底部 checkbox 已移除）；`update.sh` 继续以 plist 存在与否为自启偏好信号，模板由 `AppDelegate.launchAgentPlistContent(label:executablePath:)` 统一生成（self-test 断言其契约）。
+
+设置菜单（右上角 ⚙ 齿轮按钮）为三段式：「外观与布局」（卡片显示与排序、背景样式子菜单标题携带当前态）／「通用设置」（悬停自动展开、开机自启）／「退出 CodexUsage」（⌘Q）。底栏退出按钮已移除，退出仅存设置菜单；面板窗口内的 ⌘Q 由内容根视图 `PanelRootView.performKeyEquivalent` 兜底转交退出。底栏单行：版本胶囊（pillNeutral 样式，`CodexRole.footer.version`，有新版本时右上角亮 accent 圆点）＋更新时间（成功「HH:mm 更新」；7 天窗口失败/过期时红字「刷新失败」，tooltip 保留最后成功时间原文）＋「数据刷新」pill（`.subtleAccent`，⌘R 经 `makeActionButton` 从 menu item 透传修饰键）。手动刷新在飞位 `manualRefreshInFlight` 仅手动置位（排队等待在飞自动刷新也计在飞），自动轮询不置位，20s 兜底强制清位；闸门真正释放才清位。刷新 pill 的 icon 以 `NSTextAttachment` 合入 attributed title（不走 `imagePosition` 默认排布），宽度按合成串实测 + 相等约束保证左右边距对称；`--visual-preview-quit-hover` 预览旗标已随退出按钮移除，底栏回归走 `verifyFooterChromeForPreview`。
 
 更新脚本接收已确认的 Release 标签和正在运行的应用路径，校验包身份、构建版本和实际安装版本后仅处理目标进程。离线脚本测试使用临时应用、伪造进程和网络命令，**不能替代真实安装环境中的更新、回滚和面板点击验收**。
 
