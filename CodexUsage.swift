@@ -3751,6 +3751,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         hover.target = self
         hover.state = panelHoverEnabled ? .on : .off
         menu.addItem(hover)
+        // 「开机自启」与底部 checkbox 同源：model.loginItem 携带 title/action/state
+        // （preview 基线 .on，不触真实 LaunchAgent），点击由 AppDelegate.onToggleLogin 处理
+        let login = NSMenuItem(title: "开机自启", action: nil, keyEquivalent: "")
+        login.action = model?.loginItem.action
+        login.target = model?.loginItem.target
+        login.state = model?.loginItem.state ?? (isPreviewMode ? .on : .off)
+        menu.addItem(login)
         let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
         background.submenu = makeBackgroundStyleMenu()
         menu.addItem(background)
@@ -4107,12 +4114,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         func editor() -> PanelCardSettingsView? { descendants(contentController.view).compactMap { $0 as? PanelCardSettingsView }.first }
         func fail(_ message: String) -> Bool { print("CODEX_CARD_SETTINGS \(message)"); return false }
 
-        // 统一「···」菜单：卡片设置入口 + 悬停开关 + 背景样式子菜单；未进入设置页时入口可用
+        // 统一「···」菜单：卡片设置入口 + 悬停开关 + 开机自启 + 背景样式子菜单；未进入设置页时入口可用
         let menu = makePanelSettingsMenu()
-        guard menu.items.map(\.title) == ["卡片显示与排序…", "悬停显示状态面板", "背景样式"], menu.items[0].isEnabled,
+        guard menu.items.map(\.title) == ["卡片显示与排序…", "悬停显示状态面板", "开机自启", "背景样式"], menu.items[0].isEnabled,
               let hoverItem = menu.items.first(where: { $0.title == "悬停显示状态面板" }),
               hoverItem.action == #selector(toggleHoverPanel), hoverItem.target === self,
-              let backgroundMenu = menu.items[2].submenu,
+              let loginItem = menu.items.first(where: { $0.title == "开机自启" }),
+              loginItem.state == .on, loginItem.action != nil, loginItem.target != nil,
+              let backgroundMenu = menu.items[3].submenu,
               backgroundMenu.items.map(\.title).contains("纯色"),
               backgroundMenu.items.contains(where: { $0.title.hasPrefix("液态玻璃") }) else { return fail("menu structure") }
 
@@ -5267,6 +5276,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             configureVisualPreview()
             return
         }
+        // 开机自启默认开：无显式关闭记录且 LaunchAgent 缺失时自动安装（preview 不走此处）
+        ensureLoginItemDefaultEnabled()
         rebuildMenu()
         renderBar()
         // 面板内更新进度：状态翻转时重建内容（按钮↔进度行），进度百分比由进度行自刷；
@@ -6556,10 +6567,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         FileManager.default.fileExists(atPath: launchAgentPath)
     }
 
+    /// LaunchAgent plist 模板（update.sh 以 plist 存在与否为自启偏好、ProgramArguments:0
+    /// 为安装位置契约）：RunAtLoad 登录拉起；KeepAlive 仅在非正常退出（崩溃/被 kill）时
+    /// 重启——菜单「退出」走 exit 0，launchd 不复活进程。
+    static func launchAgentPlistContent(label: String, executablePath: String) -> String {
+        """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key><string>\(label)</string>
+            <key>ProgramArguments</key>
+            <array><string>\(executablePath)</string></array>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key>
+            <dict><key>SuccessfulExit</key><false/></dict>
+        </dict>
+        </plist>
+        """
+    }
+
     @objc private func onToggleLogin() {
         guard !visualPreview else { return }
         if isLoginItemEnabled() {
             try? FileManager.default.removeItem(atPath: launchAgentPath)
+            LaunchAtLoginPreference.save(false)   // 显式关闭：阻止下次启动按默认开自动装回
         } else {
             // Translocation 下可执行文件位于只读临时挂载：写进 plist 重启后指向失效路径，
             // 与更新同款拦截，提示先安装到「应用程序」再开启
@@ -6572,24 +6604,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 updateUI()
                 return
             }
-            let exec = Bundle.main.executablePath ?? ""
-            // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不复活进程
-            let plist = """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-                <key>Label</key><string>\(launchAgentLabel)</string>
-                <key>ProgramArguments</key>
-                <array><string>\(exec)</string></array>
-                <key>RunAtLoad</key><true/>
-                <key>KeepAlive</key>
-                <dict><key>SuccessfulExit</key><false/></dict>
-            </dict>
-            </plist>
-            """
             do {
-                try plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+                try Self.launchAgentPlistContent(label: launchAgentLabel, executablePath: Bundle.main.executablePath ?? "")
+                    .write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+                LaunchAtLoginPreference.save(true)
             } catch {
                 NSLog("[CodexUsage] Failed to write LaunchAgent plist at %@: %@", launchAgentPath, error.localizedDescription)
                 let alert = NSAlert()
@@ -6602,7 +6620,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateUI()
     }
 
+    /// 开机自启默认开：用户未显式关闭且 LaunchAgent plist 缺失时自动安装。
+    /// Translocation 下静默跳过（写入会指向只读临时挂载的失效路径），用户把 app 移入
+    /// 「应用程序」后下次启动补装；写失败仅记日志，不打扰启动流程。
+    private func ensureLoginItemDefaultEnabled() {
+        guard !visualPreview, LaunchAtLoginPreference.explicitValue() != false,
+              !isLoginItemEnabled(), !isTranslocated else { return }
+        do {
+            try Self.launchAgentPlistContent(label: launchAgentLabel, executablePath: Bundle.main.executablePath ?? "")
+                .write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+            NSLog("[CodexUsage] LaunchAgent installed (default-on, no explicit opt-out)")
+        } catch {
+            NSLog("[CodexUsage] LaunchAgent default-on install failed: %@", error.localizedDescription)
+        }
+    }
+
     @objc func onQuit() { NSApp.terminate(nil) }
+}
+
+/// 开机自启显式偏好：nil = 用户从未表达（默认开生效，启动自动安装 LaunchAgent）；
+/// plist 存在与否本身是 update.sh 的自启偏好信号，这里额外区分「显式关闭」与
+/// 「未表达」，避免默认开把用户关闭的状态装回。
+enum LaunchAtLoginPreference {
+    static let defaultsKey = "launchAtLogin.enabled"
+
+    static func explicitValue(from defaults: UserDefaults = .standard) -> Bool? {
+        guard defaults.object(forKey: defaultsKey) != nil else { return nil }
+        return defaults.bool(forKey: defaultsKey)
+    }
+
+    static func save(_ value: Bool, to defaults: UserDefaults = .standard) {
+        defaults.set(value, forKey: defaultsKey)
+    }
 }
 
 // MARK: - 入口（支持 --once 命令行自检）
@@ -8271,7 +8320,24 @@ enum CodexOfflineRegression {
             PanelHoverPreference.save(true, to: hoverStore)
             try expect(PanelHoverPreference.load(from: hoverStore), "悬停偏好 save 须写回")
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/per-model attribution/model switching/.zst archives/real-frame decode/tail-read, external usage model/parse/per-model scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist, panel card layout/normalize/persist-fallback, token value transition, panel visuals geometry/symbols, panel hover geometry/intent/click-outcome/preference)")
+            // 开机自启：偏好三态（缺省=未表达→默认开）与 LaunchAgent plist 模板契约
+            let loginSuite = "CodexUsage-self-test-login-\(UUID().uuidString)"
+            let loginStore = UserDefaults(suiteName: loginSuite)!
+            defer { loginStore.removePersistentDomain(forName: loginSuite) }
+            try expect(LaunchAtLoginPreference.explicitValue(from: loginStore) == nil, "自启偏好缺省=未表达（默认开生效）")
+            LaunchAtLoginPreference.save(false, to: loginStore)
+            try expect(LaunchAtLoginPreference.explicitValue(from: loginStore) == false, "显式关闭须如实读取（阻止默认开装回）")
+            LaunchAtLoginPreference.save(true, to: loginStore)
+            try expect(LaunchAtLoginPreference.explicitValue(from: loginStore) == true, "显式开启须如实读取")
+            let loginPlist = AppDelegate.launchAgentPlistContent(label: "com.local.codex-usage",
+                executablePath: "/tmp/fake/CodexUsage.app/Contents/MacOS/CodexUsage")
+            try expect(loginPlist.contains("<key>Label</key><string>com.local.codex-usage</string>")
+                && loginPlist.contains("<key>RunAtLoad</key><true/>")
+                && loginPlist.contains("/tmp/fake/CodexUsage.app/Contents/MacOS/CodexUsage"),
+                "LaunchAgent plist 模板须携带 label、RunAtLoad 与可执行路径（update.sh 契约）")
+            try expect(loginPlist.contains("SuccessfulExit"), "KeepAlive SuccessfulExit 限定仅异常退出复活")
+
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/per-model attribution/model switching/.zst archives/real-frame decode/tail-read, external usage model/parse/per-model scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist, panel card layout/normalize/persist-fallback, token value transition, panel visuals geometry/symbols, panel hover geometry/intent/click-outcome/preference, login-item preference/plist template)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)
