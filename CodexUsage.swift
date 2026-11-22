@@ -2618,7 +2618,12 @@ struct UsagePanelModel {
     var version: String
     var refreshItem: NSMenuItem
     var loginItem: NSMenuItem
-    var quitItem: NSMenuItem
+    /// 7 天窗口最后成功时间的展示文案（footer「HH:mm 更新」）；空串 = 无数据
+    var quotaLastOKText: String = ""
+    /// 7 天窗口 stale/error 的合成文案（与额度卡 notice 同源同文案）；nil = 正常
+    var sevenDayErrorLine: String?
+    /// 仅手动刷新在飞为 true（排队等待在飞自动刷新时也计为在飞）
+    var refreshInFlight: Bool = false
 }
 
 enum TokenModelList {
@@ -2780,11 +2785,17 @@ final class PanelSolidBackgroundView: NSView {
 final class PanelActionButton: NSButton {
     enum Style {
         case plain, prominent, subtleAccent
+        /// 版本胶囊专用：常驻 6% 灰底、hover 12%（与 .plain 的 0/8% 区分，暗示可点击）。
+        case pillNeutral
     }
 
     var menuItem: NSMenuItem?
     var style: Style = .plain { didSet { needsDisplay = true } }
     private var hovered = false { didSet { needsDisplay = true } }
+    /// 指向光标开关（版本胶囊用）：cursor rect 只能在 resetCursorRects() 里注册。
+    var pointingHandCursor = false
+    /// 外观切换后重生成 attributed title 的钩子（footer 刷新 pill 的附件图标预着色用）。
+    var appearanceChangeHandler: (() -> Void)?
     override var wantsUpdateLayer: Bool { true }
 
     override func updateLayer() {
@@ -2799,12 +2810,18 @@ final class PanelActionButton: NSButton {
                     : NSColor.clear).cgColor
             case .subtleAccent:
                 layer?.backgroundColor = PanelAccent.codex.color.withAlphaComponent(hovered ? 0.28 : 0.18).cgColor
+            case .pillNeutral:
+                layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(hovered ? 0.12 : 0.06).cgColor
             }
         }
     }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         needsDisplay = true
+        appearanceChangeHandler?()
+    }
+    override func resetCursorRects() {
+        if pointingHandCursor { addCursorRect(bounds, cursor: .pointingHand) }
     }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -3032,14 +3049,25 @@ final class PanelHeaderView: NSView {
         row.addArrangedSubview(titles)
         row.addArrangedSubview(PanelUI.spacer())
         if let target = settingsTarget, let action = settingsAction {
-            let image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "面板设置")?
-                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
-            let button = NSButton(image: image ?? NSImage(), target: target, action: action)
-            button.isBordered = false; button.contentTintColor = .secondaryLabelColor
-            button.toolTip = "面板设置"; button.setAccessibilityLabel("面板设置")
-            button.widthAnchor.constraint(equalToConstant: 24).isActive = true
-            button.heightAnchor.constraint(equalToConstant: 24).isActive = true
-            row.addArrangedSubview(button)
+            // ⚙ 设置按钮：PanelActionButton 直连 target/action（不经 performAction/menuItem），hover 有 8% 灰底
+            let gear = PanelActionButton(frame: .zero)
+            gear.style = .plain
+            gear.target = target
+            gear.action = action
+            gear.translatesAutoresizingMaskIntoConstraints = false
+            gear.wantsLayer = true
+            gear.layer?.cornerRadius = 12
+            gear.isBordered = false
+            gear.focusRingType = .none
+            gear.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "面板设置")?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+            gear.imagePosition = .imageOnly
+            gear.contentTintColor = .secondaryLabelColor
+            gear.toolTip = "面板设置"
+            gear.setAccessibilityLabel("面板设置")
+            gear.widthAnchor.constraint(equalToConstant: 24).isActive = true
+            gear.heightAnchor.constraint(equalToConstant: 24).isActive = true
+            row.addArrangedSubview(gear)
         }
         addSubview(row)
         PanelUI.pin(row, to: self)
@@ -3343,7 +3371,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var cachePeriod = 1
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
-    // 卡片显隐与排序（「···」→ 卡片显示与排序）；隐藏 ≠ 收起，隐藏的卡片仍照常获取数据。
+    // 卡片显隐与排序（⚙ 设置菜单 → 卡片显示与排序）；隐藏 ≠ 收起，隐藏的卡片仍照常获取数据。
     private(set) var panelLayout: PanelCardLayout
     private var showingCardSettings = false
     private var cardSettingsEditor: PanelCardSettingsView?
@@ -3432,7 +3460,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     private func configureContent() {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 320))
+        let container = PanelRootView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 320))
+        // 语义对齐原底栏退出按钮：先收面板再退出
+        container.quitHandler = { [weak self] in
+            self?.close()
+            DispatchQueue.main.async {
+                _ = NSApp.sendAction(#selector(AppDelegate.onQuit), to: NSApp.delegate, from: nil)
+            }
+        }
         contentController.view = container
         container.wantsLayer = true
         container.layer?.cornerRadius = 16
@@ -3590,7 +3625,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if old.title != next.title || old.plan != next.plan || old.email != next.email ||
            old.lastAttempt != next.lastAttempt || old.version != next.version ||
            item(old.refreshItem) != item(next.refreshItem) ||
-           item(old.quitItem) != item(next.quitItem) {
+           old.quotaLastOKText != next.quotaLastOKText ||
+           old.sevenDayErrorLine != next.sevenDayErrorLine ||
+           old.refreshInFlight != next.refreshInFlight {
             installChrome(model: next)
         }
         renderedModel = next
@@ -3730,22 +3767,40 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return card
     }
 
-    // MARK: - 面板设置（「···」菜单：卡片显示与排序 + 背景样式）
+    // MARK: - 面板设置（⚙ 设置菜单：外观与布局 + 通用设置）
 
     private func persistPanelLayout() {
         guard !isPreviewMode else { return }
         panelLayout.save()
     }
 
-    /// 统一「···」菜单：卡片显示与排序入口 + 背景样式子菜单。
+    /// ⚙ 设置菜单：外观与布局（卡片显示与排序 + 背景样式）与通用设置（悬停自动展开 +
+    /// 开机自启）两组，末项退出（⌘Q）。底栏退出按钮移除后的唯一退出入口之一。
     private func makePanelSettingsMenu() -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
+        // 分组标题：禁用、无 action，仅作视觉分组
+        func groupHeader(_ title: String) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            item.attributedTitle = NSAttributedString(string: title, attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ])
+            return item
+        }
+        menu.addItem(groupHeader("外观与布局"))
         let cards = NSMenuItem(title: "卡片显示与排序…", action: #selector(showCardSettings), keyEquivalent: "")
         cards.target = self
         cards.isEnabled = !showingCardSettings
         menu.addItem(cards)
-        let hover = NSMenuItem(title: "悬停显示状态面板", action: #selector(toggleHoverPanel), keyEquivalent: "")
+        // 父项标题携带当前态；submenu 项由 makeBackgroundStyleMenu 提供（含当前勾选）
+        let background = NSMenuItem(title: "背景样式（\(backgroundStyle.menuTitle)）", action: nil, keyEquivalent: "")
+        background.submenu = makeBackgroundStyleMenu()
+        menu.addItem(background)
+        menu.addItem(.separator())
+        menu.addItem(groupHeader("通用设置"))
+        let hover = NSMenuItem(title: "悬停自动展开", action: #selector(toggleHoverPanel), keyEquivalent: "")
         hover.target = self
         hover.state = panelHoverEnabled ? .on : .off
         menu.addItem(hover)
@@ -3756,9 +3811,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         login.target = model?.loginItem.target
         login.state = model?.loginItem.state ?? (isPreviewMode ? .on : .off)
         menu.addItem(login)
-        let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
-        background.submenu = makeBackgroundStyleMenu()
-        menu.addItem(background)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "退出 CodexUsage", action: #selector(AppDelegate.onQuit), keyEquivalent: "q")
+        quit.keyEquivalentModifierMask = .command
+        quit.target = NSApp.delegate
+        menu.addItem(quit)
         return menu
     }
 
@@ -3771,7 +3828,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if hadMonitors && isOpen { installMonitors() }
     }
 
-    // MARK: 悬停显示状态面板开关（「···」菜单）
+    // MARK: 悬停显示状态面板开关（⚙ 设置菜单）
 
     /// 开关的呈现状态：以控制器运行时为准（生产启动时从偏好初始化，preview 基线默认开），
     /// 避免菜单 state 与运行时脱节；控制器缺失时回退默认开启。落盘仍只在生产路径。
@@ -3784,11 +3841,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         hoverController?.setEnabled(next)
     }
 
-    /// 「···」菜单悬停开关的离线回归：item 存在且接线正确、state 与呈现状态一致、
+    /// ⚙ 设置菜单悬停开关的离线回归：item 存在且接线正确、state 与呈现状态一致、
     /// 翻转即时改运行时状态且 preview 不落盘（偏好键原值前后不变，允许既有生产值存在）。
     func verifyHoverSettingsToggleForPreview() -> Bool {
         let menu = makePanelSettingsMenu()
-        guard let item = menu.items.first(where: { $0.title == "悬停显示状态面板" }),
+        guard let item = menu.items.first(where: { $0.title == "悬停自动展开" }),
               item.action == #selector(toggleHoverPanel), item.target === self else { return false }
         guard item.state == (panelHoverEnabled ? .on : .off) else { return false }
         guard let controller = hoverController else { return false }
@@ -3807,7 +3864,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     @objc private func showCardSettings() {
         showingCardSettings = true
         refreshPanelLayout()
-        // 打开设置页必须接管焦点：否则焦点残留「···」按钮，Space 会再次弹菜单，
+        // 打开设置页必须接管焦点：否则焦点残留 ⚙ 设置按钮，Space 会再次弹菜单，
         // 菜单跟踪期间 transient Popover 失 key 被关闭（真实按键验收发现的缺陷）。
         func scan(_ view: NSView) -> PanelCardSettingsView? {
             if let editor = view as? PanelCardSettingsView { return editor }
@@ -3867,7 +3924,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         let card = PanelCardView(padding: 8)
         let row = PanelUI.stack(spacing: 6)
         PanelUI.addFullWidth(PanelUI.label("全部卡片已隐藏", size: 12, weight: .semibold, wrapping: false), to: row)
-        PanelUI.addFullWidth(PanelUI.label("卡片可在「···」→ 卡片显示与排序中重新开启。", size: 10, color: .secondaryLabelColor), to: row)
+        PanelUI.addFullWidth(PanelUI.label("卡片可在右上角 ⚙ → 卡片显示与排序中重新开启。", size: 10, color: .secondaryLabelColor), to: row)
         let restore = PanelActionButton()
         restore.style = .plain
         restore.target = self
@@ -4112,18 +4169,22 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         func editor() -> PanelCardSettingsView? { descendants(contentController.view).compactMap { $0 as? PanelCardSettingsView }.first }
         func fail(_ message: String) -> Bool { print("CODEX_CARD_SETTINGS \(message)"); return false }
 
-        // 统一「···」菜单：卡片设置入口 + 悬停开关 + 开机自启 + 背景样式子菜单；未进入设置页时入口可用
+        // ⚙ 设置菜单：两组分组标题 + 九项结构；未进入设置页时入口可用
         let menu = makePanelSettingsMenu()
-        guard menu.items.map(\.title) == ["卡片显示与排序…", "悬停显示状态面板", "开机自启", "背景样式"], menu.items[0].isEnabled,
-              let hoverItem = menu.items.first(where: { $0.title == "悬停显示状态面板" }),
+        guard menu.items.map(\.title) == ["外观与布局", "卡片显示与排序…", "背景样式（\(backgroundStyle.menuTitle)）", "", "通用设置", "悬停自动展开", "开机自启", "", "退出 CodexUsage"],
+              !menu.items[0].isEnabled, !menu.items[4].isEnabled, menu.items[1].isEnabled,
+              let hoverItem = menu.items.first(where: { $0.title == "悬停自动展开" }),
               hoverItem.action == #selector(toggleHoverPanel), hoverItem.target === self,
               let loginItem = menu.items.first(where: { $0.title == "开机自启" }),
               loginItem.state == .on, loginItem.action != nil, loginItem.target != nil,
-              let backgroundMenu = menu.items[3].submenu,
+              let backgroundMenu = menu.items[2].submenu,
               backgroundMenu.items.map(\.title).contains("纯色"),
-              backgroundMenu.items.contains(where: { $0.title.hasPrefix("液态玻璃") }) else { return fail("menu structure") }
+              backgroundMenu.items.contains(where: { $0.title.hasPrefix("液态玻璃") }),
+              let quitMenuItem = menu.items.last, quitMenuItem.title == "退出 CodexUsage",
+              quitMenuItem.action == #selector(AppDelegate.onQuit), quitMenuItem.keyEquivalent == "q",
+              quitMenuItem.keyEquivalentModifierMask == .command else { return fail("menu structure") }
 
-        // 打开设置页：焦点必须落在首行复选框上（焦点残留「···」按钮会让 Space 重弹菜单并关闭面板）
+        // 打开设置页：焦点必须落在首行复选框上（焦点残留 ⚙ 设置按钮会让 Space 重弹菜单并关闭面板）
         showCardSettings()
         guard showingCardSettings, let settings = editor() else { return fail("settings page missing") }
         guard let window = contentController.view.window, window.firstResponder === settings.initialKeyView else {
@@ -4333,18 +4394,21 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         button.layer?.cornerRadius = 6
         button.alignment = style == .prominent ? .center : .left
         button.keyEquivalent = item.keyEquivalent
-        button.keyEquivalentModifierMask = []
+        // 透传 menu item 的修饰键（默认 .command）：footer 刷新按钮 ⌘R 正确生效，
+        // 也修正裸按 r/q 即触发的怪行为
+        button.keyEquivalentModifierMask = item.keyEquivalentModifierMask
         button.toolTip = item.toolTip
         button.focusRingType = .none
         let title = overrideTitle ?? item.title
         let prominent = style == .prominent
+        let subtle = style == .subtleAccent
         let textColor: NSColor = prominent
             ? NSColor(name: nil) { appearance in
                 appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .black : .white
             }
-            : .labelColor
+            : (subtle ? PanelAccent.codex.color : .labelColor)
         button.attributedTitle = NSAttributedString(string: title, attributes: [
-            .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular),
+            .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : (subtle ? .medium : .regular)),
             .foregroundColor: textColor
         ])
         button.setButtonType(.momentaryChange)
@@ -4352,7 +4416,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         (button.cell as? NSButtonCell)?.highlightsBy = []
         button.cell?.wraps = true
         button.cell?.lineBreakMode = .byWordWrapping
-        button.heightAnchor.constraint(greaterThanOrEqualToConstant: style == .plain ? 26 : 30).isActive = true
+        // subtleAccent 目前仅 footer 刷新 pill 使用，由调用方以相等约束定高（28）
+        if style != .subtleAccent {
+            button.heightAnchor.constraint(greaterThanOrEqualToConstant: style == .plain ? 26 : 30).isActive = true
+        }
         return button
     }
 
@@ -4382,26 +4449,28 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     func expandToolsForPreview() { externalExpanded = true }
     func collapseDailyForPreview() { dailyExpanded = false }
-    private var quitButtonForPreview: PanelActionButton? {
-        descendants(footerContainer).compactMap({ $0 as? PanelActionButton }).first(where: {
-            $0.menuItem?.action == #selector(AppDelegate.onQuit)
-        })
-    }
-    func showQuitHoverForPreview() -> Bool {
-        guard let quit = quitButtonForPreview else { return false }
-        quit.setHoveredForPreview(true)
+    /// 底栏 chrome 离线回归：版本胶囊 / 更新时间 / 刷新 pill 三件套接线与文案；
+    /// 退出已迁入 ⚙ 设置菜单，底栏不得残留任何直连 onQuit 的按钮。
+    func verifyFooterChromeForPreview() -> Bool {
+        contentController.view.layoutSubtreeIfNeeded()
+        let buttons = descendants(footerContainer).compactMap { $0 as? PanelActionButton }
+        let versionID = NSUserInterfaceItemIdentifier("CodexRole.footer.version")
+        let updatedAtID = NSUserInterfaceItemIdentifier("CodexRole.footer.updatedAt")
+        let refreshID = NSUserInterfaceItemIdentifier("CodexRole.footer.refresh")
+        guard let version = buttons.first(where: { $0.identifier == versionID }) else { return false }
+        guard version.target === self, version.action == #selector(requestUpdateCheck),
+              version.toolTip?.contains("点击检查更新") == true else { return false }
+        guard descendants(footerContainer).contains(where: { $0.identifier == updatedAtID }) else { return false }
+        guard let refresh = buttons.first(where: { $0.identifier == refreshID }) else { return false }
+        // onRefresh 是 AppDelegate 私有方法，编译期拿不到 #selector，用运行时字符串比对
+        guard refresh.target === self, refresh.menuItem?.action == NSSelectorFromString("onRefresh"),
+              refresh.isEnabled, refresh.keyEquivalent == "r",
+              refresh.keyEquivalentModifierMask == .command,
+              refresh.title.contains("数据刷新") else { return false }
+        guard !buttons.contains(where: {
+            $0.action == #selector(AppDelegate.onQuit) || $0.menuItem?.action == #selector(AppDelegate.onQuit)
+        }) else { return false }
         return true
-    }
-    func verifyQuitHoverForPreview() -> Bool {
-        guard let quit = quitButtonForPreview, quit.alignment == .center else { return false }
-        quit.updateTrackingAreas()
-        quit.setHoveredForPreview(true)
-        let highlighted = quit.layer?.backgroundColor?.alpha ?? 0
-        quit.setHoveredForPreview(false)
-        let cleared = quit.layer?.backgroundColor?.alpha ?? 0
-        let valid = highlighted > 0 && cleared == 0 && !quit.trackingAreas.isEmpty
-        if !valid { print("QUIT_HOVER highlighted=\(highlighted) cleared=\(cleared) tracking=\(quit.trackingAreas.count)") }
-        return valid
     }
     /// 截图辅助：展示原位卡片设置页（不参与事件断言）。
     func showCardSettingsForPreview() { showCardSettings() }
@@ -5126,10 +5195,40 @@ private final class PeriodSectionView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-/// 版本号按钮：hover 显示指向光标，暗示可点击检查更新。
-/// cursor rect 必须在 resetCursorRects() 内注册（在别处调用是 no-op）。
-private final class PanelVersionButton: NSButton {
-    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+/// 面板内容容器（popover 根视图）：底栏退出按钮移除后 ⌘Q 失去常驻 responder，
+/// 在此兜底拦截面板窗口内的 ⌘Q；其余按键（含刷新按钮的 ⌘R）交还 super 走默认 responder 链。
+final class PanelRootView: NSView {
+    var quitHandler: (() -> Void)?
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "q" {
+            quitHandler?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+/// 更新可用圆点：6pt accent 色圆点，越出版本胶囊边界 2pt 纯展示（hitTest 返回 nil 不参与命中）。
+private final class AccentDotView: NSView {
+    override var wantsUpdateLayer: Bool { true }
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 3
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            self.layer?.backgroundColor = PanelAccent.codex.color.cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 private final class PanelFooterView: NSView {
@@ -5138,18 +5237,86 @@ private final class PanelFooterView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 8)
+        // 单行 meta：版本胶囊（左）+ 更新圆点 + 弹性空隙 + 更新时间 + 刷新 pill（右）
         let meta = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-        meta.addArrangedSubview(PanelUI.label(model.lastAttempt, size: 11, color: .secondaryLabelColor, wrapping: false))
-        meta.addArrangedSubview(PanelUI.spacer())
-        let version = PanelVersionButton(title: model.version, target: target, action: #selector(UsagePanelController.requestUpdateCheck))
+
+        // 版本胶囊：PanelActionButton 直构（不走 buttonFactory），pillNeutral 常驻 6% 灰底 + 指向光标
+        let versionAttr = NSAttributedString(string: model.version, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.labelColor
+        ])
+        let version = PanelActionButton(frame: .zero)
+        version.style = .pillNeutral
+        version.pointingHandCursor = true
+        version.target = target
+        version.action = #selector(UsagePanelController.requestUpdateCheck)
+        version.translatesAutoresizingMaskIntoConstraints = false
+        version.wantsLayer = true
+        version.layer?.cornerRadius = 12
+        version.alignment = .center
+        version.setButtonType(.momentaryChange)
         version.isBordered = false
-        version.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        version.contentTintColor = .secondaryLabelColor
-        version.toolTip = "点击检查更新"
-        version.setAccessibilityLabel("\(model.version)，点击检查更新")
         version.focusRingType = .none
+        (version.cell as? NSButtonCell)?.highlightsBy = []
+        version.cell?.wraps = false
+        version.attributedTitle = versionAttr
+        version.toolTip = "\(BuildInfo.version) · 点击检查更新"
+        version.setAccessibilityLabel("\(BuildInfo.version)，点击检查更新")
+        version.identifier = NSUserInterfaceItemIdentifier("CodexRole.footer.version")
+        NSLayoutConstraint.activate([
+            version.widthAnchor.constraint(equalToConstant: ceil(versionAttr.size().width) + 20),
+            version.heightAnchor.constraint(equalToConstant: 24)
+        ])
         meta.addArrangedSubview(version)
-        root.addArrangedSubview(meta)
+
+        // 更新圆点挂在胶囊右上角：纵向越出上缘 2pt、横向内缩 2pt（与参照实现一致；胶囊不裁剪 subviews）
+        let dot = AccentDotView()
+        dot.isHidden = model.updateItem == nil
+        version.addSubview(dot)
+        NSLayoutConstraint.activate([
+            dot.widthAnchor.constraint(equalToConstant: 6),
+            dot.heightAnchor.constraint(equalToConstant: 6),
+            dot.topAnchor.constraint(equalTo: version.topAnchor, constant: -2),
+            dot.trailingAnchor.constraint(equalTo: version.trailingAnchor, constant: -2)
+        ])
+
+        meta.addArrangedSubview(PanelUI.spacer())
+
+        // 更新时间：7 天窗口失败/过期时红字提示（tooltip 携带完整合成文案，时间口径仍为最后成功时刻）
+        let updatedAt: NSTextField
+        if let errorLine = model.sevenDayErrorLine {
+            updatedAt = PanelUI.label("刷新失败", size: 11, color: .systemRed, wrapping: false)
+            updatedAt.toolTip = errorLine
+        } else if !model.quotaLastOKText.isEmpty {
+            updatedAt = PanelUI.label("\(model.quotaLastOKText) 更新", size: 11, color: .secondaryLabelColor, wrapping: false)
+        } else {
+            updatedAt = PanelUI.label("—", size: 11, color: .secondaryLabelColor, wrapping: false)
+        }
+        updatedAt.identifier = NSUserInterfaceItemIdentifier("CodexRole.footer.updatedAt")
+        meta.addArrangedSubview(updatedAt)
+
+        // 刷新 pill：工厂产出 .subtleAccent 底后再加工；⌘R 已由 makeActionButton 透传
+        let refresh = buttonFactory(model.refreshItem, .subtleAccent, nil)
+        refresh.identifier = NSUserInterfaceItemIdentifier("CodexRole.footer.refresh")
+        refresh.alignment = .center
+        refresh.cell?.wraps = false
+        let refreshText = model.refreshInFlight ? "刷新中…" : "数据刷新"
+        refresh.isEnabled = !model.refreshInFlight
+        refresh.attributedTitle = Self.refreshAttributedTitle(refreshText, appearance: refresh.effectiveAppearance)
+        // 附件图标按当前 appearance 预着色，外观切换时重生成（动态色对附件渲染不稳定）
+        refresh.appearanceChangeHandler = { [weak refresh] in
+            guard let refresh = refresh else { return }
+            refresh.attributedTitle = Self.refreshAttributedTitle(refreshText, appearance: refresh.effectiveAppearance)
+        }
+        // 宽度用相等约束：合成串实测宽 + 左右各 12pt，保证左右边距对称
+        NSLayoutConstraint.activate([
+            refresh.widthAnchor.constraint(equalToConstant: ceil(refresh.attributedTitle.size().width) + 24),
+            refresh.heightAnchor.constraint(equalToConstant: 28)
+        ])
+        meta.addArrangedSubview(refresh)
+
+        PanelUI.addFullWidth(meta, to: root)
+
         if let message = updateMessage {
             // 含"失败"/"错误"/"无法"关键词用红色，其余用次要色
             let isError = message.contains("失败") || message.contains("错误") || message.contains("无法")
@@ -5158,21 +5325,41 @@ private final class PanelFooterView: NSView {
             root.addArrangedSubview(label)
         }
 
-        let actions = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
-        let refresh = buttonFactory(model.refreshItem, .prominent, nil)
-        refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true
-        actions.addArrangedSubview(refresh)
-        actions.addArrangedSubview(PanelUI.spacer())
-        let quit = buttonFactory(model.quitItem, .plain, nil)
-        // 固定宽度的独立按钮需在 hover 底色的视觉中心，不沿用整行文本按钮的左对齐。
-        quit.alignment = .center
-        quit.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        actions.addArrangedSubview(quit)
-        root.addArrangedSubview(actions)
         addSubview(root)
         PanelUI.pin(root, to: self)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 合成「icon + 文字」标题（不走 NSButton imagePosition=.imageLeft 的默认排布）：
+    /// arrow.clockwise（pointSize 11、medium）经 NSTextAttachment 合入，附件 bounds 按
+    /// capHeight 光学垂直居中；icon 经 palette 预着色 accent，与文字间距用空格 + kern 微调
+    /// 约 4pt；合成串不留尾部空格。文字 12pt medium accent 色。
+    private static func refreshAttributedTitle(_ text: String, appearance: NSAppearance) -> NSAttributedString {
+        let font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let accent = resolveAccent(for: appearance)
+        let symbol = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [accent]))
+        let attachment = NSTextAttachment()
+        let iconSize = symbol?.size ?? .zero
+        attachment.image = symbol
+        attachment.bounds = CGRect(x: 0, y: (font.capHeight - iconSize.height) / 2,
+                                   width: iconSize.width, height: iconSize.height)
+        let title = NSMutableAttributedString(attachment: attachment)
+        title.append(NSAttributedString(string: " ", attributes: [.font: font, .kern: 2]))
+        title.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: accent]))
+        return title
+    }
+
+    /// 把动态 accent 色按指定 appearance 解析成具体色（NSColor 无 resolvedColor(with:)，
+    /// 借 performAsCurrentDrawingAppearance 内取 cgColor 完成解析）
+    private static func resolveAccent(for appearance: NSAppearance) -> NSColor {
+        var resolved = PanelAccent.codex.color
+        appearance.performAsCurrentDrawingAppearance {
+            resolved = NSColor(cgColor: PanelAccent.codex.color.cgColor) ?? resolved
+        }
+        return resolved
+    }
 }
 
 
@@ -5188,6 +5375,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var updateTimer: Timer?
     private var usage = UsageData()
     private var refreshSchedule = RefreshSchedule()
+    // 手动刷新在飞标记：手动请求可能排队等待在飞自动刷新（RefreshSchedule.active），
+    // 无法从闸门位派生（自动轮询也持有闸门），须显式跟踪；20s 兜底防网络悬挂导致按钮永久卡死
+    private var manualRefreshInFlight = false
+    private var manualRefreshReset: DispatchWorkItem?
     private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
     // （与 GlmUsage 的静默保留旧数据不同，这是刻意改进：过期数据必须可见）
@@ -5414,7 +5605,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.sourceStatus = ["Codex": .available, "Proma": .available, "Claude Code": .absent, "Hermes": .absent]
         if arguments.contains("--visual-preview-pro") { usage.planType = "pro"; usage.fiveHour = nil; usage.fiveHourNotApplicable = true }
         fiveHourLastOK = now
-        sevenDayLastOK = now
+        // 稍早于 now：预览 footer 显示「HH:mm 更新」的典型成功路径
+        sevenDayLastOK = now.addingTimeInterval(-120)
         tokensLastOK = now
         resetCardsLastOK = now
         tiboLastOK = now
@@ -5506,11 +5698,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if arguments.contains("--visual-preview-scroll-end") {
                         _ = self.panelController.scrollToEndForPreview()
                     }
-                    if arguments.contains("--visual-preview-quit-hover") {
-                        guard self.panelController.showQuitHoverForPreview() else {
-                            fputs("CodexUsage visual preview: quit button missing\n", stderr); exit(1)
-                        }
-                    }
                     if arguments.contains("--visual-preview-show-card-settings") {
                         self.panelController.showCardSettingsForPreview()
                     }
@@ -5551,7 +5738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard panelController.isOpen else { return fail("preview panel did not open") }
         guard panelController.verifyCardLayoutForPreview() else { return fail("card layout or spacing failed") }
-        guard panelController.verifyQuitHoverForPreview() else { return fail("quit hover alignment or state reset failed") }
+        guard panelController.verifyFooterChromeForPreview() else { return fail("footer chrome wiring failed") }
         guard let statusButton = statusItem.button else { return fail("status button missing") }
         statusButton.performClick(nil)
         guard !panelController.isOpen else { return fail("status button did not close panel") }
@@ -5595,7 +5782,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 guard !self.panelController.isOpen else { return fail("outside click did not close panel") }
                 self.panelController.toggle(anchoredTo: button)
-                guard let refresh = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                // footer 刷新 pill 的键等价为 ⌘R（修饰键经 makeActionButton 从 menu item 透传）
+                guard let refresh = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command],
                     timestamp: 0, windowNumber: self.panelController.previewWindowNumber, context: nil, characters: "r",
                     charactersIgnoringModifiers: "r", isARepeat: false, keyCode: 15) else {
                     return fail("could not create refresh key event")
@@ -5603,16 +5791,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.postEvent(refresh, atStart: false)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     guard self.panelController.isOpen else { return fail("refresh action closed the panel") }
-                    print("CodexUsage visual event test: PASS (card layout, quit hover alignment/reset, status button toggle, model rows, tool periods, response/cache period chips, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
+                    print("CodexUsage visual event test: PASS (card layout, footer chrome, status button toggle, model rows, tool periods, response/cache period chips, chart movement handler/keyboard, Escape, outside click, refresh keeps panel open)")
                     exit(0)
                 }
             }
         }
     }
 
+    /// 手动刷新在飞位：重入安全；active 时重新武装 20s 兜底复位（防网络悬挂卡死按钮）。
+    private func setManualRefreshInFlight(_ active: Bool) {
+        manualRefreshReset?.cancel()
+        manualRefreshReset = nil
+        let changed = manualRefreshInFlight != active
+        manualRefreshInFlight = active
+        if active {
+            let reset = DispatchWorkItem { [weak self] in
+                // 兜底复位只在仍处「在飞」时生效：正常完成路径已先清位
+                guard let self = self, self.manualRefreshInFlight else { return }
+                self.manualRefreshInFlight = false
+                self.updateUI()
+            }
+            manualRefreshReset = reset
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: reset)
+        }
+        if changed { updateUI() }
+    }
+
     // 拉取数据：额度走网络（回调内含 401 兜底刷新），token 扫描与重置卡明细走每 5 分钟周期
     private func refresh(manual: Bool = false) {
-        guard !visualPreview, let work = refreshSchedule.request(manual: manual, now: Date()) else { return }
+        guard !visualPreview else {
+            // 预览演示态：手动刷新只走本地演示（不触网、不写盘）；自动轮询维持现状直接返回
+            guard manual else { return }
+            setManualRefreshInFlight(true)
+            panelController.setUpdateMessage("正在刷新预览…")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.setManualRefreshInFlight(false)
+                self?.panelController.setUpdateMessage("预览数据已刷新")
+            }
+            return
+        }
+        guard let work = refreshSchedule.request(manual: manual, now: Date()) else {
+            // 排队等待在飞自动刷新：手动请求仍计为在飞，footer 立即反映「刷新中…」
+            if manual { setManualRefreshInFlight(true) }
+            return
+        }
+        if manual { setManualRefreshInFlight(true) }
         performRefresh(work)
     }
 
@@ -5624,7 +5847,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard CodexAuth.identity(auth) == identity else {
             synchronizeAccount()
             updateUI()
-            if let next = refreshSchedule.finish() { performRefresh(next) }
+            // 闸门真正释放才清手动在飞位；排队的手动刷新接手后仍在飞
+            if let next = refreshSchedule.finish() {
+                performRefresh(next)
+            } else {
+                setManualRefreshInFlight(false)
+            }
             return
         }
         lastAttemptAt = Date()
@@ -5702,7 +5930,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 各 apply 回调只更新数据，渲染统一在这里做一次：
             // 菜单重建与 status.json 写入每轮刷新各一次，而不是每个数据源一次
             self.updateUI()
-            if let next = self.refreshSchedule.finish() { self.performRefresh(next) }
+            // 闸门真正释放才清手动在飞位；排队的手动刷新接手后仍在飞
+            if let next = self.refreshSchedule.finish() {
+                self.performRefresh(next)
+            } else {
+                self.setManualRefreshInFlight(false)
+            }
         }
     }
 
@@ -5853,7 +6086,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         togglePanel()
         expectShown(false, "close-after-panel-pin")
 
-        // 7. `···` 菜单开关：运行时即时生效（preview 不落盘，断言只验证翻转本身）
+        // 7. ⚙ 设置菜单开关：运行时即时生效（preview 不落盘，断言只验证翻转本身）
         guard panelController.verifyHoverSettingsToggleForPreview() else { fail("settings toggle") }
         print("CODEX_HOVER_TEST settings-toggle: ok")
 
@@ -6119,7 +6352,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateItem = item
         }
 
-        func quota(_ label: String, _ window: QuotaWindow?, isFive: Bool) -> UsagePanelModel.Quota {
+        // 返回值携带 stale/error 的合成文案（与 notice 同源同文案；两者都有时优先 error 文案，
+        // 都无 → nil）：供 footer 更新时间位做「刷新失败」提示，仅 7 天窗口取用
+        func quota(_ label: String, _ window: QuotaWindow?, isFive: Bool) -> (UsagePanelModel.Quota, String?) {
             let last = isFive ? fiveHourLastOK : sevenDayLastOK
             let stale = isFive ? fiveHourStale : sevenDayStale
             let error = isFive ? usage.fiveHourError : usage.sevenDayError
@@ -6129,22 +6364,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 resetText = window.reset.map { Fmt.quotaReset($0) } ?? "时间未知"
             }
             var notices: [UsagePanelModel.Notice] = []
+            var errorLine: String?
             if stale {
                 var text = "⚠ 已过期"
                 if let last = last { text += " · 最后成功 \(Fmt.dayTime(last))" }
                 notices.append(notice(text, .warning))
+                errorLine = text
             }
             if let error = error {
                 var text = unavailable ? error : "刷新失败：\(error)"
                 if !stale, let last = last { text += " · 最后成功 \(Fmt.dayTime(last))" }
                 notices.append(notice(text, unavailable ? .info : .error))
+                errorLine = text
             }
-            return UsagePanelModel.Quota(title: label, resetText: resetText,
-                remaining: Fmt.remaining(window?.usedPercent), notices: notices)
+            return (UsagePanelModel.Quota(title: label, resetText: resetText,
+                remaining: Fmt.remaining(window?.usedPercent), notices: notices), errorLine)
         }
         var quotas: [UsagePanelModel.Quota] = []
-        if !usage.fiveHourNotApplicable { quotas.append(quota("5 小时窗口", usage.fiveHour, isFive: true)) }
-        quotas.append(quota("7 天窗口", usage.sevenDay, isFive: false))
+        if !usage.fiveHourNotApplicable { quotas.append(quota("5 小时窗口", usage.fiveHour, isFive: true).0) }
+        let sevenDayQuota = quota("7 天窗口", usage.sevenDay, isFive: false)
+        quotas.append(sevenDayQuota.0)
+        let sevenDayErrorLine = sevenDayQuota.1
 
         var resetSection: UsagePanelModel.ResetSection?
         if let storedCards = usage.resetCards {
@@ -6322,15 +6562,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             globalNotices.append(notice("额度错误：\(error)", .error))
         }
 
-        let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(onRefresh), keyEquivalent: "r")
+        let refreshItem = NSMenuItem(title: "数据刷新", action: #selector(onRefresh), keyEquivalent: "r")
         refreshItem.target = self
         let loginItem = NSMenuItem(title: "开机自启", action: #selector(onToggleLogin), keyEquivalent: "")
         loginItem.target = self
         loginItem.state = visualPreview ? .on : (isLoginItemEnabled() ? .on : .off)
-        let quitItem = NSMenuItem(title: "退出", action: #selector(onQuit), keyEquivalent: "q")
-        quitItem.target = self
 
-        let displayVersion = BuildInfo.version
+        // 胶囊内只显示短版本号（去 -dirty/-g<hash> 等尾巴）
+        let displayVersion = BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version
         let model = UsagePanelModel(
             updateItem: updateItem,
             title: "Codex 用量", plan: (!visualPreview && CodexAuth.usesAPIKey()) ? "API Key" : (usage.planType ?? "Unknown"),
@@ -6364,10 +6603,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             notices: globalNotices,
             lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))",
-            version: "版本 \(displayVersion)",
+            version: displayVersion,
             refreshItem: refreshItem,
             loginItem: loginItem,
-            quitItem: quitItem)
+            quotaLastOKText: sevenDayLastOK.map { Fmt.time($0) } ?? "",
+            sevenDayErrorLine: sevenDayErrorLine,
+            refreshInFlight: manualRefreshInFlight)
         panelController.update(model: model)
     }
 
