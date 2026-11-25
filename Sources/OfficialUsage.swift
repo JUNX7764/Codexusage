@@ -1,18 +1,34 @@
 import Foundation
 
-struct OfficialUsageSnapshot {
-    enum SparsePolicy { case unknown, officialActivity }
+struct OfficialUsageSnapshot: Equatable {
+    enum SparsePolicy: Equatable { case unknown, officialActivity }
     enum Day: Equatable { case reported(Double), inferredZero, missing }
     var lifetime: Double?
-    var days: [String: Double]
+    var days: [String: Double] {
+        didSet {
+            minDay = days.keys.min()
+            maxDay = days.keys.max()
+        }
+    }
     var fetchedAt: Date
     var sparsePolicy: SparsePolicy = .unknown
+    private(set) var minDay: String?
+    private(set) var maxDay: String?
+
+    init(lifetime: Double?, days: [String: Double], fetchedAt: Date, sparsePolicy: SparsePolicy = .unknown) {
+        self.lifetime = lifetime
+        self.days = days
+        self.fetchedAt = fetchedAt
+        self.sparsePolicy = sparsePolicy
+        self.minDay = days.keys.min()
+        self.maxDay = days.keys.max()
+    }
 
     /// The official client renders absent dates as zero. Restrict that behavior to
     /// the range bounded by actual returned dates; never extrapolate beyond it.
     func day(_ date: String) -> Day {
         if let value = days[date] { return .reported(value) }
-        guard sparsePolicy == .officialActivity, let first = days.keys.min(), let last = days.keys.max(),
+        guard sparsePolicy == .officialActivity, let first = minDay, let last = maxDay,
               date >= first, date <= last else { return .missing }
         return .inferredZero
     }

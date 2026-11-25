@@ -7,7 +7,7 @@ enum QuotaHistoryStartup {
     }
 }
 
-struct QuotaCycleSnapshot {
+struct QuotaCycleSnapshot: Equatable {
     let state: QuotaCycleState
     let isLoading: Bool
     let isSaved: Bool

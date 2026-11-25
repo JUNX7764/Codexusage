@@ -159,19 +159,21 @@ final class DailyUsageChart: NSView {
         var entries: [(String, Entry)] = []
         var today: String?
         if let snapshot = snapshot, !snapshot.days.isEmpty {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = .current
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.timeZone = .current
-            formatter.calendar = Calendar(identifier: .gregorian)
+            formatter.calendar = calendar
             formatter.dateFormat = "yyyy-MM-dd"
-            let calendar = Calendar.current
             let now = Date()
             let todayName = formatter.string(from: now)
             today = todayName
-            let end = max(todayName, snapshot.days.keys.max() ?? todayName)
+            let end = max(todayName, snapshot.maxDay ?? todayName)
             if let endDate = formatter.date(from: end) {
                 for index in (0..<30).reversed() {
-                    let day = formatter.string(from: calendar.date(byAdding: .day, value: -index, to: endDate)!)
+                    guard let dayDate = calendar.date(byAdding: .day, value: -index, to: endDate) else { continue }
+                    let day = formatter.string(from: dayDate)
                     let entry: Entry
                     switch snapshot.day(day) {
                     case .reported(let value): entry = .reported(value)

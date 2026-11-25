@@ -34,11 +34,14 @@ enum UsageComparison {
         }
         guard let snapshot = snapshot else { return unavailable("尚未取得数据") }
         guard !snapshot.days.isEmpty else { return unavailable("尚未取得每日数据") }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
         let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .current; formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current; formatter.calendar = calendar
         formatter.dateFormat = "yyyy-MM-dd"; formatter.isLenient = false
         let dates = (0..<14).map {
-            formatter.string(from: Calendar.current.date(byAdding: .day, value: -$0, to: now)!)
+            formatter.string(from: calendar.date(byAdding: .day, value: -$0, to: now)
+                ?? now.addingTimeInterval(Double(-$0) * 86400))
         }
         let dailyRange = "\(dates[0]) 对比 \(dates[1])（今日未结束）"
         let weeklyRange = "\(dates[6]) 至 \(dates[0]) 对比 \(dates[13]) 至 \(dates[7])（今日未结束）；\(weeklyFormula)"

@@ -40,16 +40,31 @@ struct RefreshSchedule {
 
 /// Coalesces immutable snapshots received while storage is busy. Encoding, I/O
 /// and successful-write deduplication are owned by the serial writer queue.
+/// Optional `volatileKeys` (e.g. `lastAttemptAt`) are excluded from the deduplication
+/// digest so idle polls do not rewrite disk; a full snapshot is still persisted
+/// whenever any non-volatile field changes or `heartbeatInterval` elapses.
 final class StatusSnapshotWriter {
     typealias Snapshot = [String: Any]
     private let queue = DispatchQueue(label: "com.local.codex-usage.status", qos: .utility)
     private let lock = NSLock()
     private var pending: Snapshot?
     private var running = false
-    private var saved: Data?
+    private var savedDigest: Data?
+    private var lastWrittenAt: Date?
+    private let volatileKeys: Set<String>
+    private let heartbeatInterval: TimeInterval
+    private let now: () -> Date
     private let write: (Data) throws -> Void
 
-    init(write: @escaping (Data) throws -> Void) { self.write = write }
+    init(volatileKeys: Set<String> = [],
+         heartbeatInterval: TimeInterval = 300,
+         now: @escaping () -> Date = Date.init,
+         write: @escaping (Data) throws -> Void) {
+        self.volatileKeys = volatileKeys
+        self.heartbeatInterval = heartbeatInterval
+        self.now = now
+        self.write = write
+    }
 
     func submit(_ snapshot: Snapshot) {
         lock.lock()
@@ -71,10 +86,28 @@ final class StatusSnapshotWriter {
             pending = nil
             lock.unlock()
             do {
-                let data = try JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys, .prettyPrinted])
-                if data != saved {
+                let digest: Data
+                let preEncoded: Data?
+                if volatileKeys.isEmpty {
+                    let data = try JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys, .prettyPrinted])
+                    digest = data
+                    preEncoded = data
+                } else {
+                    var semantic = snapshot
+                    for key in volatileKeys { semantic.removeValue(forKey: key) }
+                    digest = try JSONSerialization.data(withJSONObject: semantic, options: [.sortedKeys])
+                    preEncoded = nil
+                }
+                let timestamp = now()
+                let heartbeatDue = !volatileKeys.isEmpty && (lastWrittenAt.map {
+                    let elapsed = timestamp.timeIntervalSince($0)
+                    return elapsed >= heartbeatInterval || elapsed < 0
+                } ?? true)
+                if digest != savedDigest || heartbeatDue {
+                    let data = try preEncoded ?? JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys, .prettyPrinted])
                     try write(data)
-                    saved = data
+                    savedDigest = digest
+                    lastWrittenAt = timestamp
                 }
             } catch {
                 NSLog("[CodexUsage] status write failed: %@", error.localizedDescription)

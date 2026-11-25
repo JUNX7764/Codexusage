@@ -1,6 +1,6 @@
 # CodexUsage 当前架构概览
 
-> 状态：当前架构摘要。最后核对：2026-11-12。
+> 状态：当前架构摘要。最后核对：2026-11-25。
 > 本文解释模块和边界，不复制函数级规格；具体行为以源码和测试为准。
 
 ## 1. 应用形态
@@ -26,12 +26,13 @@ CodexUsage 是 macOS 13+、universal 双架构（Apple Silicon + Intel）的原�
 | `QuotaCycleReducer` / `QuotaCycleStore` / `QuotaCycleCoordinator` | 额度观测状态机、账户隔离存储与代际校验 |
 | `QuotaCycleHistoryView` / `QuotaCycleChart` | 周期双柱图与原生浏览交互；UI 状态由控制器持有 |
 | `UsageAttribution` | 处理重叠来源路径的唯一归属 |
-| `PanelCardView` / `PanelComparisonStack` 等卡片组件 | 七个业务板块的原生卡片容器、比较条与徽标 |
+| `PanelCardView` / `PanelComparisonStack` 等卡片组件 | 九个业务板块的原生卡片容器、比较条与徽标 |
 | `TiboDisplay` 与相关模型 | AIHOT 重置动态的解析、排序和展示 |
+| `RefreshSchedule` / `StatusSnapshotWriter` | 5 分钟周期合并调度，以及忽略易变字段并按心跳去重落盘的 `status.json` 写入器 |
 | `UpdateChecker` | 检查 GitHub Release 及更新资产 |
 | `UpdateProgressController` | 启动后台更新并恢复、展示进度 |
-| `UsagePanelController` | 原生 `NSPopover`、面板布局与交互 |
-| `AppDelegate` | 生命周期、刷新调度、账户隔离、自启和状态聚合 |
+| `UsagePanelController` | 原生 `NSPopover`、面板布局、悬停展开与交互 |
+| `AppDelegate` | 系统生命周期（休眠/唤醒暂停与恢复、`NWPathMonitor` 网络恢复、退出前排空写盘）、刷新调度、账户隔离、LaunchAgent 自启和状态聚合 |
 | `CodexOfflineRegression` | 使用临时目录和假数据的离线自检 |
 
 主入口保留 top-level 形式；构建时在独立临时目录创建合法 `main.swift`，同 `Sources/` 编译。
@@ -72,7 +73,7 @@ GitHub Release 列表 → 可安装版本及其说明 → 面板内确认 → ZI
 
 ## 5. 已知架构债务
 
-- Swift 源码、UI 和自检集中在约六千行的主文件中（新统计模块已拆分至 `Sources/`，拆分工作尚未完成），审查与回归定位成本较高。
+- Swift 源码、UI 和自检集中在约一万行的主文件中（部分统计与交互模块已拆分至 `Sources/`，拆分工作尚未完成），审查与回归定位成本较高。
 - 自动更新尚缺独立发布者签名和完整面板点击到重启的常规发布验收。
 - 凭据写回与 Codex CLI 之间没有跨进程共同锁，已保留已知竞态说明。
 - 发布前测试目前依赖本地手动执行，没有 CI 强制门禁。

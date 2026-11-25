@@ -104,12 +104,16 @@ final class QuotaCycleHistoryView: NSView {
         refresh()
     }
     @objc private func showMore() { state.browser.loadEarlier(); refresh() }
-    // 展示用 formatter 按格式缓存（Fmt 同款约定）：悬停与面板重建每轮调用十几次
-    private static var cachedFormatters: [String: DateFormatter] = [:]
+    // 展示用 formatter 按线程与格式缓存（Fmt 同款约定）：悬停与面板重建每轮调用十几次
     private static func formatter(_ format: String) -> DateFormatter {
-        if let cached = cachedFormatters[format] { return cached }
-        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = format
-        cachedFormatters[format] = f
+        let key = "CodexUsage.QuotaCycleHistoryView.df.\(format)"
+        let dict = Thread.current.threadDictionary
+        if let cached = dict[key] as? DateFormatter { return cached }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.timeZone = .autoupdatingCurrent
+        f.dateFormat = format
+        dict[key] = f
         return f
     }
     static func date(_ date: Date, format: String = "MM/dd HH:mm") -> String {
