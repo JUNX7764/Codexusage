@@ -4,6 +4,7 @@ import SQLite3
 import CoreFoundation
 import Darwin
 import CryptoKit
+import Network
 
 enum CodexNumber {
     static func finite(_ value: Any?) -> Double? {
@@ -170,33 +171,43 @@ enum CodexAuth {
         var tokens: Tokens
     }
 
-    static func load(at path: String = authPath) -> Snapshot? {
+    /// Single-read helper returning both the OAuth snapshot (if present and not in explicit
+    /// API-key mode) and whether API-key mode is active, avoiding redundant auth.json disk reads.
+    static func loadWithMode(at path: String = authPath) -> (snapshot: Snapshot?, usesAPIKey: Bool) {
         guard let data = FileManager.default.contents(atPath: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
+            return (nil, false)
         }
         let rawMode = (obj["auth_mode"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if rawMode == "apikey" || rawMode == "api_key" { return nil }
+        let mode = (rawMode?.isEmpty == true) ? nil : rawMode
+        let isAPIKey: Bool
+        if mode == "apikey" || mode == "api_key" {
+            isAPIKey = true
+        } else if mode != nil {
+            isAPIKey = false
+        } else {
+            isAPIKey = (obj["OPENAI_API_KEY"] as? String).map { !$0.isEmpty } ?? false
+        }
+        if mode == "apikey" || mode == "api_key" { return (nil, true) }
         guard let tokens = obj["tokens"] as? [String: Any],
               let access = tokens["access_token"] as? String, !access.isEmpty else {
-            return nil
+            return (nil, isAPIKey)
         }
         let refresh = tokens["refresh_token"] as? String
         let id = tokens["id_token"] as? String
-        return Snapshot(
+        let snapshot = Snapshot(
             tokens: Tokens(accessToken: access, refreshToken: refresh,
                            idToken: id, email: id.flatMap(jwtEmail), accountID: tokens["account_id"] as? String))
+        return (snapshot, isAPIKey)
+    }
+
+    static func load(at path: String = authPath) -> Snapshot? {
+        loadWithMode(at: path).snapshot
     }
 
     /// API key authentication is distinct from a ChatGPT subscription.
     static func usesAPIKey(at path: String = authPath) -> Bool {
-        guard let data = FileManager.default.contents(atPath: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-        let rawMode = (obj["auth_mode"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let mode = (rawMode?.isEmpty == true) ? nil : rawMode
-        if mode == "apikey" || mode == "api_key" { return true }
-        if mode != nil { return false }
-        return (obj["OPENAI_API_KEY"] as? String).map { !$0.isEmpty } ?? false
+        loadWithMode(at: path).usesAPIKey
     }
 
     /// JWT 第二段 Base64URL 解码 → payload 字典；解不出返回空字典，
@@ -1040,8 +1051,8 @@ struct ModelTokenUsage {
 }
 
 /// 模型响应 / 缓存命中卡的逐请求统计（token_usage_record 管线，与累计差分管线完全独立）。
-/// 字段与 FileEntry.recordDaysByModel 的扁平 14 值布局一一对应：
-/// requests, sumDur, sumOut, sumIn, sumCached, sumCacheWrite, hist[8]。
+/// 字段与 FileEntry.recordDaysByModel 的扁平 15 值布局一一对应：
+/// requests, sumDur, sumOut, sumIn, sumCached, sumCacheWrite, hist[8], timedOut。
 /// 口径（docs/plans/2026-11-15-model-response-cache-cards.md「口径定义」）：
 /// usage 是逐请求终值，绝不求和 turn_token_usage/thread_token_usage 等累计值。
 struct ModelRunStats: Equatable {
@@ -1132,7 +1143,7 @@ enum TokenScanner {
         var needsRebuild: Bool? = nil
     }
     // Model dimensions require one rebuild; aggregate totals keep the original accounting rules.
-    // v4：新增 recordDaysByModel 等 14 值布局字段；旧 v3 状态作废整体重扫（代价秒级）。
+    // v4：新增 recordDaysByModel 字段；v5 扩展为 15 值布局（补齐 timedOut）并支持增量迁移重建。
     struct State: Codable { var version: Int = 5; var files: [String: FileEntry] = [:]; var sampleDate: String? }
     struct Result {
         var today = Stats()
@@ -6181,9 +6192,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var usage = UsageData()
     private var refreshSchedule = RefreshSchedule()
     // 手动刷新在飞标记：手动请求可能排队等待在飞自动刷新（RefreshSchedule.active），
-    // 无法从闸门位派生（自动轮询也持有闸门），须显式跟踪；20s 兜底防网络悬挂导致按钮永久卡死
+    // 无法从闸门位派生（自动轮询也持有闸门），须显式跟踪；50s 兜底覆盖最坏 401 三步链并防网络悬挂导致按钮永久卡死
     private var manualRefreshInFlight = false
     private var manualRefreshReset: DispatchWorkItem?
+    private var panelNeedsRebuild = true
+    private var authUsesAPIKey = false
     private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠
     // （与 GlmUsage 的静默保留旧数据不同，这是刻意改进：过期数据必须可见）
@@ -6205,13 +6218,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastAttemptAt = Date()
     private let launchAgentLabel = "com.local.codex-usage"
     // 深浅主题切换重画（GlmUsage 同款）：菜单栏是彩色非模板图，不随系统明暗自动变色。
-    // setImage 也会再次触发 KVO 通知，用明暗主题快照去重防止 renderBar↔KVO 反馈循环。
+    // setImage 也会再次触发 KVO 通知，用明暗主题快照与渲染键去重防止 renderBar↔KVO 反馈循环与 5s 空转重画。
+    private struct RenderedBarKey: Equatable {
+        let dark: Bool
+        let appDark: Bool
+        let line1Label: String
+        let line1Value: String
+        let line2Label: String
+        let line2Value: String
+        let remaining5h: Int?
+        let remaining7d: Int?
+        let singleWindow: Bool
+        let toolTip: String
+    }
     private var statusItemAppearanceObs: NSKeyValueObservation?
     private var barThemeDark: Bool?
+    private var lastRenderedBarKey: RenderedBarKey?
     // 菜单栏可因深色壁纸、双屏或全屏而与 App 外观合法地不同，不能用 App 外观覆盖菜单栏。
-    // 每 5s 对账，不一致时仅重建不缓存的动态颜色图片，不切换 isVisible、不钉死绘制外观。
+    // 每 5s 对账，仅在渲染键变化时重建不缓存的动态颜色图片，不切换 isVisible、不钉死绘制外观。
     private var appearancePollTimer: Timer?
-    private let statusWriter = StatusSnapshotWriter { data in
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var wakeRefreshWork: DispatchWorkItem?
+    private var pathMonitor: NWPathMonitor?
+    private let pathMonitorQueue = DispatchQueue(label: "com.local.codex-usage.netpath", qos: .utility)
+    private var lastNetworkSatisfied: Bool?
+    private var lastNetworkInterfaces: [NWInterface.InterfaceType] = []
+    private var networkRecoveryWork: DispatchWorkItem?
+    private let statusWriter = StatusSnapshotWriter(volatileKeys: ["lastAttemptAt"], heartbeatInterval: 300) { data in
         let path = NSHomeDirectory() + "/Library/Application Support/CodexUsage/status.json"
         try AtomicJSONFile.replace(data, at: path)
     }
@@ -6273,14 +6306,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in self?.updateProgressDidChange() }
         refresh(manual: true)
         attachBarAppearanceObserver()
-        appearancePollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.reconcileBarAppearance()
-        }
-        appearancePollTimer?.tolerance = 1
-        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            self?.refresh()
-        }
-        timer?.tolerance = 3
+        startPeriodicTimers()
+        installLifecycleObservers()
+        startNetworkMonitor()
         // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 30 分钟；
         // 打开菜单也会触发一次（同一 interval 节流，不增加请求频率）
         updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateCheck.interval, repeats: true) { [weak self] _ in
@@ -6288,6 +6316,132 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         updateTimer?.tolerance = 60
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.checkForUpdate() }
+    }
+
+    private func startPeriodicTimers() {
+        if appearancePollTimer == nil {
+            let poll = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                self?.reconcileBarAppearance()
+            }
+            poll.tolerance = 1
+            appearancePollTimer = poll
+        }
+        if timer == nil {
+            let refreshTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+                self?.refresh()
+            }
+            refreshTimer.tolerance = 3
+            timer = refreshTimer
+        }
+    }
+
+    private func stopPeriodicTimers() {
+        appearancePollTimer?.invalidate()
+        appearancePollTimer = nil
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private var hasErrorOrStaleSource: Bool {
+        usage.quotaError != nil || usage.fiveHourError != nil || usage.sevenDayError != nil
+            || usage.resetCardsError != nil || usage.tiboError != nil || usage.officialError != nil
+            || fiveHourStale || sevenDayStale || resetCardsStale || tiboStale
+    }
+
+    private func installLifecycleObservers() {
+        guard !visualPreview else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        let onSleep: (Notification) -> Void = { [weak self] _ in
+            guard let self = self else { return }
+            self.stopPeriodicTimers()
+            self.wakeRefreshWork?.cancel()
+            self.wakeRefreshWork = nil
+            self.networkRecoveryWork?.cancel()
+            self.networkRecoveryWork = nil
+        }
+        let onWake: (Notification) -> Void = { [weak self] _ in
+            guard let self = self else { return }
+            self.startPeriodicTimers()
+            self.wakeRefreshWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                self.wakeRefreshWork = nil
+                self.refresh()
+            }
+            self.wakeRefreshWork = work
+            // 唤醒后等待 ~2s 让 Wi-Fi / DNS 就绪，避免白白消耗 5 分钟 .full 配额槽
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+        }
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main, using: onSleep))
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main, using: onSleep))
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main, using: onWake))
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main, using: onWake))
+    }
+
+    private func startNetworkMonitor() {
+        guard !visualPreview, pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            let interfaces = path.availableInterfaces.map(\.type)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                let previousSatisfied = self.lastNetworkSatisfied
+                let previousInterfaces = self.lastNetworkInterfaces
+                self.lastNetworkSatisfied = satisfied
+                self.lastNetworkInterfaces = interfaces
+                guard satisfied else { return }
+                let recovered = previousSatisfied == false
+                let interfaceChanged = previousSatisfied == true && interfaces != previousInterfaces
+                if recovered || (interfaceChanged && self.hasErrorOrStaleSource) {
+                    self.scheduleNetworkRecoveryRefresh(forceFull: self.hasErrorOrStaleSource)
+                }
+            }
+        }
+        monitor.start(queue: pathMonitorQueue)
+        pathMonitor = monitor
+    }
+
+    private func scheduleNetworkRecoveryRefresh(forceFull: Bool) {
+        networkRecoveryWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.networkRecoveryWork = nil
+            self.refresh(manual: false, forceFull: forceFull || self.hasErrorOrStaleSource)
+        }
+        networkRecoveryWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        stopPeriodicTimers()
+        updateTimer?.invalidate()
+        updateTimer = nil
+        manualRefreshReset?.cancel()
+        manualRefreshReset = nil
+        wakeRefreshWork?.cancel()
+        wakeRefreshWork = nil
+        networkRecoveryWork?.cancel()
+        networkRecoveryWork = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        statusItemAppearanceObs?.invalidate()
+        statusItemAppearanceObs = nil
+        if let obs = updateProgressObserver {
+            NotificationCenter.default.removeObserver(obs)
+            updateProgressObserver = nil
+        }
+        for obs in workspaceObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
+        workspaceObservers.removeAll()
+        panelHoverController?.setEnabled(false)
+        statusWriter.waitForWrites()
+        if let coordinator = quotaHistoryCoordinator {
+            let sem = DispatchSemaphore(value: 0)
+            coordinator.drain { sem.signal() }
+            _ = sem.wait(timeout: .now() + 2.0)
+        }
     }
 
     /// 本地视觉验收：固定数据、无网络/定时器，也不覆盖真实 status.json。
@@ -6616,7 +6770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 手动刷新在飞位：重入安全；active 时重新武装 20s 兜底复位（防网络悬挂卡死按钮）。
+    /// 手动刷新在飞位：重入安全；active 时重新武装 50s 兜底复位（覆盖最坏 401 三步请求链并防网络悬挂卡死按钮）。
     private func setManualRefreshInFlight(_ active: Bool) {
         manualRefreshReset?.cancel()
         manualRefreshReset = nil
@@ -6630,13 +6784,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.updateUI()
             }
             manualRefreshReset = reset
-            DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: reset)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 50, execute: reset)
         }
         if changed { updateUI() }
     }
 
     // 拉取数据：额度走网络（回调内含 401 兜底刷新），token 扫描与重置卡明细走每 5 分钟周期
-    private func refresh(manual: Bool = false) {
+    private func refresh(manual: Bool = false, forceFull: Bool = false) {
         guard !visualPreview else {
             // 预览演示态：手动刷新只走本地演示（不触网、不写盘）；自动轮询维持现状直接返回
             guard manual else { return }
@@ -6648,7 +6802,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        guard let work = refreshSchedule.request(manual: manual, now: Date()) else {
+        guard let work = refreshSchedule.request(manual: manual || forceFull, now: Date()) else {
             // 排队等待在飞自动刷新：手动请求仍计为在飞，footer 立即反映「刷新中…」
             if manual { setManualRefreshInFlight(true) }
             return
@@ -6657,26 +6811,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         performRefresh(work)
     }
 
+    private func applyOfficialResult(_ result: Result<OfficialUsageSnapshot, OfficialUsageReader.Failure>) {
+        switch result {
+        case .success(let snapshot): usage.official = snapshot; usage.officialError = nil
+        case .failure(.unavailable): usage.officialError = "网络不可用"
+        case .failure(.unsupported): usage.officialError = "当前账号或环境不支持"
+        case .failure(.timeout): usage.officialError = "查询超时"
+        case .failure(.invalid): usage.officialError = "查询失败"
+        case .failure(.unauthorized): usage.officialError = "账号认证失效，等待额度刷新后重试"
+        case .failure(.identityMismatch): usage.officialError = "无法确认账号一致"
+        }
+    }
+
     private func performRefresh(_ work: RefreshSchedule.Work) {
-        synchronizeAccount()
+        let initialLoaded = CodexAuth.loadWithMode()
+        let auth = synchronizeAccount(auth: initialLoaded)
         let generation = accountGeneration
         let identity = accountIdentity
-        let auth = CodexAuth.load()
-        guard CodexAuth.identity(auth) == identity else {
-            synchronizeAccount()
-            updateUI()
-            // 闸门真正释放才清手动在飞位；排队的手动刷新接手后仍在飞
-            if let next = refreshSchedule.finish() {
-                performRefresh(next)
-            } else {
-                setManualRefreshInFlight(false)
-            }
-            return
-        }
         lastAttemptAt = Date()
         updateUI()
         let group = DispatchGroup()
         let quotaRequestStartedAt = Date()
+        var officialNeedsRetryAfterRotation = false
+        var resetCardsNeedRetryAfterRotation = false
         group.enter()
         Fetcher.fetchQuota(auth: auth) { [weak self] r in
             DispatchQueue.main.async {
@@ -6711,15 +6868,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let result = OfficialUsageReader.read(expected: auth)
                 DispatchQueue.main.async {
                     if let self = self, self.acceptAccountResponse(generation: generation, identity: identity) {
-                        switch result {
-                        case .success(let snapshot): self.usage.official = snapshot; self.usage.officialError = nil
-                        case .failure(.unavailable): self.usage.officialError = "网络不可用"
-                        case .failure(.unsupported): self.usage.officialError = "当前账号或环境不支持"
-                        case .failure(.timeout): self.usage.officialError = "查询超时"
-                        case .failure(.invalid): self.usage.officialError = "查询失败"
-                        case .failure(.unauthorized): self.usage.officialError = "账号认证失效，等待额度刷新后重试"
-                        case .failure(.identityMismatch): self.usage.officialError = "无法确认账号一致"
-                        }
+                        self.applyOfficialResult(result)
+                        if case .failure(.unauthorized) = result { officialNeedsRetryAfterRotation = true }
+                        if case .failure(.identityMismatch) = result { officialNeedsRetryAfterRotation = true }
                     }
                     group.leave()
                 }
@@ -6730,6 +6881,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     if let self = self, self.acceptAccountResponse(generation: generation, identity: identity) {
                         self.applyResetCards(cards, err)
+                        if err == "HTTP 401" { resetCardsNeedRetryAfterRotation = true }
                     }
                     group.leave()
                 }
@@ -6745,21 +6897,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
-            // 各 apply 回调只更新数据，渲染统一在这里做一次：
-            // 菜单重建与 status.json 写入每轮刷新各一次，而不是每个数据源一次
-            self.updateUI()
-            // 闸门真正释放才清手动在飞位；排队的手动刷新接手后仍在飞
-            if let next = self.refreshSchedule.finish() {
-                self.performRefresh(next)
-            } else {
-                self.setManualRefreshInFlight(false)
+            if work == .full, (officialNeedsRetryAfterRotation || resetCardsNeedRetryAfterRotation),
+               let oldTokens = auth?.tokens {
+                let postLoaded = CodexAuth.loadWithMode()
+                if let rotatedAuth = postLoaded.snapshot,
+                   CodexAuth.identity(rotatedAuth) == identity,
+                   !CodexAuth.sameAuth(oldTokens, rotatedAuth.tokens),
+                   self.acceptAccountResponse(generation: generation, identity: identity, loaded: postLoaded) {
+                    // fetchQuota 触发了 401 凭据轮换：对并发失败的 .full 同伴补拉一次，避免 5 分钟内持续报错
+                    self.updateUI()
+                    let retryGroup = DispatchGroup()
+                    if officialNeedsRetryAfterRotation {
+                        retryGroup.enter()
+                        DispatchQueue.global(qos: .utility).async { [weak self] in
+                            let retryResult = OfficialUsageReader.read(expected: rotatedAuth)
+                            DispatchQueue.main.async {
+                                if let self = self, self.acceptAccountResponse(generation: generation, identity: identity) {
+                                    self.applyOfficialResult(retryResult)
+                                }
+                                retryGroup.leave()
+                            }
+                        }
+                    }
+                    if resetCardsNeedRetryAfterRotation {
+                        retryGroup.enter()
+                        Fetcher.fetchResetCards(auth: rotatedAuth) { [weak self] cards, err in
+                            DispatchQueue.main.async {
+                                if let self = self, self.acceptAccountResponse(generation: generation, identity: identity) {
+                                    self.applyResetCards(cards, err)
+                                }
+                                retryGroup.leave()
+                            }
+                        }
+                    }
+                    retryGroup.notify(queue: .main) { [weak self] in
+                        self?.finishRefreshCycle()
+                    }
+                    return
+                }
             }
+            self.finishRefreshCycle()
         }
     }
 
-    private func synchronizeAccount() {
-        let current = CodexAuth.identity(CodexAuth.load())
-        guard current != accountIdentity else { return }
+    private func finishRefreshCycle() {
+        // 各 apply 回调只更新数据，渲染统一在这里做一次：
+        // 菜单重建与 status.json 写入每轮刷新各一次，而不是每个数据源一次
+        updateUI()
+        // 闸门真正释放才清手动在飞位；排队的手动刷新接手后仍在飞
+        if let next = refreshSchedule.finish() {
+            performRefresh(next)
+        } else {
+            setManualRefreshInFlight(false)
+        }
+    }
+
+    /// 用卡后的定向刷新：只拉额度与重置卡明细（不重复触发本机磁盘/SQLite 全量扫描与 Tibo 请求）。
+    private func refreshQuotaAndResetCards() {
+        guard !visualPreview else { return }
+        let loaded = CodexAuth.loadWithMode()
+        let auth = synchronizeAccount(auth: loaded)
+        let generation = accountGeneration
+        let identity = accountIdentity
+        lastAttemptAt = Date()
+        let group = DispatchGroup()
+        let quotaRequestStartedAt = Date()
+        var resetCardsGot401 = false
+        group.enter()
+        Fetcher.fetchQuota(auth: auth) { [weak self] r in
+            DispatchQueue.main.async {
+                if let self = self, self.acceptAccountResponse(generation: generation, identity: identity) {
+                    self.applyQuota(r)
+                    if let identity = identity,
+                       let sample = QuotaHistoryAdapter.observation(r, requestStartedAt: quotaRequestStartedAt, observedAt: Date()) {
+                        self.quotaHistoryCoordinator?.observe(sample, identity: identity, generation: generation)
+                    }
+                }
+                group.leave()
+            }
+        }
+        group.enter()
+        Fetcher.fetchResetCards(auth: auth) { [weak self] cards, err in
+            DispatchQueue.main.async {
+                if let self = self, self.acceptAccountResponse(generation: generation, identity: identity) {
+                    self.applyResetCards(cards, err)
+                    if err == "HTTP 401" { resetCardsGot401 = true }
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { [weak self] in
+            guard let self = self else { return }
+            if resetCardsGot401, let oldTokens = auth?.tokens {
+                let postLoaded = CodexAuth.loadWithMode()
+                if let rotatedAuth = postLoaded.snapshot,
+                   CodexAuth.identity(rotatedAuth) == identity,
+                   !CodexAuth.sameAuth(oldTokens, rotatedAuth.tokens),
+                   self.acceptAccountResponse(generation: generation, identity: identity, loaded: postLoaded) {
+                    Fetcher.fetchResetCards(auth: rotatedAuth) { [weak self] cards, err in
+                        DispatchQueue.main.async {
+                            guard let self = self else { return }
+                            if self.acceptAccountResponse(generation: generation, identity: identity) {
+                                self.applyResetCards(cards, err)
+                            }
+                            self.updateUI()
+                        }
+                    }
+                    return
+                }
+            }
+            self.updateUI()
+        }
+    }
+
+    @discardableResult
+    private func synchronizeAccount(auth loaded: (snapshot: CodexAuth.Snapshot?, usesAPIKey: Bool)? = nil) -> CodexAuth.Snapshot? {
+        let resolved = loaded ?? CodexAuth.loadWithMode()
+        authUsesAPIKey = resolved.usesAPIKey
+        let current = CodexAuth.identity(resolved.snapshot)
+        guard current != accountIdentity else { return resolved.snapshot }
         accountIdentity = current
         accountGeneration += 1
         panelController.resetQuotaHistoryAccount()
@@ -6767,10 +7023,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quotaHistoryCoordinator?.activate(accountIdentity: current, generation: accountGeneration)
         AccountIsolation.clear(&usage)
         fiveHourLastOK = nil; sevenDayLastOK = nil; resetCardsLastOK = nil
+        return resolved.snapshot
     }
 
-    private func acceptAccountResponse(generation: Int, identity: String?) -> Bool {
-        synchronizeAccount()
+    private func acceptAccountResponse(generation: Int, identity: String?,
+                                       loaded: (snapshot: CodexAuth.Snapshot?, usesAPIKey: Bool)? = nil) -> Bool {
+        synchronizeAccount(auth: loaded)
         return AccountIsolation.accepts(capturedGeneration: generation, currentGeneration: accountGeneration,
                                         capturedIdentity: identity, currentIdentity: accountIdentity)
     }
@@ -6782,17 +7040,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func togglePanel() {
-        if panelController.isOpen {
+        switch panelHoverClickOutcome(isShown: panelController.isOpen,
+                                      presentedByHover: panelController.presentedByHover) {
+        case .present:
+            openPanel(byHover: false)
+        case .pin:
             // hover 打开且未固定：首次点击转常开（pin，防误关），移开鼠标不再自动收，不关闭
-            if panelController.presentedByHover {
-                panelController.presentedByHover = false
-                panelHoverController?.cancelPending()
-                return
-            }
+            panelController.presentedByHover = false
+            panelHoverController?.cancelPending()
+        case .close:
             panelController.close()
-            return
         }
-        openPanel(byHover: false)
     }
 
     /// 打开面板。hover 打开与点击打开共用「打开即最新」全路径（rebuildMenu + 刷新 + 更新检查），
@@ -6802,12 +7060,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 丢弃未决驻留 show：点开→立刻点关且指针未离开图标时，陈旧 show 定时器会
         // 在 ~0.05s 后带 hover 标记重开面板（对齐参照实现的已知边角，关闭路径须主动取消）
         panelHoverController?.cancelPending()
+        if !visualPreview {
+            synchronizeAccount()
+        }
         panelController.presentedByHover = byHover
-        rebuildMenu()
+        rebuildMenu(force: true)
         panelController.show(anchoredTo: button)
         if panelController.isOpen {
             refresh()
             checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
+        } else {
+            panelController.presentedByHover = false
         }
     }
 
@@ -7077,22 +7340,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 菜单栏图片 + toolTip 渲染，不写磁盘。供外观对账定时器（每 5s）直接调用。
+    /// 经 RenderedBarKey 去重：明暗、双行文案、剩余档位、单双窗或 toolTip 均未变化时直接跳过，
+    /// 避免深色壁纸/双屏等外观差异场景下每 5s 空转重建 NSImage。
     private func renderBarImage() {
         let fiveRemaining = Fmt.remaining(usage.fiveHour?.usedPercent)
         let sevenRemaining = Fmt.remaining(usage.sevenDay?.usedPercent)
-        let line1 = StackImage.Line(label: (fiveHourStale ? "⚠ 5H" : "5H"),
-                                    value: Fmt.remainingPct(usage.fiveHour?.usedPercent),
-                                    remaining: fiveRemaining)
-        let line2 = StackImage.Line(label: (sevenDayStale ? "⚠ 7D" : "7D"),
-                                    value: Fmt.remainingPct(usage.sevenDay?.usedPercent),
-                                    remaining: sevenRemaining)
-        let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
-        barThemeDark = isDark(appearance)
+        let line1Label = fiveHourStale ? "⚠ 5H" : "5H"
+        let line1Value = Fmt.remainingPct(usage.fiveHour?.usedPercent)
+        let line2Label = sevenDayStale ? "⚠ 7D" : "7D"
+        let line2Value = Fmt.remainingPct(usage.sevenDay?.usedPercent)
+        let barAppearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        let dark = isDark(barAppearance)
+        let appDark = isDark(NSApp.effectiveAppearance)
+        let toolTip = barToolTip()
+        let key = RenderedBarKey(
+            dark: dark,
+            appDark: appDark,
+            line1Label: line1Label,
+            line1Value: line1Value,
+            line2Label: line2Label,
+            line2Value: line2Value,
+            remaining5h: fiveRemaining,
+            remaining7d: sevenRemaining,
+            singleWindow: usage.fiveHourNotApplicable,
+            toolTip: toolTip
+        )
+        guard key != lastRenderedBarKey else { return }
+        lastRenderedBarKey = key
+        barThemeDark = dark
+        let line1 = StackImage.Line(label: line1Label, value: line1Value, remaining: fiveRemaining)
+        let line2 = StackImage.Line(label: line2Label, value: line2Value, remaining: sevenRemaining)
         statusItem.button?.image = usage.fiveHourNotApplicable
             ? StackImage.make(line1: line2, line2: nil) : StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
-        statusItem.button?.toolTip = barToolTip()
+        statusItem.button?.toolTip = toolTip
     }
 
     /// 完整渲染：图片 + toolTip + 写 status.json（内容去重，不变则跳过磁盘写）。
@@ -7155,9 +7437,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusWriter.submit(info)
     }
 
-    // 下拉面板（六卡片自上而下，见 docs/project/11-usage-insights-prd.md §3）：
-    // typed model 与网络/扫描数据在同一渲染入口组装
-    private func rebuildMenu() {
+    // 下拉面板（九卡片自上而下，见 AGENTS.md 与 docs/project/11-usage-insights-prd.md）：
+    // typed model 与网络/扫描数据在同一渲染入口组装；面板关闭时延迟构建至 openPanel(byHover:) 展开前。
+    private func rebuildMenu(force: Bool = false) {
+        if !visualPreview && !force && !panelController.isOpen {
+            panelNeedsRebuild = true
+            return
+        }
+        panelNeedsRebuild = false
         func notice(_ text: String, _ level: UsagePanelModel.NoticeLevel = .info) -> UsagePanelModel.Notice {
             UsagePanelModel.Notice(text: text, level: level)
         }
@@ -7390,7 +7677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let displayVersion = BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version
         let model = UsagePanelModel(
             updateItem: updateItem,
-            title: "Codex 用量", plan: (!visualPreview && CodexAuth.usesAPIKey()) ? "API Key" : (usage.planType ?? "Unknown"),
+            title: "Codex 用量", plan: (!visualPreview && authUsesAPIKey) ? "API Key" : (usage.planType ?? "Unknown"),
             email: usage.email,
             quotas: quotas,
             resetCards: resetSection,
@@ -7431,8 +7718,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginUseReset() {
         guard !visualPreview, !resetUseInFlight else { return }
-        synchronizeAccount()
-        guard let auth = CodexAuth.load(), let identity = CodexAuth.identity(auth),
+        let initialLoaded = CodexAuth.loadWithMode()
+        guard let initialAuth = synchronizeAccount(auth: initialLoaded),
+              let identity = CodexAuth.identity(initialAuth),
               identity == accountIdentity, identity.hasPrefix("account:") else {
             panelController.setUpdateMessage("无法确认当前账户，请重新登录后再试", dismissAfter: 5); return
         }
@@ -7465,31 +7753,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: pending == nil ? "使用" : "核对")
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        // Confirmation may have been open while the user switched accounts.
-        guard CodexAuth.identity(CodexAuth.load()) == identity else {
-            synchronizeAccount(); updateUI(); return
+        // Confirmation may have been open while the user switched accounts or Codex CLI rotated tokens.
+        let postModalLoaded = CodexAuth.loadWithMode()
+        guard let freshAuth = postModalLoaded.snapshot, CodexAuth.identity(freshAuth) == identity else {
+            synchronizeAccount(auth: postModalLoaded); updateUI(); return
         }
-        let requestedAt: Date? = pending == nil ? Date() : pending?["createdAt"] as? Date
+        let now = Date()
+        let requestedAt: Date? = pending == nil ? now : pending?["createdAt"] as? Date
         let baselineID = pending == nil ? quotaHistorySnapshot.state.current?.id :
             (pending?["baselineCycleID"] as? String).flatMap(UUID.init(uuidString:))
         if pending == nil {
-            var values: [String: Any] = ["identity": identity, "cardID": cardID, "key": key, "createdAt": requestedAt!]
+            var values: [String: Any] = ["identity": identity, "cardID": cardID, "key": key, "createdAt": now]
             if let baselineID = baselineID { values["baselineCycleID"] = baselineID.uuidString }
             defaults.set(values, forKey: pendingResetKey)
-            guard defaults.synchronize() else {
-                panelController.setUpdateMessage("无法保存请求状态，未使用重置卡", dismissAfter: 7); return
-            }
         }
         let operationHash = QuotaCycleCoordinator.operationHash(key)
         let operationGeneration = accountGeneration
         if pending == nil {
             quotaHistoryCoordinator?.recordRedemption(QuotaRedemptionEvidence(operationHash: operationHash,
-                originalRequestedAt: requestedAt, responseAt: requestedAt!, status: .requested,
+                originalRequestedAt: requestedAt, responseAt: now, status: .requested,
                 baselineCycleID: baselineID), identity: identity, generation: operationGeneration)
         }
         resetUseInFlight = true
         rebuildMenu()
-        Fetcher.useResetCard(auth: auth, cardID: cardID, key: key) { [weak self] result in
+        Fetcher.useResetCard(auth: freshAuth, cardID: cardID, key: key) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.resetUseInFlight = false
@@ -7504,7 +7791,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.quotaHistoryCoordinator?.recordRedemption(QuotaRedemptionEvidence(operationHash: operationHash,
                     originalRequestedAt: requestedAt, responseAt: Date(), status: status,
                     baselineCycleID: baselineID), identity: identity, generation: operationGeneration)
-                if result != .unknown { defaults.removeObject(forKey: self.pendingResetKey); defaults.synchronize() }
+                if result != .unknown { defaults.removeObject(forKey: self.pendingResetKey) }
                 let message: String
                 switch result {
                 case .success, .alreadyRedeemed: message = "重置卡已使用，正在刷新额度"
@@ -7521,10 +7808,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.panelController.setUpdateMessage(message, dismissAfter: result == .unknown ? 15 : 6)
                 }
                 self.updateUI()
-                self.refresh(manual: true)
+                self.refreshQuotaAndResetCards()
                 if result.acknowledgesRedemption {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                        self?.refresh(manual: true)
+                        self?.refreshQuotaAndResetCards()
                     }
                 }
             }
@@ -7611,35 +7898,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSHomeDirectory() + "/Library/LaunchAgents/\(launchAgentLabel).plist"
     }
 
+    static func isLaunchAgentEnabled(plistPath: String, executablePath: String?) -> Bool {
+        guard FileManager.default.fileExists(atPath: plistPath) else { return false }
+        guard let execPath = executablePath, !execPath.isEmpty else { return true }
+        guard let data = FileManager.default.contents(atPath: plistPath),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            return true
+        }
+        guard let args = plist["ProgramArguments"] as? [String], let first = args.first, !first.isEmpty else {
+            return false
+        }
+        let currentStd = URL(fileURLWithPath: execPath).standardizedFileURL.path
+        let plistStd = URL(fileURLWithPath: first).standardizedFileURL.path
+        return plistStd == currentStd
+    }
+
     private func isLoginItemEnabled() -> Bool {
-        FileManager.default.fileExists(atPath: launchAgentPath)
+        Self.isLaunchAgentEnabled(plistPath: launchAgentPath, executablePath: Bundle.main.executablePath)
     }
 
     /// LaunchAgent plist 模板（update.sh 以 plist 存在与否为自启偏好、ProgramArguments:0
     /// 为安装位置契约）：RunAtLoad 登录拉起；KeepAlive 仅在非正常退出（崩溃/被 kill）时
     /// 重启——菜单「退出」走 exit 0，launchd 不复活进程。
+    /// 使用 PropertyListSerialization 生成合法 XML，确保路径中 `&` / `<` / `>` 等特殊字符安全转义。
     static func launchAgentPlistContent(label: String, executablePath: String) -> String {
-        """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>Label</key><string>\(label)</string>
-            <key>ProgramArguments</key>
-            <array><string>\(executablePath)</string></array>
-            <key>RunAtLoad</key><true/>
-            <key>KeepAlive</key>
-            <dict><key>SuccessfulExit</key><false/></dict>
-        </dict>
-        </plist>
-        """
+        let plist: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [executablePath],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false]
+        ]
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0),
+              let xml = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return xml
+    }
+
+    static func launchctlProgramPath(from output: String) -> String? {
+        for rawLine in output.split(whereSeparator: \.isNewline) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("program") else { continue }
+            let rest = trimmed.dropFirst("program".count).trimmingCharacters(in: .whitespaces)
+            guard rest.hasPrefix("=") else { continue }
+            let value = rest.dropFirst().trimmingCharacters(in: .whitespaces)
+            if !value.isEmpty { return value }
+        }
+        return nil
+    }
+
+    private func writeLaunchAgentPlist(executablePath: String) throws {
+        let dir = (launchAgentPath as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let content = Self.launchAgentPlistContent(label: launchAgentLabel, executablePath: executablePath)
+        guard !content.isEmpty else {
+            throw NSError(domain: "CodexUsage.LaunchAgent", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "无法序列化 LaunchAgent 配置"])
+        }
+        try content.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+    }
+
+    private func bootoutLaunchAgentIfOwned(executablePath: String) {
+        let target = "gui/\(getuid())/\(launchAgentLabel)"
+        let expectedStd = URL(fileURLWithPath: executablePath).standardizedFileURL.path
+        DispatchQueue.global(qos: .utility).async {
+            let inspect = Process()
+            inspect.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            inspect.arguments = ["print", target]
+            let pipe = Pipe()
+            inspect.standardOutput = pipe
+            inspect.standardError = FileHandle.nullDevice
+            do {
+                try inspect.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                inspect.waitUntilExit()
+                guard inspect.terminationStatus == 0,
+                      let output = String(data: data, encoding: .utf8),
+                      let loadedProgram = Self.launchctlProgramPath(from: output) else { return }
+                let loadedStd = URL(fileURLWithPath: loadedProgram).standardizedFileURL.path
+                guard loadedStd == expectedStd else { return }
+                let bootout = Process()
+                bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                bootout.arguments = ["bootout", target]
+                bootout.standardOutput = FileHandle.nullDevice
+                bootout.standardError = FileHandle.nullDevice
+                try bootout.run()
+                bootout.waitUntilExit()
+            } catch {
+                NSLog("[CodexUsage] launchctl bootout skipped: %@", error.localizedDescription)
+            }
+        }
     }
 
     @objc private func onToggleLogin() {
         guard !visualPreview else { return }
         if isLoginItemEnabled() {
-            try? FileManager.default.removeItem(atPath: launchAgentPath)
-            LaunchAtLoginPreference.save(false)   // 显式关闭：阻止下次启动按默认开自动装回
+            do {
+                try FileManager.default.removeItem(atPath: launchAgentPath)
+                LaunchAtLoginPreference.save(false)   // 显式关闭：阻止下次启动按默认开自动装回
+                if let execPath = Bundle.main.executablePath, !execPath.isEmpty {
+                    bootoutLaunchAgentIfOwned(executablePath: execPath)
+                }
+            } catch {
+                NSLog("[CodexUsage] Failed to remove LaunchAgent plist at %@: %@", launchAgentPath, error.localizedDescription)
+                let alert = NSAlert()
+                alert.messageText = "关闭开机自启失败"
+                alert.informativeText = "无法移除 LaunchAgent 配置文件，请检查「~/Library/LaunchAgents」目录权限。\n\n\(error.localizedDescription)"
+                alert.addButton(withTitle: "好")
+                alert.runModal()
+            }
         } else {
             // Translocation 下可执行文件位于只读临时挂载：写进 plist 重启后指向失效路径，
             // 与更新同款拦截，提示先安装到「应用程序」再开启
@@ -7652,9 +8019,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 updateUI()
                 return
             }
+            guard let execPath = Bundle.main.executablePath, !execPath.isEmpty else {
+                NSLog("[CodexUsage] Cannot enable LaunchAgent: empty executablePath")
+                let alert = NSAlert()
+                alert.messageText = "开启开机自启失败"
+                alert.informativeText = "无法确定当前应用可执行文件路径。"
+                alert.addButton(withTitle: "好")
+                alert.runModal()
+                updateUI()
+                return
+            }
             do {
-                try Self.launchAgentPlistContent(label: launchAgentLabel, executablePath: Bundle.main.executablePath ?? "")
-                    .write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+                try writeLaunchAgentPlist(executablePath: execPath)
                 LaunchAtLoginPreference.save(true)
             } catch {
                 NSLog("[CodexUsage] Failed to write LaunchAgent plist at %@: %@", launchAgentPath, error.localizedDescription)
@@ -7673,10 +8049,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 「应用程序」后下次启动补装；写失败仅记日志，不打扰启动流程。
     private func ensureLoginItemDefaultEnabled() {
         guard !visualPreview, LaunchAtLoginPreference.explicitValue() != false,
-              !isLoginItemEnabled(), !isTranslocated else { return }
+              !FileManager.default.fileExists(atPath: launchAgentPath), !isTranslocated,
+              let execPath = Bundle.main.executablePath, !execPath.isEmpty else { return }
         do {
-            try Self.launchAgentPlistContent(label: launchAgentLabel, executablePath: Bundle.main.executablePath ?? "")
-                .write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+            try writeLaunchAgentPlist(executablePath: execPath)
             NSLog("[CodexUsage] LaunchAgent installed (default-on, no explicit opt-out)")
         } catch {
             NSLog("[CodexUsage] LaunchAgent default-on install failed: %@", error.localizedDescription)
@@ -7705,20 +8081,62 @@ enum LaunchAtLoginPreference {
 // MARK: - 入口（支持 --once 命令行自检）
 
 final class ProfileFixtureProtocol: URLProtocol {
-    static var status = 200
-    static var body = Data()
-    static var delay: TimeInterval = 0
+    private static let lock = NSLock()
+    private static var _status = 200
+    private static var _body = Data()
+    private static var _delay: TimeInterval = 0
+
+    static var status: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _status }
+        set { lock.lock(); _status = newValue; lock.unlock() }
+    }
+    static var body: Data {
+        get { lock.lock(); defer { lock.unlock() }; return _body }
+        set { lock.lock(); _body = newValue; lock.unlock() }
+    }
+    static var delay: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return _delay }
+        set { lock.lock(); _delay = newValue; lock.unlock() }
+    }
+
+    private let stateLock = NSLock()
+    private var cancelled = false
+
+    private func isCancelled() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return cancelled
+    }
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        let status = Self.status, body = Self.body, delay = Self.delay
-        if delay > 0 { Thread.sleep(forTimeInterval: delay) }
-        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+        Self.lock.lock()
+        let status = Self._status, body = Self._body, delay = Self._delay
+        Self.lock.unlock()
+        if delay > 0 {
+            let deadline = Date().addingTimeInterval(delay)
+            while Date() < deadline {
+                if isCancelled() { return }
+                Thread.sleep(forTimeInterval: min(0.01, max(0, deadline.timeIntervalSinceNow)))
+            }
+        }
+        guard !isCancelled() else { return }
+        guard let url = request.url,
+              let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil) else {
+            client?.urlProtocol(self, didFailWithError: NSError(domain: "ProfileFixture", code: 1))
+            return
+        }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        guard !isCancelled() else { return }
         client?.urlProtocol(self, didLoad: body)
+        guard !isCancelled() else { return }
         client?.urlProtocolDidFinishLoading(self)
     }
-    override func stopLoading() {}
+    override func stopLoading() {
+        stateLock.lock()
+        cancelled = true
+        stateLock.unlock()
+    }
 }
 
 final class FetcherFixtureProtocol: URLProtocol {
@@ -9404,11 +9822,14 @@ enum CodexOfflineRegression {
             try expect(LaunchAtLoginPreference.explicitValue(from: loginStore) == true, "显式开启须如实读取")
             let loginPlist = AppDelegate.launchAgentPlistContent(label: "com.local.codex-usage",
                 executablePath: "/tmp/fake/CodexUsage.app/Contents/MacOS/CodexUsage")
-            try expect(loginPlist.contains("<key>Label</key><string>com.local.codex-usage</string>")
-                && loginPlist.contains("<key>RunAtLoad</key><true/>")
-                && loginPlist.contains("/tmp/fake/CodexUsage.app/Contents/MacOS/CodexUsage"),
+            let parsedLoginPlist = try PropertyListSerialization.propertyList(
+                from: Data(loginPlist.utf8), options: [], format: nil) as? [String: Any]
+            let parsedKeepAlive = parsedLoginPlist?["KeepAlive"] as? [String: Any]
+            try expect(parsedLoginPlist?["Label"] as? String == "com.local.codex-usage"
+                && parsedLoginPlist?["RunAtLoad"] as? Bool == true
+                && (parsedLoginPlist?["ProgramArguments"] as? [String]) == ["/tmp/fake/CodexUsage.app/Contents/MacOS/CodexUsage"],
                 "LaunchAgent plist 模板须携带 label、RunAtLoad 与可执行路径（update.sh 契约）")
-            try expect(loginPlist.contains("SuccessfulExit"), "KeepAlive SuccessfulExit 限定仅异常退出复活")
+            try expect(parsedKeepAlive?["SuccessfulExit"] as? Bool == false, "KeepAlive SuccessfulExit 限定仅异常退出复活")
 
             // ── Batch 1 稳定性与性能回归测试（全离线，使用临时目录与假凭据） ──
             do {
@@ -9817,7 +10238,77 @@ enum CodexOfflineRegression {
                            "TokenBucketRow with short columnTitles failed safely")
             }
 
-            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/per-model attribution/model switching/.zst archives/real-frame decode/tail-read, external usage model/parse/per-model scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist, panel card layout/normalize/persist-fallback, token value transition, panel visuals geometry/symbols, panel hover geometry/intent/click-outcome/preference, login-item preference/plist template, batch1 stability/perf/security regressions, batch2 ui/updater/a11y regressions)")
+            // Batch 3 生命周期、磁盘 I/O、LaunchAgent 与面板状态不变式离线回归：
+            do {
+                // 1) launchAgentPlistContent 对 XML 特殊字符（& / < / >）安全转义并可 PropertyListSerialization 往返解析
+                let specialExec = "/Applications/R&D <Test>/CodexUsage.app/Contents/MacOS/CodexUsage"
+                let specialPlist = AppDelegate.launchAgentPlistContent(label: "com.local.codex-usage", executablePath: specialExec)
+                try expect(specialPlist.contains("&amp;") && specialPlist.contains("&lt;") && specialPlist.contains("&gt;"),
+                           "launchAgentPlistContent did not XML-escape special characters")
+                let roundTripped = try PropertyListSerialization.propertyList(
+                    from: Data(specialPlist.utf8), options: [], format: nil) as? [String: Any]
+                let rtKeepAlive = roundTripped?["KeepAlive"] as? [String: Any]
+                try expect(roundTripped?["Label"] as? String == "com.local.codex-usage"
+                           && (roundTripped?["ProgramArguments"] as? [String]) == [specialExec]
+                           && roundTripped?["RunAtLoad"] as? Bool == true
+                           && rtKeepAlive?["SuccessfulExit"] as? Bool == false,
+                           "launchAgentPlistContent round-trip mismatch")
+
+                // 2) isLaunchAgentEnabled 路径校验与 launchctlProgramPath 解析
+                let agentPlistPath = root.path + "/com.local.codex-usage.plist"
+                try expect(!AppDelegate.isLaunchAgentEnabled(plistPath: agentPlistPath, executablePath: specialExec),
+                           "missing plist should report disabled")
+                try specialPlist.write(toFile: agentPlistPath, atomically: true, encoding: .utf8)
+                try expect(AppDelegate.isLaunchAgentEnabled(plistPath: agentPlistPath, executablePath: specialExec),
+                           "matching plist should report enabled")
+                try expect(!AppDelegate.isLaunchAgentEnabled(plistPath: agentPlistPath, executablePath: "/Applications/Other/CodexUsage"),
+                           "mismatched ProgramArguments[0] should report disabled")
+                try Data("not-a-plist".utf8).write(to: URL(fileURLWithPath: agentPlistPath))
+                try expect(AppDelegate.isLaunchAgentEnabled(plistPath: agentPlistPath, executablePath: specialExec),
+                           "unreadable existing plist should fall back to enabled")
+                let samplePrint = "gui/501/com.local.codex-usage = {\n\tstate = running\n\tprogram = /Applications/CodexUsage.app/Contents/MacOS/CodexUsage\n}\n"
+                try expect(AppDelegate.launchctlProgramPath(from: samplePrint) == "/Applications/CodexUsage.app/Contents/MacOS/CodexUsage",
+                           "launchctlProgramPath failed to parse program line")
+                try expect(AppDelegate.launchctlProgramPath(from: "gui/501/x = {\n\tstate = waiting\n}\n") == nil,
+                           "launchctlProgramPath falsely matched missing program")
+
+                // 3) CodexAuth.loadWithMode 单次读盘与 load/usesAPIKey 一致性
+                let oauthPath = root.path + "/mode-oauth.json"
+                try Data("{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"tok-1\",\"account_id\":\"acct-1\"}}".utf8)
+                    .write(to: URL(fileURLWithPath: oauthPath))
+                let oauthMode = CodexAuth.loadWithMode(at: oauthPath)
+                try expect(oauthMode.snapshot?.tokens.accessToken == "tok-1" && !oauthMode.usesAPIKey,
+                           "loadWithMode failed for chatgpt oauth auth")
+                let explicitKeyPath = root.path + "/mode-apikey.json"
+                try Data("{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"sk-1\",\"tokens\":{\"access_token\":\"stale\"}}".utf8)
+                    .write(to: URL(fileURLWithPath: explicitKeyPath))
+                let explicitKeyMode = CodexAuth.loadWithMode(at: explicitKeyPath)
+                try expect(explicitKeyMode.snapshot == nil && explicitKeyMode.usesAPIKey,
+                           "loadWithMode failed for explicit apikey auth")
+                let legacyKeyPath = root.path + "/mode-legacy-key.json"
+                try Data("{\"OPENAI_API_KEY\":\"sk-legacy\"}".utf8).write(to: URL(fileURLWithPath: legacyKeyPath))
+                let legacyKeyMode = CodexAuth.loadWithMode(at: legacyKeyPath)
+                try expect(legacyKeyMode.snapshot == nil && legacyKeyMode.usesAPIKey,
+                           "loadWithMode failed for legacy OPENAI_API_KEY auth")
+                let missingMode = CodexAuth.loadWithMode(at: root.path + "/does-not-exist.json")
+                try expect(missingMode.snapshot == nil && !missingMode.usesAPIKey,
+                           "loadWithMode failed for missing file")
+
+                // 4) panelHoverClickOutcome 与 openPanel 失败回滚状态不变式
+                try expect(panelHoverClickOutcome(isShown: false, presentedByHover: true) == .present,
+                           "closed panel must present even if stale hover flag was true")
+                let detachedController = UsagePanelController()
+                let detachedButton = NSStatusBarButton(frame: NSRect(x: 0, y: 0, width: 20, height: 20))
+                detachedController.presentedByHover = true
+                detachedController.show(anchoredTo: detachedButton)
+                if !detachedController.isOpen {
+                    detachedController.presentedByHover = false
+                }
+                try expect(!detachedController.isOpen && !detachedController.presentedByHover,
+                           "detached status button show must not leave panel open or presentedByHover stuck true")
+            }
+
+            print("CodexUsage --self-test: PASS (strict/partial quota parsing, independent freshness, menu bar color tiers/light-dark images, card expiry, tibo reset parsing/display/merge, token scan windows/per-model attribution/model switching/.zst archives/real-frame decode/tail-read, external usage model/parse/per-model scan/hermes-diff/failure-surface/7-30-calendar-day windows, refresh gate/schedule, temp auth merge/permissions/failure, update check release version compare/assets, tibo link scheme allowlist, panel card layout/normalize/persist-fallback, token value transition, panel visuals geometry/symbols, panel hover geometry/intent/click-outcome/preference, login-item preference/plist template, batch1 stability/perf/security regressions, batch2 ui/updater/a11y regressions, batch3 lifecycle/io/launchagent regressions)")
             return 0
         } catch {
             fputs("CodexUsage --self-test: FAIL: \(error)\n", stderr)

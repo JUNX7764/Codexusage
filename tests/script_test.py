@@ -679,7 +679,9 @@ echo "build" >> "$MOCK_LOG"
         self.assertNotIn("lastBarNudge", source)
         self.assertIn("img.cacheMode = .never", source)
         render_bar = source.split("private func renderBar() {", 1)[1].split("\n    }", 1)[0]
+        render_bar_image = source.split("private func renderBarImage() {", 1)[1].split("\n    }", 1)[0]
         self.assertNotIn("appearance:", render_bar)
+        self.assertNotIn("appearance:", render_bar_image)
 
     def test_codesign_failure_blocks_build(self):
         self._mock("lipo", r'''
@@ -692,11 +694,13 @@ exit 2
 ''')
         project = self.base / "build-project"
         (project / "scripts").mkdir(parents=True)
+        (project / "vendor").mkdir(parents=True)
         shutil.copy2(BUILD, project / "build.sh")
         shutil.copy2(ROOT / "Info.plist", project / "Info.plist")
         shutil.copy2(ROOT / "AppIcon.icns", project / "AppIcon.icns")
         shutil.copy2(UPDATE, project / "scripts" / "update.sh")
-        shutil.copytree(ROOT / "vendor", project / "vendor")
+        shutil.copy2(ROOT / "vendor" / "zstd_bridge.h", project / "vendor" / "zstd_bridge.h")
+        (project / "vendor" / "zstd_bridge.c").write_text("int codex_zstd_stub(void) { return 0; }\n")
         (project / f"{EXECUTABLE}.swift").write_text("// swiftc is mocked\n")
         result = subprocess.run(
             ["bash", str(project / "build.sh")], cwd=project,
