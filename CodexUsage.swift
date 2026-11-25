@@ -1282,8 +1282,10 @@ enum TokenScanner {
                         && e.device == statDevice && e.inode == statInode {
                         continue
                     }
-                    // 未变化缓存文件仅凭 stat 跳过，避免每 5 分钟对数百个历史文件做 open+fstat+pread+close
-                    if e.size == statSize && e.mtime == statMtime
+                    // 非活跃历史文件（24h 内未修改）仅凭 stat 跳过，避免每 5 分钟对数百个历史文件做 open+fstat+pread+close；
+                    // 近 24h 活跃文件仍执行下方 boundary pread，确保同大小同 mtime 原地覆写也能被捕获。
+                    let isInactive = statMtime > 0 && abs(now.timeIntervalSince1970 - statMtime) >= 86400
+                    if isInactive && e.size == statSize && e.mtime == statMtime
                         && e.device == statDevice && e.inode == statInode
                         && (e.boundary != nil || (!compressed && e.offset == 0)) {
                         continue
@@ -1918,7 +1920,7 @@ enum ExternalTokenScanner {
             hermes.daysByModel = hermes.daysByModel.filter { $0.key >= cutoffKey && $0.key <= maxKeepKey }
             st.hermes = hermes
         }
-        let files = scanFiles(roots: roots, cutoff: cutoff, cutoffKey: cutoffKey, maxKeepKey: maxKeepKey,
+        let files = scanFiles(roots: roots, now: now, cutoff: cutoff, cutoffKey: cutoffKey, maxKeepKey: maxKeepKey,
                               pathCache: &pathCache, into: &st)
         var hermesOK: Bool?   // nil = 未安装（state.db 不存在），不算失败
         if let db = hermesDB, FileManager.default.fileExists(atPath: db) {
@@ -2052,7 +2054,7 @@ enum ExternalTokenScanner {
     /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
     /// 已被删除的文件从状态中剔除（枚举失败的 root 不动，避免目录临时不可用时误清）。
     /// 返回 (已安装 root 数, 成功枚举 root 数)：目录不存在 = 未安装，不计入失败面。
-    private static func scanFiles(roots: [String], cutoff: Date, cutoffKey: String, maxKeepKey: String,
+    private static func scanFiles(roots: [String], now: Date, cutoff: Date, cutoffKey: String, maxKeepKey: String,
                                   pathCache: inout [String: String],
                                   into st: inout State) -> (installed: Int, enumerated: Int, status: [String: UsageSourceStatus]) {
         var seen = Set<String>()
@@ -2101,11 +2103,13 @@ enum ExternalTokenScanner {
                     st.files[path] = fs
                     continue
                 }
-                // 冷文件（超过 31 天无改动且无窗口内日桶）或未变化缓存文件：仅凭 stat 跳过，零 open
+                // 冷文件（超过 31 天无改动且无窗口内日桶）或非活跃历史文件（24h 内未修改）：仅凭 stat 跳过，零 open；
+                // 近 24h 活跃文件仍执行下方 boundaryHash 校验，防止同大小同 mtime 原地覆写漏检。
                 if fs.offset == sizeU, fs.mtime == mtimeU, fs.device == statDev, fs.inode == statIno {
                     let isCold = fs.days.isEmpty && fs.daysByModel.isEmpty
                         && mtimeU > 0 && Date(timeIntervalSince1970: mtimeU) < cutoff
-                    if isCold || fs.offset == 0 || fs.boundary != nil {
+                    let isInactive = mtimeU > 0 && abs(now.timeIntervalSince1970 - mtimeU) >= 86400
+                    if isCold || (isInactive && (fs.offset == 0 || fs.boundary != nil)) {
                         continue
                     }
                 }
@@ -2752,7 +2756,7 @@ final class UpdateProgressController: NSObject {
     private var timer: Timer?
     private var directory: URL?
     private var process: Process?
-    private var startedAt: Date?
+    private var startedAtUptime: TimeInterval?
 
     func start(script: String, targetTag: String, appPath: String) {
         guard !isActive else { return }   // 进度行已替换按钮，这里再兜底防重入
@@ -2800,7 +2804,7 @@ final class UpdateProgressController: NSObject {
             }
             try launch.run()
             process = launch
-            startedAt = Date()
+            startedAtUptime = ProcessInfo.processInfo.systemUptime
             let pollTimer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.refresh() }
             RunLoop.main.add(pollTimer, forMode: .common)
             timer = pollTimer
@@ -2881,7 +2885,7 @@ final class UpdateProgressController: NSObject {
             guard !code.isEmpty else { return }   // result 尚未写完整，下轮再读
             timer?.invalidate(); timer = nil
             process = nil
-            startedAt = nil
+            startedAtUptime = nil
             if code == "0" {
                 // 正常路径下旧进程已被脚本替换重启，走不到这里；兜底停止轮询
                 directory = nil
@@ -2897,7 +2901,7 @@ final class UpdateProgressController: NSObject {
             }
             return
         }
-        if let startedAt = startedAt, Date().timeIntervalSince(startedAt) >= Self.safetyTimeout {
+        if let startedAt = startedAtUptime, ProcessInfo.processInfo.systemUptime - startedAt >= Self.safetyTimeout {
             finishError("更新超时，请检查网络或查看日志后重试。")
         }
     }
@@ -2905,7 +2909,7 @@ final class UpdateProgressController: NSObject {
     private func finishError(_ detail: String) {
         timer?.invalidate(); timer = nil
         process = nil
-        startedAt = nil
+        startedAtUptime = nil
         phase = .failed
         notify()   // 先恢复面板里的更新按钮，再模态弹窗
         NSApp.activate(ignoringOtherApps: true)
@@ -3073,6 +3077,16 @@ final class UpdateChecker {
     private(set) var availableTag: String?
     private(set) var releaseNotes = ""
     private static let failureCooldown: TimeInterval = 60
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 25
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        config.urlCache = nil
+        return URLSession(configuration: config)
+    }()
     private var etag: String?
     private var lastCheck: Date?
     private var lastFailure: Date?
@@ -3106,7 +3120,7 @@ final class UpdateChecker {
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("CodexUsage/1.0 (menubar; update check)", forHTTPHeaderField: "User-Agent")
         if let etag = etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+        Self.session.dataTask(with: req) { [weak self] data, resp, err in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.inFlight = false
@@ -3369,9 +3383,9 @@ private enum PanelUI {
 
     static func addFullWidth(_ view: NSView, to stack: NSStackView) {
         stack.addArrangedSubview(view)
-        if !(stack.orientation == .vertical && stack.alignment == .width) {
-            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        }
+        // NSStackView.alignment = .width 内部约束仅 defaultHigh(750)，
+        // 对高 hugging 按钮/行视图仍须显式 required 宽度约束保证撑满。
+        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
     }
 
     static func pin(_ view: NSView, to container: NSView) {
@@ -6238,6 +6252,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 每 5s 对账，仅在渲染键变化时重建不缓存的动态颜色图片，不切换 isVisible、不钉死绘制外观。
     private var appearancePollTimer: Timer?
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var systemAsleep = false
+    private var screenAsleep = false
     private var wakeRefreshWork: DispatchWorkItem?
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.local.codex-usage.netpath", qos: .utility)
@@ -6343,39 +6359,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var hasErrorOrStaleSource: Bool {
-        usage.quotaError != nil || usage.fiveHourError != nil || usage.sevenDayError != nil
+        let officialStale = usage.official.map {
+            Date().timeIntervalSince($0.fetchedAt) > UsageFreshness.staleSeconds
+        } ?? false
+        return usage.quotaError != nil || usage.fiveHourError != nil || usage.sevenDayError != nil
             || usage.resetCardsError != nil || usage.tiboError != nil || usage.officialError != nil
-            || fiveHourStale || sevenDayStale || resetCardsStale || tiboStale
+            || fiveHourStale || sevenDayStale || resetCardsStale || tiboStale || officialStale
     }
 
     private func installLifecycleObservers() {
         guard !visualPreview else { return }
         let center = NSWorkspace.shared.notificationCenter
-        let onSleep: (Notification) -> Void = { [weak self] _ in
-            guard let self = self else { return }
-            self.stopPeriodicTimers()
-            self.wakeRefreshWork?.cancel()
-            self.wakeRefreshWork = nil
-            self.networkRecoveryWork?.cancel()
-            self.networkRecoveryWork = nil
+        func pauseForSleep() {
+            stopPeriodicTimers()
+            wakeRefreshWork?.cancel()
+            wakeRefreshWork = nil
+            networkRecoveryWork?.cancel()
+            networkRecoveryWork = nil
         }
-        let onWake: (Notification) -> Void = { [weak self] _ in
-            guard let self = self else { return }
-            self.startPeriodicTimers()
-            self.wakeRefreshWork?.cancel()
+        func resumeAfterWake() {
+            startPeriodicTimers()
+            wakeRefreshWork?.cancel()
             let work = DispatchWorkItem { [weak self] in
-                guard let self = self else { return }
+                guard let self = self, !self.systemAsleep, !self.screenAsleep else { return }
                 self.wakeRefreshWork = nil
                 self.refresh()
             }
-            self.wakeRefreshWork = work
+            wakeRefreshWork = work
             // 唤醒后等待 ~2s 让 Wi-Fi / DNS 就绪，避免白白消耗 5 分钟 .full 配额槽
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
         }
-        workspaceObservers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main, using: onSleep))
-        workspaceObservers.append(center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main, using: onSleep))
-        workspaceObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main, using: onWake))
-        workspaceObservers.append(center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main, using: onWake))
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.systemAsleep = true
+            pauseForSleep()
+        })
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.screenAsleep = true
+            pauseForSleep()
+        })
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.systemAsleep = false
+            // Dark Wake / Power Nap 期间屏幕仍熄灭：不重启 5s/10s 轮询定时器
+            guard !self.screenAsleep else { return }
+            resumeAfterWake()
+        })
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.screenAsleep = false
+            self.systemAsleep = false
+            resumeAfterWake()
+        })
     }
 
     private func startNetworkMonitor() {
@@ -6390,7 +6426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let previousInterfaces = self.lastNetworkInterfaces
                 self.lastNetworkSatisfied = satisfied
                 self.lastNetworkInterfaces = interfaces
-                guard satisfied else { return }
+                guard satisfied, !self.screenAsleep, !self.systemAsleep else { return }
                 let recovered = previousSatisfied == false
                 let interfaceChanged = previousSatisfied == true && interfaces != previousInterfaces
                 if recovered || (interfaceChanged && self.hasErrorOrStaleSource) {
@@ -7935,18 +7971,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return xml
     }
 
-    static func launchctlProgramPath(from output: String) -> String? {
-        for rawLine in output.split(whereSeparator: \.isNewline) {
-            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
-            guard trimmed.hasPrefix("program") else { continue }
-            let rest = trimmed.dropFirst("program".count).trimmingCharacters(in: .whitespaces)
-            guard rest.hasPrefix("=") else { continue }
-            let value = rest.dropFirst().trimmingCharacters(in: .whitespaces)
-            if !value.isEmpty { return value }
-        }
-        return nil
-    }
-
     private func writeLaunchAgentPlist(executablePath: String) throws {
         let dir = (launchAgentPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -7958,49 +7982,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try content.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
     }
 
-    private func bootoutLaunchAgentIfOwned(executablePath: String) {
-        let target = "gui/\(getuid())/\(launchAgentLabel)"
-        let expectedStd = URL(fileURLWithPath: executablePath).standardizedFileURL.path
-        DispatchQueue.global(qos: .utility).async {
-            let inspect = Process()
-            inspect.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            inspect.arguments = ["print", target]
-            let pipe = Pipe()
-            inspect.standardOutput = pipe
-            inspect.standardError = FileHandle.nullDevice
-            do {
-                try inspect.run()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                inspect.waitUntilExit()
-                guard inspect.terminationStatus == 0,
-                      let output = String(data: data, encoding: .utf8),
-                      let loadedProgram = Self.launchctlProgramPath(from: output) else { return }
-                let loadedStd = URL(fileURLWithPath: loadedProgram).standardizedFileURL.path
-                guard loadedStd == expectedStd else { return }
-                let bootout = Process()
-                bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                bootout.arguments = ["bootout", target]
-                bootout.standardOutput = FileHandle.nullDevice
-                bootout.standardError = FileHandle.nullDevice
-                try bootout.run()
-                bootout.waitUntilExit()
-            } catch {
-                NSLog("[CodexUsage] launchctl bootout skipped: %@", error.localizedDescription)
-            }
-        }
-    }
-
     @objc private func onToggleLogin() {
         guard !visualPreview else { return }
         if isLoginItemEnabled() {
             do {
+                // 仅移除 plist 阻止下次登录拉起，绝不在应用内调用 launchctl bootout：
+                // 本进程若由 launchd 启动，bootout 会立即向当前进程发 SIGTERM 导致关闭自启时直接闪退；
+                // 正常「退出 CodexUsage」走 exit 0，KeepAlive.SuccessfulExit=false 不会复活进程。
                 try FileManager.default.removeItem(atPath: launchAgentPath)
                 LaunchAtLoginPreference.save(false)   // 显式关闭：阻止下次启动按默认开自动装回
-                if let execPath = Bundle.main.executablePath, !execPath.isEmpty {
-                    bootoutLaunchAgentIfOwned(executablePath: execPath)
-                }
             } catch {
                 NSLog("[CodexUsage] Failed to remove LaunchAgent plist at %@: %@", launchAgentPath, error.localizedDescription)
+                NSApp.activate(ignoringOtherApps: true)
                 let alert = NSAlert()
                 alert.messageText = "关闭开机自启失败"
                 alert.informativeText = "无法移除 LaunchAgent 配置文件，请检查「~/Library/LaunchAgents」目录权限。\n\n\(error.localizedDescription)"
@@ -8011,6 +8004,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Translocation 下可执行文件位于只读临时挂载：写进 plist 重启后指向失效路径，
             // 与更新同款拦截，提示先安装到「应用程序」再开启
             if isTranslocated {
+                NSApp.activate(ignoringOtherApps: true)
                 let alert = NSAlert()
                 alert.messageText = "无法开启开机自启"
                 alert.informativeText = "CodexUsage 正在从临时位置运行（App Translocation）。\n请退出应用，把 CodexUsage.app 拖入「应用程序」文件夹后从那里打开，再开启自启。"
@@ -8021,6 +8015,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             guard let execPath = Bundle.main.executablePath, !execPath.isEmpty else {
                 NSLog("[CodexUsage] Cannot enable LaunchAgent: empty executablePath")
+                NSApp.activate(ignoringOtherApps: true)
                 let alert = NSAlert()
                 alert.messageText = "开启开机自启失败"
                 alert.informativeText = "无法确定当前应用可执行文件路径。"
@@ -8034,6 +8029,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 LaunchAtLoginPreference.save(true)
             } catch {
                 NSLog("[CodexUsage] Failed to write LaunchAgent plist at %@: %@", launchAgentPath, error.localizedDescription)
+                NSApp.activate(ignoringOtherApps: true)
                 let alert = NSAlert()
                 alert.messageText = "开启开机自启失败"
                 alert.informativeText = "无法写入 LaunchAgent 配置文件，请检查「~/Library/LaunchAgents」目录权限。\n\n\(error.localizedDescription)"
@@ -10254,7 +10250,7 @@ enum CodexOfflineRegression {
                            && rtKeepAlive?["SuccessfulExit"] as? Bool == false,
                            "launchAgentPlistContent round-trip mismatch")
 
-                // 2) isLaunchAgentEnabled 路径校验与 launchctlProgramPath 解析
+                // 2) isLaunchAgentEnabled 路径校验
                 let agentPlistPath = root.path + "/com.local.codex-usage.plist"
                 try expect(!AppDelegate.isLaunchAgentEnabled(plistPath: agentPlistPath, executablePath: specialExec),
                            "missing plist should report disabled")
@@ -10266,11 +10262,48 @@ enum CodexOfflineRegression {
                 try Data("not-a-plist".utf8).write(to: URL(fileURLWithPath: agentPlistPath))
                 try expect(AppDelegate.isLaunchAgentEnabled(plistPath: agentPlistPath, executablePath: specialExec),
                            "unreadable existing plist should fall back to enabled")
-                let samplePrint = "gui/501/com.local.codex-usage = {\n\tstate = running\n\tprogram = /Applications/CodexUsage.app/Contents/MacOS/CodexUsage\n}\n"
-                try expect(AppDelegate.launchctlProgramPath(from: samplePrint) == "/Applications/CodexUsage.app/Contents/MacOS/CodexUsage",
-                           "launchctlProgramPath failed to parse program line")
-                try expect(AppDelegate.launchctlProgramPath(from: "gui/501/x = {\n\tstate = waiting\n}\n") == nil,
-                           "launchctlProgramPath falsely matched missing program")
+
+                // 2b) 对抗审查回归：近 24h 活跃文件原地等长同 mtime 同 inode 覆写须被边界校验检出（TokenScanner + ExternalTokenScanner）
+                let inPlaceRoot = root.path + "/inplace-overwrite"
+                try FileManager.default.createDirectory(atPath: inPlaceRoot, withIntermediateDirectories: true)
+                let activeCodexFile = inPlaceRoot + "/rollout-\(sesStamp(now))-inplace.jsonl"
+                let lineA = runCount(now, 100)
+                let lineB = runCount(now, 500)
+                try expect(lineA.utf8.count == lineB.utf8.count, "test fixture lines must have identical byte length")
+                try lineA.write(toFile: activeCodexFile, atomically: false, encoding: .utf8)
+                let fixedMtime = now.addingTimeInterval(-60)
+                try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: activeCodexFile)
+                let inPlaceState = root.path + "/inplace-codex-state.json"
+                let ip1 = TokenScanner.scan(root: inPlaceRoot, statePath: inPlaceState, now: now)
+                try expect(ip1.today.total == 101, "initial active scan failed (got \(ip1.today.total))")
+                // 原地覆写保持同一 inode、同一字节长度、同一 mtime
+                let fhC = FileHandle(forWritingAtPath: activeCodexFile)!
+                try fhC.seek(toOffset: 0)
+                try fhC.write(contentsOf: Data(lineB.utf8))
+                try fhC.close()
+                try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: activeCodexFile)
+                let ip2 = TokenScanner.scan(root: inPlaceRoot, statePath: inPlaceState, now: now)
+                try expect(ip2.today.total == 501, "TokenScanner missed in-place same-size same-mtime overwrite (got \(ip2.today.total))")
+
+                let inPlaceExtRoot = root.path + "/inplace-ext"
+                try FileManager.default.createDirectory(atPath: inPlaceExtRoot, withIntermediateDirectories: true)
+                let activeExtFile = inPlaceExtRoot + "/active.jsonl"
+                let extA = extLine("gpt-5.6-sol", extBase, inTok: 100, outTok: 10) + "\n"
+                let extB = extLine("gpt-5.6-sol", extBase, inTok: 400, outTok: 20) + "\n"
+                try expect(extA.utf8.count == extB.utf8.count, "ext fixture lines must have identical byte length")
+                try extA.write(toFile: activeExtFile, atomically: false, encoding: .utf8)
+                let fixedExtMtime = extBase.addingTimeInterval(-60)
+                try FileManager.default.setAttributes([.modificationDate: fixedExtMtime], ofItemAtPath: activeExtFile)
+                let inPlaceExtState = root.path + "/inplace-ext-state.json"
+                let ipe1 = ExternalTokenScanner.scan(roots: [inPlaceExtRoot], hermesDB: nil, statePath: inPlaceExtState, now: extBase)
+                try expect(ipe1.today.total == 110, "initial active ext scan failed (got \(ipe1.today.total))")
+                let fhE = FileHandle(forWritingAtPath: activeExtFile)!
+                try fhE.seek(toOffset: 0)
+                try fhE.write(contentsOf: Data(extB.utf8))
+                try fhE.close()
+                try FileManager.default.setAttributes([.modificationDate: fixedExtMtime], ofItemAtPath: activeExtFile)
+                let ipe2 = ExternalTokenScanner.scan(roots: [inPlaceExtRoot], hermesDB: nil, statePath: inPlaceExtState, now: extBase)
+                try expect(ipe2.today.total == 420, "ExternalTokenScanner missed in-place same-size same-mtime overwrite (got \(ipe2.today.total))")
 
                 // 3) CodexAuth.loadWithMode 单次读盘与 load/usesAPIKey 一致性
                 let oauthPath = root.path + "/mode-oauth.json"
