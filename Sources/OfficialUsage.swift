@@ -1,7 +1,7 @@
 import Foundation
 
-struct OfficialUsageSnapshot {
-    enum SparsePolicy { case unknown, officialActivity }
+struct OfficialUsageSnapshot: Equatable {
+    enum SparsePolicy: Equatable { case unknown, officialActivity }
     enum Day: Equatable { case reported(Double), inferredZero, missing }
     var lifetime: Double?
     var days: [String: Double] {
